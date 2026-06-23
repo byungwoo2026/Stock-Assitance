@@ -31,8 +31,8 @@ st.set_page_config(page_title="나만의 투자 조수", layout="wide")
 st.title("📈 나만의 투자 조수 대시보드")
 st.markdown("시장의 자금 쏠림, 주주 수급, 주요 뉴스 및 기술적 매수 신호를 분석합니다.")
 
-# 사이드바 메뉴 구성
-menu = st.sidebar.selectbox("메뉴 선택", ["종합 대시보드", "시장 자금 & 업종 분석", "주요 기업 헤드라인 뉴스", "외인 수급 & 기술적 조건 스크리너", "최우수 애널리스트 추천 종목", "가치재평가주", "개별종목 매수 분석"])
+# 탭형 메뉴 구성
+menu_tabs = st.tabs(["📊 종합 대시보드", "💰 시장 자금 & 업종", "📰 헤드라인 뉴스", "🔍 수급 & 기술적 조건", "🏆 애널리스트 추천", "💎 가치재평가주", "🤖 개별종목 분석"])
 
 # 차단 없는 네이버 뉴스 RSS 엔진
 def fetch_headlines_rss(keyword):
@@ -529,7 +529,7 @@ def get_stock_code_map():
     return code_map
 
 # 각 메뉴별 UI 화면 구성
-if menu == "종합 대시보드":
+with menu_tabs[0]:
     st.subheader("오늘의 투자 핵심 요약")
     
     # 상단에 안정적으로 수집된 코스피/코스닥 지수 표시
@@ -561,7 +561,7 @@ if menu == "종합 대시보드":
         
     st.markdown("---")
 
-elif menu == "시장 자금 & 업종 분석":
+with menu_tabs[1]:
     st.subheader("📊 시장 자금 흐름 & 스마트머니 수급 분석")
     st.markdown("---")
     
@@ -618,7 +618,7 @@ elif menu == "시장 자금 & 업종 분석":
                         st.markdown(f"**{idx}. {stock}**\n- 🔍 **매수 사유 분석**: [{reason}]({link})")
                         st.write("")
 
-elif menu == "주요 기업 헤드라인 뉴스":
+with menu_tabs[2]:
     st.subheader("📰 시총 상위 기업 및 상한가 종목 헤드라인")
     st.markdown("---")
     
@@ -681,7 +681,7 @@ elif menu == "주요 기업 헤드라인 뉴스":
                 else:
                     st.info("코스닥 상한가 종목이 없습니다.")
 
-elif menu == "외인 수급 & 기술적 조건 스크리너":
+with menu_tabs[3]:
     st.subheader("🔍 주도주 기술적 타점 랭킹 스크리너")
     
     st.info("""
@@ -707,7 +707,7 @@ elif menu == "외인 수급 & 기술적 조건 스크리너":
         else:
             st.warning("데이터를 수집하는 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
 
-elif menu == "최우수 애널리스트 추천 종목":
+with menu_tabs[4]:
     st.subheader("🏆 2026 최우수 애널리스트 & 주요 증권사 추천 종목")
     
     st.info("""
@@ -732,7 +732,7 @@ elif menu == "최우수 애널리스트 추천 종목":
     else:
         st.warning("최근 1주일 내 추천 종목 데이터를 불러오지 못했거나 발간된 리포트가 없습니다.")
 
-elif menu == "가치재평가주":
+with menu_tabs[5]:
     st.subheader("💎 가치재평가주 (Value Re-evaluation) 스크리닝")
     
     st.info("""
@@ -762,8 +762,8 @@ elif menu == "가치재평가주":
         for idx, stock in enumerate(high_growth_stocks, 1):
             st.markdown(f"**{idx}. {stock}** (글로벌 메가 트렌드 편승 및 폭발적인 실적 퀀텀점프)")
 
-elif menu == "개별종목 매수 분석":
-    st.subheader("📌 개별종목 매수 분석")
+with menu_tabs[6]:
+    st.subheader("📌 개별종목 매수 분석 (Scoring & Analysis)")
     st.markdown("기술적 지표(10%), 최신 뉴스 및 수급(40%), 경영지표(20%), 밸류에이션(10%), 시장 트렌드(20%)를 종합 분석합니다.")
     st.info("💡 분석을 원하는 종목의 **종목명**(예: 삼성전자) 또는 **6자리 종목코드**(예: 005930)를 입력하세요.")
     
