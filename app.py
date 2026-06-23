@@ -7,6 +7,8 @@ from datetime import datetime
 import time
 import xml.etree.ElementTree as ET
 
+from market_utils import format_index_change_value
+
 # Response encoding helper: detect charset from headers/meta and fall back to apparent_encoding
 def _set_response_encoding(res):
     ct = res.headers.get('content-type', '')
@@ -86,14 +88,12 @@ def fetch_market_index(market_type="KOSPI", retries=3):
             if now_value and change_value:
                 # 텍스트 내 불필요한 공백 제거
                 index_val = now_value.text.strip()
-                change_val = change_value.text.strip().split()[-1] # 상승/하락 폭만 추출
-                
-                # 상승, 하락, 보합 기호에 맞게 +/- 추가
-                if '상승' in change_value.text:
-                    change_val = "+" + change_val
-                elif '하락' in change_value.text:
-                    change_val = "-" + change_val
-                
+                change_text = change_value.get_text(" ", strip=True)
+                change_val = format_index_change_value(change_text)
+
+                if not change_val:
+                    change_val = "-"
+
                 return {"index": index_val, "change": change_val, "status": "success"}
             else:
                 raise ValueError("DOM 구조를 찾을 수 없습니다.")
