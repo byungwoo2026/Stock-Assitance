@@ -7,7 +7,26 @@ from datetime import datetime
 import time
 import xml.etree.ElementTree as ET
 
-from market_utils import format_index_change_value
+from market_utils_final import format_index_change_value
+
+
+def render_index_metric(label, index_value, change_value):
+    """지수 메트릭을 명확한 색상과 텍스트로 표시한다."""
+    if not change_value:
+        st.markdown(f"<div><b>{label}</b>: {index_value} | -</div>", unsafe_allow_html=True)
+        return
+
+    if change_value.startswith("-"):
+        delta_text = change_value
+        color = "#1f77b4"
+    else:
+        delta_text = change_value if change_value.startswith("+") else f"+{change_value}"
+        color = "#d62728"
+
+    st.markdown(
+        f"<div><b>{label}</b>: {index_value} | <span style='color:{color}; font-weight:700'>{delta_text}</span></div>",
+        unsafe_allow_html=True,
+    )
 
 # Response encoding helper: detect charset from headers/meta and fall back to apparent_encoding
 def _set_response_encoding(res):
@@ -504,9 +523,14 @@ def analyze_stock_technical(code):
     except Exception:
         return None
 
+def normalize_stock_query(text):
+    if not text:
+        return ""
+    return re.sub(r"[\s\-\(\)\[\]\/]+", "", text)
+
 @st.cache_data(ttl=86400)
 def get_stock_code_map():
-    url = 'http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13'
+    url = 'https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13'
     code_map = {}
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
@@ -528,6 +552,43 @@ def get_stock_code_map():
         pass
     return code_map
 
+
+def resolve_stock_code(user_input):
+    user_input = (user_input or "").strip()
+    if not user_input:
+        return None
+
+    if re.fullmatch(r"\d{6}", user_input):
+        return user_input
+
+    code_map = get_stock_code_map()
+    if not code_map:
+        return None
+
+    direct_match = code_map.get(user_input)
+    if direct_match:
+        return direct_match
+
+    normalized_input = normalize_stock_query(user_input)
+    if not normalized_input:
+        return None
+
+    for company_name, code in code_map.items():
+        if normalize_stock_query(company_name) == normalized_input:
+            return code
+
+    matches = []
+    for company_name, code in code_map.items():
+        normalized_name = normalize_stock_query(company_name)
+        if normalized_input in normalized_name or normalized_name in normalized_input:
+            matches.append((len(normalized_name), company_name, code))
+
+    if matches:
+        matches.sort(key=lambda item: (item[0], item[1]))
+        return matches[0][2]
+
+    return None
+
 # 각 메뉴별 UI 화면 구성
 with menu_tabs[0]:
     st.subheader("오늘의 투자 핵심 요약")
@@ -539,10 +600,10 @@ with menu_tabs[0]:
     m_col1, m_col2, m_col3 = st.columns(3)
     with m_col1:
         delta_kpi = kospi_data['change'] if kospi_data['status'] == 'success' else None
-        st.metric(label="KOSPI", value=kospi_data['index'], delta=delta_kpi)
+        render_index_metric("KOSPI", kospi_data['index'], delta_kpi)
     with m_col2:
         delta_kdq = kosdaq_data['change'] if kosdaq_data['status'] == 'success' else None
-        st.metric(label="KOSDAQ", value=kosdaq_data['index'], delta=delta_kdq)
+        render_index_metric("KOSDAQ", kosdaq_data['index'], delta_kdq)
         
     st.markdown("---")
     
@@ -772,12 +833,9 @@ with menu_tabs[6]:
     if st.button("분석 시작") and user_input:
         user_input = user_input.strip()
         stock_code = None
-        if user_input.isdigit() and len(user_input) == 6:
-            stock_code = user_input
-        else:
+        if user_input:
             with st.spinner("종목명을 검색하는 중..."):
-                code_map = get_stock_code_map()
-                stock_code = code_map.get(user_input)
+                stock_code = resolve_stock_code(user_input)
             
         if not stock_code:
             st.warning("올바른 종목명 또는 6자리 종목코드를 입력해주세요.")
