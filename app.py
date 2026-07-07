@@ -644,10 +644,10 @@ elif menu == "시장 자금 & 업종 분석":
         with st.spinner("최근 1달간의 업종별 트렌드를 분석 중입니다..."):
             top_sectors = fetch_1month_sector_trends()
             
-        if top_sectors:
+            if top_sectors:
             df_sectors = pd.DataFrame(top_sectors)
             df_sectors.index = range(1, len(df_sectors) + 1)
-            st.dataframe(df_sectors[['업종/테마', '변동']], use_container_width=True)
+            st.dataframe(df_sectors[['업종/테마', '변동']], width='stretch')
         else:
             st.error("업종 데이터를 불러오는 데 실패했습니다.")
             
@@ -785,7 +785,7 @@ elif menu == "외인 수급 & 기술적 조건 스크리너":
             st.success(f"현재 시장에서 가장 기술적 타점이 우수한 상위 {len(screener_results)}개 종목입니다!")
             df_screen = pd.DataFrame(screener_results)
             df_screen.index = range(1, len(df_screen) + 1)
-            st.dataframe(df_screen, use_container_width=True)
+            st.dataframe(df_screen, width='stretch')
         else:
             st.warning("데이터를 수집하는 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
 
@@ -951,7 +951,7 @@ elif menu == "개별종목분석":
                     st.markdown("---")
                     st.markdown("### 📊 분석 결과")
                     df_results = pd.DataFrame(analysis_results)
-                    st.dataframe(df_results, use_container_width=True)
+                    st.dataframe(df_results, width='stretch')
     
     # Tab 2: ETF List
     with tab2:
@@ -1009,7 +1009,7 @@ elif menu == "개별종목분석":
                     st.markdown("---")
                     st.markdown("### 📊 분석 결과")
                     df_results = pd.DataFrame(analysis_results)
-                    st.dataframe(df_results, use_container_width=True)
+                    st.dataframe(df_results, width='stretch')
     
     # Tab 3: 개별종목 분석 (기존 방식)
     with tab3:
