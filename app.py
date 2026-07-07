@@ -6,54 +6,20 @@ import re
 from datetime import datetime
 import time
 import xml.etree.ElementTree as ET
-
-from market_utils_final import format_index_change_value
-
-
-def render_index_metric(label, index_value, change_value):
-    """지수 메트릭을 명확한 색상과 텍스트로 표시한다."""
-    if not change_value:
-        st.markdown(f"<div><b>{label}</b>: {index_value} | -</div>", unsafe_allow_html=True)
-        return
-
-    if change_value.startswith("-"):
-        delta_text = change_value
-        color = "#1f77b4"
-    else:
-        delta_text = change_value if change_value.startswith("+") else f"+{change_value}"
-        color = "#d62728"
-
-    st.markdown(
-        f"<div><b>{label}</b>: {index_value} | <span style='color:{color}; font-weight:700'>{delta_text}</span></div>",
-        unsafe_allow_html=True,
-    )
-
-# Response encoding helper: detect charset from headers/meta and fall back to apparent_encoding
-def _set_response_encoding(res):
-    ct = res.headers.get('content-type', '')
-    m = re.search(r'charset=([^;\s]+)', ct, flags=re.I)
-    if m:
-        res.encoding = m.group(1)
-        return
-    # try to inspect a small snippet of bytes for meta charset
-    try:
-        snippet = res.content[:1000].decode('utf-8', errors='ignore')
-        m2 = re.search(r'charset=["\']?([\w\-]+)', snippet, flags=re.I)
-        if m2:
-            res.encoding = m2.group(1)
-            return
-    except Exception:
-        pass
-    # fallback
-    res.encoding = res.apparent_encoding or 'utf-8'
+# pyrefly: ignore [missing-import]
+try:
+    import google.generativeai as genai
+    GENAI_AVAILABLE = True
+except ImportError:
+    GENAI_AVAILABLE = False
 
 st.set_page_config(page_title="나만의 투자 조수", layout="wide")
 
-st.title("📈 나만의 투자 조수 대시보드")
+st.title("📈 나만의 AI 투자 조수 대시보드")
 st.markdown("시장의 자금 쏠림, 주주 수급, 주요 뉴스 및 기술적 매수 신호를 분석합니다.")
 
-# 탭형 메뉴 구성
-menu_tabs = st.tabs(["📊 종합 대시보드", "💰 시장 자금 & 업종", "📰 헤드라인 뉴스", "🔍 수급 & 기술적 조건", "🏆 애널리스트 추천", "💎 가치재평가주", "🤖 개별종목 분석"])
+# 사이드바 메뉴 구성
+menu = st.sidebar.selectbox("메뉴 선택", ["종합 대시보드", "시장 자금 & 업종 분석", "주요 기업 헤드라인 뉴스", "외인 수급 & 기술적 조건 스크리너", "최우수 애널리스트 추천 종목", "가치재평가주", "개별종목분석"])
 
 # 차단 없는 네이버 뉴스 RSS 엔진
 def fetch_headlines_rss(keyword):
@@ -107,12 +73,14 @@ def fetch_market_index(market_type="KOSPI", retries=3):
             if now_value and change_value:
                 # 텍스트 내 불필요한 공백 제거
                 index_val = now_value.text.strip()
-                change_text = change_value.get_text(" ", strip=True)
-                change_val = format_index_change_value(change_text)
-
-                if not change_val:
-                    change_val = "-"
-
+                change_val = change_value.text.strip().split()[-1] # 상승/하락 폭만 추출
+                
+                # 상승, 하락, 보합 기호에 맞게 +/- 추가
+                if '상승' in change_value.text:
+                    change_val = "+" + change_val
+                elif '하락' in change_value.text:
+                    change_val = "-" + change_val
+                
                 return {"index": index_val, "change": change_val, "status": "success"}
             else:
                 raise ValueError("DOM 구조를 찾을 수 없습니다.")
@@ -192,7 +160,7 @@ def fetch_top_market_cap(market_type="KOSPI", top_n=20):
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
-        _set_response_encoding(res)
+        res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         companies = []
         for a in soup.select('a.tltle')[:top_n]:
@@ -208,7 +176,7 @@ def fetch_upper_limit_stocks():
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
-        _set_response_encoding(res)
+        res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         
         tables = soup.select('table.type_5')
@@ -240,7 +208,7 @@ def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10)
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
-        _set_response_encoding(res)
+        res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         stocks = []
         for a in soup.find_all('a'):
@@ -265,7 +233,7 @@ def fetch_top_analyst_recommendations():
     
     try:
         res = requests.get(url, headers=headers, timeout=5)
-        _set_response_encoding(res)
+        res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         
         results = []
@@ -313,7 +281,7 @@ def run_logical_screener():
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         res = requests.get(url_quant, headers=headers, timeout=5)
-        _set_response_encoding(res)
+        res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         
         stocks = []
@@ -424,7 +392,7 @@ def fetch_stock_name_and_fundamentals(code):
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
-        _set_response_encoding(res)
+        res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
         
         name_elem = soup.select_one('.wrap_company h2 a')
@@ -523,19 +491,14 @@ def analyze_stock_technical(code):
     except Exception:
         return None
 
-def normalize_stock_query(text):
-    if not text:
-        return ""
-    return re.sub(r"[\s\-\(\)\[\]\/]+", "", text)
-
 @st.cache_data(ttl=86400)
 def get_stock_code_map():
-    url = 'https://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13'
+    url = 'http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13'
     code_map = {}
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         res = requests.get(url, headers=headers, timeout=10)
-        _set_response_encoding(res)
+        res.encoding = 'euc-kr'
         soup = BeautifulSoup(res.text, 'html.parser')
         rows = soup.find_all('tr')
         for row in rows:
@@ -552,45 +515,86 @@ def get_stock_code_map():
         pass
     return code_map
 
+def get_ai_summary(news_list):
+    try:
+        genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list])
+        prompt = f"""
+        당신은 전문 주식 투자 분석가입니다. 다음 실시간 뉴스 리스트를 꼼꼼히 분석하여 
+        투자자 입장에서 핵심 요약을 명확하게 '3줄'로 작성해주세요. 
+        그리고 종합 결론으로 이 뉴스가 해당 기업의 주가 흐름에 [긍정적 / 중립 / 부정적] 일지 판단하고 이유를 덧붙여주세요.
+        
+        [뉴스 리스트]
+        {news_text}
+        """
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"⚠️ AI 분석 중 오류가 발생했습니다. (Secrets 설정이나 키 값을 확인해 주세요): {e}"
 
-def resolve_stock_code(user_input):
-    user_input = (user_input or "").strip()
-    if not user_input:
-        return None
+def get_individual_stock_ai_analysis(fundamentals, tech, news_list):
+    try:
+        genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list]) if news_list else "최근 관련 뉴스 없음"
+        prompt = f"""
+        당신은 전문 주식 투자 분석가(리서치 센터장)입니다. 
+        다음 개별 종목 정보를 바탕으로 투자자에게 깊이 있고 전문적인 'AI 심층 투자 분석 보고서'를 작성해주세요.
 
-    if re.fullmatch(r"\d{6}", user_input):
-        return user_input
+        [종목 기본 정보]
+        - 종목명: {fundamentals['name']}
+        - 영업이익률: {fundamentals['op_margin']}%
+        - ROE: {fundamentals['roe']}%
+        - 추정 PER: {fundamentals['cns_per']}배 (후행 PER: {fundamentals['per']}배)
+        - PBR: {fundamentals['pbr']}배
 
-    code_map = get_stock_code_map()
-    if not code_map:
-        return None
+        [기술적 지표 및 트렌드]
+        - 현재가: {int(tech['price']):,}원
+        - 최근 1개월 수익률: {tech['one_month_return']:.2f}%
+        - RSI (14): {tech['rsi']:.2f} (30 이하는 과매도, 70 이상은 과열)
+        - MACD 상태: {'매수 우위 (MACD > Signal)' if tech['macd'] > tech['signal'] else '매도 우위 (MACD <= Signal)'}
+        - 20일 이동평균선 위치: {'20일선 위 (상승추세)' if tech['price'] > tech['sma20'] else '20일선 아래 (조정/하락세)'}
 
-    direct_match = code_map.get(user_input)
-    if direct_match:
-        return direct_match
+        [관련 최신 뉴스 및 시장 평가]
+        {news_text}
 
-    normalized_input = normalize_stock_query(user_input)
-    if not normalized_input:
-        return None
+        보고서는 가독성 있게 작성되어야 하며, 다음 내용을 포함해 주세요:
+        1. **재무 건전성 및 밸류에이션 평가**: 영업이익률/ROE를 통한 수익성 평가, PER/PBR 기준 고평가/저평가 여부 분석.
+        2. **차트 및 기술적 흐름 해석**: 이동평균선 추세, RSI 과매도/과열 강도, MACD 신호를 조합한 매수 타점 분석.
+        3. **시장 모멘텀 및 뉴스 분석**: 최근 뉴스들의 호재/악재 성격 및 수급 영향 평가.
+        4. **최종 AI 투자 전략 & 가이드**: 추천 매매 전략(분할 매수, 관망, 매도 등)과 목표/손절 대응 팁.
+        """
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"⚠️ AI 분석 리포트 생성 중 오류가 발생했습니다: {e}"
 
-    for company_name, code in code_map.items():
-        if normalize_stock_query(company_name) == normalized_input:
-            return code
+def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
+    try:
+        genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
+        model = genai.GenerativeModel('gemini-1.5-flash')
+        sectors_text = "\n".join([f"- {s['업종/테마']}: {s['변동']}" for s in top_sectors]) if top_sectors else "업종 정보 없음"
+        prompt = f"""
+        당신은 금융 전략가이자 투자 비서입니다. 오늘의 한국 증시 동향을 종합하여 투자 전략을 브리핑해주세요.
 
-    matches = []
-    for company_name, code in code_map.items():
-        normalized_name = normalize_stock_query(company_name)
-        if normalized_input in normalized_name or normalized_name in normalized_input:
-            matches.append((len(normalized_name), company_name, code))
+        [시장 지수]
+        - KOSPI: {kospi_data.get('index', 'N/A')} ({kospi_data.get('change', 'N/A')})
+        - KOSDAQ: {kosdaq_data.get('index', 'N/A')} ({kosdaq_data.get('change', 'N/A')})
 
-    if matches:
-        matches.sort(key=lambda item: (item[0], item[1]))
-        return matches[0][2]
+        [최근 1달 자금 유입 TOP 5 업종/테마]
+        {sectors_text}
 
-    return None
+        위 데이터를 바탕으로 시장의 흐름을 냉철하게 분석하고, 투자자가 참고할 수 있는 짤막하고 명쾌한 'AI 투자 전략 보고서'를 3~4문장 단위로 단락을 나누어 작성해주세요. 
+        글자 크기가 너무 크지 않도록 마크다운 구조(강조 등)를 활용하여 정중하고 명확한 어조로 요약해 주세요.
+        """
+        response = model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"⚠️ AI 시장 분석 중 오류가 발생했습니다: {e}"
 
 # 각 메뉴별 UI 화면 구성
-with menu_tabs[0]:
+if menu == "종합 대시보드":
     st.subheader("오늘의 투자 핵심 요약")
     
     # 상단에 안정적으로 수집된 코스피/코스닥 지수 표시
@@ -600,10 +604,10 @@ with menu_tabs[0]:
     m_col1, m_col2, m_col3 = st.columns(3)
     with m_col1:
         delta_kpi = kospi_data['change'] if kospi_data['status'] == 'success' else None
-        render_index_metric("KOSPI", kospi_data['index'], delta_kpi)
+        st.metric(label="KOSPI", value=kospi_data['index'], delta=delta_kpi)
     with m_col2:
         delta_kdq = kosdaq_data['change'] if kosdaq_data['status'] == 'success' else None
-        render_index_metric("KOSDAQ", kosdaq_data['index'], delta_kdq)
+        st.metric(label="KOSDAQ", value=kosdaq_data['index'], delta=delta_kdq)
         
     st.markdown("---")
     
@@ -621,8 +625,15 @@ with menu_tabs[0]:
         st.write("스크리너 메뉴는 주말 한국거래소(KRX) 서버 점검으로 인해 평일 장 거래 시간에 정상 가동됩니다.")
         
     st.markdown("---")
+    if GENAI_AVAILABLE:
+        st.markdown("### 🤖 AI 투자 비서의 데일리 시장 분석 & 전략")
+        with st.spinner("Gemini가 오늘의 시장 상황과 최근 자금 흐름을 종합 분석하고 있습니다..."):
+            market_briefing = get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors)
+            st.info(market_briefing)
+    else:
+        st.info("💡 Google Generative AI 패키지가 설치되지 않아 AI 분석 기능을 사용할 수 없습니다.")
 
-with menu_tabs[1]:
+elif menu == "시장 자금 & 업종 분석":
     st.subheader("📊 시장 자금 흐름 & 스마트머니 수급 분석")
     st.markdown("---")
     
@@ -679,7 +690,7 @@ with menu_tabs[1]:
                         st.markdown(f"**{idx}. {stock}**\n- 🔍 **매수 사유 분석**: [{reason}]({link})")
                         st.write("")
 
-with menu_tabs[2]:
+elif menu == "주요 기업 헤드라인 뉴스":
     st.subheader("📰 시총 상위 기업 및 상한가 종목 헤드라인")
     st.markdown("---")
     
@@ -700,19 +711,29 @@ with menu_tabs[2]:
             search_button = st.button(f"{selected_company} 뉴스 검색")
 
             if search_button:
-                with st.spinner(f"'{selected_company}' 최신 이슈를 수신 중..."):
+               with st.spinner(f"'{selected_company}' 최신 이슈를 수신 중..."):
                     news_list = fetch_headlines_rss(selected_company)
+            
+               st.markdown(f"#### 📢 {selected_company} 실시간 주요 헤드라인")
 
-                st.markdown(f"#### 📢 {selected_company} 실시간 주요 헤드라인")
+               if news_list:
+                # 1. AI 투자 비서 상자를 먼저 상단에 띄웁니다.
+                   if GENAI_AVAILABLE:
+                       st.markdown("### 🤖 AI 투자 비서의 3줄 시장 분석")
+                       with st.spinner("Gemini가 실시간 호재/악재 감성 분석을 진행하고 있습니다..."):
+                           ai_briefing = get_ai_summary(news_list)
+                           st.info(ai_briefing)
+                       st.markdown("---")
 
-                if news_list:
-                    for idx, news in enumerate(news_list, 1):
-                        st.markdown(f"**{idx}. [{news['press']}]** [{news['title']}]({news['link']})")
-                        st.write("")
-                else:
-                    st.warning("현재 검색된 최신 뉴스 헤드라인이 없습니다.")
+                # 2. 그 아래에 기존 뉴스 리스트가 차례대로 출력됩니다.
+                   for idx, news in enumerate(news_list, 1):
+                       st.markdown(f"**{idx}. [{news['press']}]** [{news['title']}]({news['link']})")
+                       st.write("") # 한 줄씩 띄워주는 센스
+               else:
+                st.warning("현재 검색된 최신 뉴스 헤드라인이 없습니다.")
+            
             else:
-                st.error("기업 목록을 불러오지 못했습니다.")
+             st.error("기업 목록을 불러오지 못했습니다.")
             
     with tab2:
         st.markdown("### 🚀 상한가 도달 종목 및 주요 이슈")
@@ -742,7 +763,7 @@ with menu_tabs[2]:
                 else:
                     st.info("코스닥 상한가 종목이 없습니다.")
 
-with menu_tabs[3]:
+elif menu == "외인 수급 & 기술적 조건 스크리너":
     st.subheader("🔍 주도주 기술적 타점 랭킹 스크리너")
     
     st.info("""
@@ -768,7 +789,7 @@ with menu_tabs[3]:
         else:
             st.warning("데이터를 수집하는 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
 
-with menu_tabs[4]:
+elif menu == "최우수 애널리스트 추천 종목":
     st.subheader("🏆 2026 최우수 애널리스트 & 주요 증권사 추천 종목")
     
     st.info("""
@@ -793,7 +814,7 @@ with menu_tabs[4]:
     else:
         st.warning("최근 1주일 내 추천 종목 데이터를 불러오지 못했거나 발간된 리포트가 없습니다.")
 
-with menu_tabs[5]:
+elif menu == "가치재평가주":
     st.subheader("💎 가치재평가주 (Value Re-evaluation) 스크리닝")
     
     st.info("""
@@ -823,133 +844,283 @@ with menu_tabs[5]:
         for idx, stock in enumerate(high_growth_stocks, 1):
             st.markdown(f"**{idx}. {stock}** (글로벌 메가 트렌드 편승 및 폭발적인 실적 퀀텀점프)")
 
-with menu_tabs[6]:
-    st.subheader("📌 개별종목 매수 분석 (Scoring & Analysis)")
+elif menu == "개별종목분석":
+    st.subheader("🤖 개별종목분석")
     st.markdown("기술적 지표(10%), 최신 뉴스 및 수급(40%), 경영지표(20%), 밸류에이션(10%), 시장 트렌드(20%)를 종합 분석합니다.")
-    st.info("💡 분석을 원하는 종목의 **종목명**(예: 삼성전자) 또는 **6자리 종목코드**(예: 005930)를 입력하세요.")
     
-    user_input = st.text_input("종목명 또는 종목코드 입력")
+    # 3가지 하위 항목 탭
+    tab1, tab2, tab3 = st.tabs(["📊 개별종목 List", "🏢 ETF List", "🔍 개별종목 분석"])
     
-    if st.button("분석 시작") and user_input:
-        user_input = user_input.strip()
-        stock_code = None
-        if user_input:
-            with st.spinner("종목명을 검색하는 중..."):
-                stock_code = resolve_stock_code(user_input)
+    # 공통 계산 함수
+    def calculate_stock_score(fundamentals, tech):
+        """종목 총점 계산"""
+        # 1. 뉴스 및 수급 모멘텀 (40%)
+        news_score = 20 # 기본점수
+        
+        # 2. 시장 트렌드 (20%) - 1개월 수익률 기준
+        trend_score = 10
+        if tech['one_month_return'] > 5:
+            trend_score = 20
+        elif tech['one_month_return'] > 0:
+            trend_score = 15
+        elif tech['one_month_return'] < -10:
+            trend_score = 0
+        
+        # 3. 기술적 지표 (10%)
+        tech_score = 5
+        if tech['price'] > tech['sma20'] and tech['macd'] > tech['signal']:
+            tech_score = 10
+        elif tech['rsi'] <= 40:
+            tech_score = 8 # 눌림목
+        
+        # 4. 경영지표 (20%) - 우선순위: 영업이익률 > ROE
+        mgmt_score = 0
+        if fundamentals['op_margin'] >= 10: mgmt_score += 12
+        elif fundamentals['op_margin'] >= 5: mgmt_score += 8
+        else: mgmt_score += 4
+        
+        if fundamentals['roe'] >= 10: mgmt_score += 8
+        elif fundamentals['roe'] >= 5: mgmt_score += 5
+        else: mgmt_score += 2
+        
+        # 5. 밸류에이션 (10%) - 우선순위: 추정PER > PBR
+        val_score = 0
+        per = fundamentals['cns_per'] if fundamentals['cns_per'] > 0 else fundamentals['per']
+        if 0 < per < 15: val_score += 6
+        elif 15 <= per < 30: val_score += 3
+        
+        if 0 < fundamentals['pbr'] < 1.5: val_score += 4
+        elif 1.5 <= fundamentals['pbr'] < 3: val_score += 2
+        
+        total_score = news_score + trend_score + tech_score + mgmt_score + val_score
+        return int(total_score)
+    
+    # Tab 1: 개별종목 List
+    with tab1:
+        st.info("💡 분석을 원하는 **개별종목 최대 10개**의 **종목명**(예: 삼성전자) 또는 **6자리 종목코드**(예: 005930)를 입력하세요. 콤마(,)로 구분해주세요.")
+        
+        stock_list_input = st.text_area("종목명 또는 종목코드 입력 (콤마로 구분, 최대 10개)", height=100)
+        
+        if st.button("개별종목 분석 시작", key="stock_list_analyze") and stock_list_input:
+            # 입력값 파싱
+            inputs = [x.strip() for x in stock_list_input.split(',')]
+            inputs = inputs[:10]  # 최대 10개로 제한
             
-        if not stock_code:
-            st.warning("올바른 종목명 또는 6자리 종목코드를 입력해주세요.")
-        else:
-            with st.spinner("해당 종목의 펀더멘털, 차트, 수급 및 뉴스 데이터를 분석 중입니다..."):
-                fundamentals = fetch_stock_name_and_fundamentals(stock_code)
-                
-                if not fundamentals:
-                    st.error("종목 정보를 불러올 수 없습니다. 입력값을 확인해주세요.")
+            code_map = get_stock_code_map()
+            stock_codes = []
+            
+            # 종목코드로 변환
+            for inp in inputs:
+                if inp.isdigit() and len(inp) == 6:
+                    stock_codes.append(inp)
                 else:
-                    tech = analyze_stock_technical(stock_code)
-                    news = fetch_headlines_rss(fundamentals['name'])
+                    code = code_map.get(inp)
+                    if code:
+                        stock_codes.append(code)
+            
+            if not stock_codes:
+                st.warning("올바른 종목명 또는 6자리 종목코드를 입력해주세요.")
+            else:
+                # 분석 수행
+                analysis_results = []
+                progress_bar = st.progress(0)
+                
+                for idx, code in enumerate(stock_codes):
+                    with st.spinner(f"분석 중... ({idx+1}/{len(stock_codes)})"):
+                        fundamentals = fetch_stock_name_and_fundamentals(code)
+                        if fundamentals:
+                            tech = analyze_stock_technical(code)
+                            if tech:
+                                total_score = calculate_stock_score(fundamentals, tech)
+                                macd_signal = '매수' if tech['macd'] > tech['signal'] else '매도'
+                                analysis_results.append({
+                                    "종목명": fundamentals['name'],
+                                    "총점": total_score,
+                                    "현재주가": f"{int(tech['price']):,}원",
+                                    "영업이익률": f"{fundamentals['op_margin']}%",
+                                    "ROE": f"{fundamentals['roe']}%",
+                                    "PBR": f"{fundamentals['pbr']}배",
+                                    "RSI": f"{tech['rsi']:.2f}",
+                                    "MACD": macd_signal,
+                                    "1개월수익률": f"{tech['one_month_return']:.2f}%"
+                                })
+                    progress_bar.progress((idx + 1) / len(stock_codes))
+                
+                # 결과 테이블 표시
+                if analysis_results:
+                    st.markdown("---")
+                    st.markdown("### 📊 분석 결과")
+                    df_results = pd.DataFrame(analysis_results)
+                    st.dataframe(df_results, use_container_width=True)
+    
+    # Tab 2: ETF List
+    with tab2:
+        st.info("💡 분석을 원하는 **ETF 최대 10개**의 **ETF명**(예: KODEX 200) 또는 **6자리 종목코드**를 입력하세요. 콤마(,)로 구분해주세요.")
+        
+        etf_list_input = st.text_area("ETF명 또는 종목코드 입력 (콤마로 구분, 최대 10개)", height=100, key="etf_input")
+        
+        if st.button("ETF 분석 시작", key="etf_analyze") and etf_list_input:
+            # 입력값 파싱
+            inputs = [x.strip() for x in etf_list_input.split(',')]
+            inputs = inputs[:10]  # 최대 10개로 제한
+            
+            code_map = get_stock_code_map()
+            stock_codes = []
+            
+            # 종목코드로 변환
+            for inp in inputs:
+                if inp.isdigit() and len(inp) == 6:
+                    stock_codes.append(inp)
+                else:
+                    code = code_map.get(inp)
+                    if code:
+                        stock_codes.append(code)
+            
+            if not stock_codes:
+                st.warning("올바른 ETF명 또는 6자리 종목코드를 입력해주세요.")
+            else:
+                # 분석 수행
+                analysis_results = []
+                progress_bar = st.progress(0)
+                
+                for idx, code in enumerate(stock_codes):
+                    with st.spinner(f"분석 중... ({idx+1}/{len(stock_codes)})"):
+                        fundamentals = fetch_stock_name_and_fundamentals(code)
+                        if fundamentals:
+                            tech = analyze_stock_technical(code)
+                            if tech:
+                                total_score = calculate_stock_score(fundamentals, tech)
+                                macd_signal = '매수' if tech['macd'] > tech['signal'] else '매도'
+                                analysis_results.append({
+                                    "종목명": fundamentals['name'],
+                                    "총점": total_score,
+                                    "현재주가": f"{int(tech['price']):,}원",
+                                    "영업이익률": f"{fundamentals['op_margin']}%",
+                                    "ROE": f"{fundamentals['roe']}%",
+                                    "PBR": f"{fundamentals['pbr']}배",
+                                    "RSI": f"{tech['rsi']:.2f}",
+                                    "MACD": macd_signal,
+                                    "1개월수익률": f"{tech['one_month_return']:.2f}%"
+                                })
+                    progress_bar.progress((idx + 1) / len(stock_codes))
+                
+                # 결과 테이블 표시
+                if analysis_results:
+                    st.markdown("---")
+                    st.markdown("### 📊 분석 결과")
+                    df_results = pd.DataFrame(analysis_results)
+                    st.dataframe(df_results, use_container_width=True)
+    
+    # Tab 3: 개별종목 분석 (기존 방식)
+    with tab3:
+        st.info("💡 분석을 원하는 종목의 **종목명**(예: 삼성전자) 또는 **6자리 종목코드**(예: 005930)를 입력하세요.")
+        
+        user_input = st.text_input("종목명 또는 종목코드 입력", key="single_stock_input")
+        
+        if st.button("AI 분석 시작", key="single_analyze") and user_input:
+            user_input = user_input.strip()
+            stock_code = None
+            if user_input.isdigit() and len(user_input) == 6:
+                stock_code = user_input
+            else:
+                with st.spinner("종목명을 검색하는 중..."):
+                    code_map = get_stock_code_map()
+                    stock_code = code_map.get(user_input)
+            
+            if not stock_code:
+                st.warning("올바른 종목명 또는 6자리 종목코드를 입력해주세요.")
+            else:
+                with st.spinner("해당 종목의 펀더멘털, 차트, 수급 및 뉴스 데이터를 분석 중입니다..."):
+                    fundamentals = fetch_stock_name_and_fundamentals(stock_code)
                     
-                    if tech is None:
-                        st.error("기술적 분석을 위한 충분한 차트 데이터가 없습니다.")
+                    if not fundamentals:
+                        st.error("종목 정보를 불러올 수 없습니다. 입력값을 확인해주세요.")
                     else:
-                        # 1. 뉴스 및 수급 모멘텀 (40%)
-                        news_score = 20 # 기본점수
-                        if news:
-                            news_score = 40 # 뉴스가 있으면 모멘텀 우수로 간주
-                            
-                        # 2. 시장 트렌드 (20%) - 1개월 수익률 기준
-                        trend_score = 10
-                        if tech['one_month_return'] > 5:
-                            trend_score = 20
-                        elif tech['one_month_return'] > 0:
-                            trend_score = 15
-                        elif tech['one_month_return'] < -10:
-                            trend_score = 0
-                            
-                        # 3. 기술적 지표 (10%)
-                        tech_score = 5
-                        if tech['price'] > tech['sma20'] and tech['macd'] > tech['signal']:
-                            tech_score = 10
-                        elif tech['rsi'] <= 40:
-                            tech_score = 8 # 눌림목
-                            
-                        # 4. 경영지표 (20%) - 우선순위: 영업이익률 > ROE
-                        mgmt_score = 0
-                        if fundamentals['op_margin'] >= 10: mgmt_score += 12
-                        elif fundamentals['op_margin'] >= 5: mgmt_score += 8
-                        else: mgmt_score += 4
+                        tech = analyze_stock_technical(stock_code)
+                        news = fetch_headlines_rss(fundamentals['name'])
                         
-                        if fundamentals['roe'] >= 10: mgmt_score += 8
-                        elif fundamentals['roe'] >= 5: mgmt_score += 5
-                        else: mgmt_score += 2
-                        
-                        # 5. 밸류에이션 (10%) - 우선순위: 추정PER > PBR
-                        val_score = 0
-                        per = fundamentals['cns_per'] if fundamentals['cns_per'] > 0 else fundamentals['per']
-                        if 0 < per < 15: val_score += 6
-                        elif 15 <= per < 30: val_score += 3
-                        
-                        if 0 < fundamentals['pbr'] < 1.5: val_score += 4
-                        elif 1.5 <= fundamentals['pbr'] < 3: val_score += 2
-                        
-                        total_score = news_score + trend_score + tech_score + mgmt_score + val_score
-                        
-                        opinion = "매도"
-                        color = "red"
-                        if total_score >= 80:
-                            opinion = "강력 매수"
-                            color = "green"
-                        elif total_score >= 60:
-                            opinion = "매수"
-                            color = "blue"
-                        elif total_score >= 40:
-                            opinion = "관망"
-                            color = "orange"
-                            
-                        def _safe_int(x):
-                            try:
-                                return f"{int(x):,}"
-                            except Exception:
-                                return "N/A"
-
-                        def _safe_float(x, ndigits=2):
-                            try:
-                                return f"{float(x):.{ndigits}f}"
-                            except Exception:
-                                return "N/A"
-
-                        st.markdown("---")
-                        st.markdown(f"### 📊 [{fundamentals.get('name','-')}] 매수 분석 결과: **{opinion}** (총점: {total_score}점)")
-
-                        col1, col2, col3, col4 = st.columns(4)
-                        col1.metric("종합 점수", f"{total_score}점")
-                        col2.metric("뉴스/모멘텀 (40)", f"{news_score}점")
-                        col3.metric("경영/밸류 (30)", f"{mgmt_score + val_score}점")
-                        col4.metric("기술/트렌드 (30)", f"{tech_score + trend_score}점")
-
-                        st.markdown("#### 🔍 상세 지표 분석")
-                        t1, t2, t3 = st.tabs(["재무 및 밸류에이션", "기술적 지표 및 트렌드", "관련 최신 뉴스"])
-                        with t1:
-                            st.write(f"- **영업이익률**: {_safe_float(fundamentals.get('op_margin'))}%")
-                            st.write(f"- **ROE**: {_safe_float(fundamentals.get('roe'))}%")
-                            st.write(f"- **추정 PER**: {_safe_float(fundamentals.get('cns_per'))}배 (후행 PER: {_safe_float(fundamentals.get('per'))}배)")
-                            st.write(f"- **PBR**: {_safe_float(fundamentals.get('pbr'))}배")
-                        with t2:
-                            st.write(f"- **현재 주가**: {_safe_int(tech.get('price'))}원")
-                            st.write(f"- **최근 1개월 수익률**: {_safe_float(tech.get('one_month_return'))}%")
-                            st.write(f"- **RSI (14)**: {_safe_float(tech.get('rsi'))}")
-                            macd_signal = '매수 우위' if tech.get('macd', 0) > tech.get('signal', 0) else '매도 우위'
-                            st.write(f"- **MACD 신호**: {macd_signal}")
-                            ma_pos = '20일선 위 (상승추세)' if tech.get('price', 0) > tech.get('sma20', 0) else '20일선 아래 (조정/하락)'
-                            st.write(f"- **이동평균선**: {ma_pos}")
-                        with t3:
+                        if tech is None:
+                            st.error("기술적 분석을 위한 충분한 차트 데이터가 없습니다.")
+                        else:
+                            # 1. 뉴스 및 수급 모멘텀 (40%)
+                            news_score = 20 # 기본점수
                             if news:
-                                for i, n in enumerate(news, 1):
-                                    title = n.get('title','')
-                                    link = n.get('link','#')
-                                    press = n.get('press','')
-                                    st.markdown(f"{i}. [{title}]({link}) ({press})")
-                            else:
-                                st.write("최근 관련 뉴스가 없습니다.")
-
-                        st.info("심층 분석 기능은 현재 비활성화되어 있습니다. 제공된 지표를 참고해주세요.")
+                                news_score = 40 # 뉴스가 있으면 모멘텀 우수로 간주
+                                
+                            # 2. 시장 트렌드 (20%) - 1개월 수익률 기준
+                            trend_score = 10
+                            if tech['one_month_return'] > 5:
+                                trend_score = 20
+                            elif tech['one_month_return'] > 0:
+                                trend_score = 15
+                            elif tech['one_month_return'] < -10:
+                                trend_score = 0
+                                
+                            # 3. 기술적 지표 (10%)
+                            tech_score = 5
+                            if tech['price'] > tech['sma20'] and tech['macd'] > tech['signal']:
+                                tech_score = 10
+                            elif tech['rsi'] <= 40:
+                                tech_score = 8 # 눌림목
+                                
+                            # 4. 경영지표 (20%) - 우선순위: 영업이익률 > ROE
+                            mgmt_score = 0
+                            if fundamentals['op_margin'] >= 10: mgmt_score += 12
+                            elif fundamentals['op_margin'] >= 5: mgmt_score += 8
+                            else: mgmt_score += 4
+                            
+                            if fundamentals['roe'] >= 10: mgmt_score += 8
+                            elif fundamentals['roe'] >= 5: mgmt_score += 5
+                            else: mgmt_score += 2
+                            
+                            # 5. 밸류에이션 (10%) - 우선순위: 추정PER > PBR
+                            val_score = 0
+                            per = fundamentals['cns_per'] if fundamentals['cns_per'] > 0 else fundamentals['per']
+                            if 0 < per < 15: val_score += 6
+                            elif 15 <= per < 30: val_score += 3
+                            
+                            if 0 < fundamentals['pbr'] < 1.5: val_score += 4
+                            elif 1.5 <= fundamentals['pbr'] < 3: val_score += 2
+                            
+                            total_score = news_score + trend_score + tech_score + mgmt_score + val_score
+                            
+                            opinion = "매도"
+                            color = "red"
+                            if total_score >= 80:
+                                opinion = "강력 매수"
+                                color = "green"
+                            elif total_score >= 60:
+                                opinion = "매수"
+                                color = "blue"
+                            elif total_score >= 40:
+                                opinion = "관망"
+                                color = "orange"
+                                
+                            st.markdown("---")
+                            st.markdown(f"### 📊 [{fundamentals['name']}] AI 매수 분석 결과: **:{color}[{opinion}]** (총점: {total_score}점)")
+                            
+                            col1, col2, col3, col4 = st.columns(4)
+                            col1.metric("종합 점수", f"{total_score}점")
+                            col2.metric("뉴스/모멘텀 (40)", f"{news_score}점")
+                            col3.metric("경영/밸류 (30)", f"{mgmt_score + val_score}점")
+                            col4.metric("기술/트렌드 (30)", f"{tech_score + trend_score}점")
+                            
+                            st.markdown("#### 🔍 상세 지표 분석")
+                            t1, t2, t3 = st.tabs(["재무 및 밸류에이션", "기술적 지표 및 트렌드", "관련 최신 뉴스"])
+                            with t1:
+                                st.write(f"- **영업이익률**: {fundamentals['op_margin']}%")
+                                st.write(f"- **ROE**: {fundamentals['roe']}%")
+                                st.write(f"- **추정 PER**: {fundamentals['cns_per']}배 (후행 PER: {fundamentals['per']}배)")
+                                st.write(f"- **PBR**: {fundamentals['pbr']}배")
+                            with t2:
+                                st.write(f"- **현재 주가**: {int(tech['price']):,}원")
+                                st.write(f"- **최근 1개월 수익률**: {tech['one_month_return']:.2f}%")
+                                st.write(f"- **RSI (14)**: {tech['rsi']:.2f}")
+                                st.write(f"- **MACD 신호**: {'매수 우위' if tech['macd'] > tech['signal'] else '매도 우위'}")
+                                st.write(f"- **이동평균선**: {'20일선 위 (상승추세)' if tech['price'] > tech['sma20'] else '20일선 아래 (조정/하락)'}")
+                            with t3:
+                                if news:
+                                    for i, n in enumerate(news, 1):
+                                        st.markdown(f"{i}. [{n['title']}]({n['link']}) ({n['press']})")
+                                else:
+                                    st.write("최근 관련 뉴스가 없습니다.")

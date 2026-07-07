@@ -1,8 +1,9 @@
+# -*- coding: utf-8 -*-
 import re
 
 
 def format_index_change_value(change_text):
-    """지수 변화 문자열을 Streamlit metric용 +/- 형식으로 변환한다."""
+    """지수 변화 문자열을 '상승/하락/보합 + 수치' 형식으로 변환한다."""
     if not change_text:
         return ""
 
@@ -10,17 +11,17 @@ def format_index_change_value(change_text):
     lowered = text.lower()
 
     if re.search(r"하락|down|하락세", text, flags=re.I):
-        sign = "-"
+        direction = "하락"
     elif re.search(r"상승|up|상승세", text, flags=re.I):
-        sign = "+"
+        direction = "상승"
     elif re.search(r"보합|flat|유지|unchanged", text, flags=re.I):
-        sign = ""
+        direction = "보합"
     else:
-        sign = ""
+        direction = ""
 
     matches = list(re.finditer(r"([+-]?\d+(?:\.\d+)?)(\s*%)?", text))
     if not matches:
-        return ""
+        return direction or ""
 
     chosen = None
     for match in reversed(matches):
@@ -35,11 +36,6 @@ def format_index_change_value(change_text):
     number = chosen.group(1)
     suffix = "%" if "%" in chosen.group(0) else ""
 
-    if number.startswith(("+", "-")):
-        return f"{number}{suffix}"
-
-    if re.search(r"하락|down", lowered):
-        return f"-{number}{suffix}"
-    if re.search(r"상승|up", lowered) or not re.search(r"보합|flat|유지|unchanged", lowered):
-        return f"+{number}{suffix}"
+    if direction:
+        return f"{direction} {number}{suffix}"
     return f"{number}{suffix}"
