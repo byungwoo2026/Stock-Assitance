@@ -1,9 +1,10 @@
 import streamlit as st
 import pandas as pd
+import FinanceDataReader as fdr
 import requests
 from bs4 import BeautifulSoup
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 import time
 import xml.etree.ElementTree as ET
 # pyrefly: ignore [missing-import]
@@ -104,7 +105,6 @@ def fetch_market_index(market_type="KOSPI", retries=3):
 @st.cache_data(ttl=3600) # 1시간 단위 캐싱 (1달 추세이므로 자주 변하지 않음)
 def fetch_1month_sector_trends():
     """대표 섹터 ETF들의 과거 1달(22영업일) 주가 데이터를 통해 진짜 자금 유입 업종 분석"""
-    import xml.etree.ElementTree as ET
     
     # 핵심 산업 섹터와 해당 섹터를 대표하는 ETF 종목코드 매핑
     sector_etfs = {
@@ -121,22 +121,18 @@ def fetch_1month_sector_trends():
     }
     
     results = []
-    headers = {"User-Agent": "Mozilla/5.0"}
+    # 영업일 기준 22일(약 1달)을 확보하기 위해 약 45일 전 데이터부터 조회
+    start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
     
     for sector, symbol in sector_etfs.items():
-        # 영업일 기준 22일(약 1달) 데이터 요청
-        url = f"https://fchart.stock.naver.com/sise.nhn?symbol={symbol}&timeframe=day&count=22&requestType=0"
         try:
-            res = requests.get(url, headers=headers, timeout=5)
-            root = ET.fromstring(res.text)
-            items = root.findall('.//item')
-            if not items: continue
+            df = fdr.DataReader(symbol, start_date)
+            if df.empty or len(df) < 22:
+                continue
             
-            first_day = items[0].get('data').split('|')
-            last_day = items[-1].get('data').split('|')
-            
-            start_price = int(first_day[4]) # 1달 전 종가
-            end_price = int(last_day[4])    # 현재 종가
+            df_recent = df.tail(22)
+            start_price = float(df_recent.iloc[0]['Close']) # 1달 전 종가
+            end_price = float(df_recent.iloc[-1]['Close'])    # 현재 종가
             
             # 1달 수익률 산출
             return_rate = (end_price - start_price) / start_price * 100
@@ -274,7 +270,6 @@ def run_logical_screener():
     """
     import pandas as pd
     import requests
-    import xml.etree.ElementTree as ET
     from bs4 import BeautifulSoup
     
     url_quant = "https://finance.naver.com/sise/sise_quant.naver"
@@ -294,20 +289,17 @@ def run_logical_screener():
 
     scored_stocks = []
     
+    # 100 영업일 분량의 데이터를 충분히 확보하기 위해 약 150일 전 날짜부터 조회
+    start_date = (datetime.now() - timedelta(days=150)).strftime('%Y-%m-%d')
+    
     for s in stocks:
         try:
-            url_chart = f"https://fchart.stock.naver.com/sise.nhn?symbol={s['code']}&timeframe=day&count=100&requestType=0"
-            res_chart = requests.get(url_chart, headers=headers, timeout=3)
-            root = ET.fromstring(res_chart.text)
-            items = root.findall('.//item')
-            if len(items) < 60: continue
+            df_fdr = fdr.DataReader(s['code'], start_date)
+            if df_fdr.empty or len(df_fdr) < 60:
+                continue
             
-            data = []
-            for item in items:
-                vals = item.get('data').split('|')
-                data.append({'close': float(vals[4])})
-            
-            df = pd.DataFrame(data)
+            df_fdr = df_fdr.tail(100) # 최근 100개 데이터 사용
+            df = pd.DataFrame({'close': df_fdr['Close']}).reset_index(drop=True)
             
             # 이동평균선
             df['SMA20'] = df['close'].rolling(window=20).mean()
@@ -443,20 +435,14 @@ def fetch_stock_name_and_fundamentals(code):
         return None
 
 def analyze_stock_technical(code):
-    url_chart = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=100&requestType=0"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    start_date = (datetime.now() - timedelta(days=150)).strftime('%Y-%m-%d')
     try:
-        res_chart = requests.get(url_chart, headers=headers, timeout=3)
-        root = ET.fromstring(res_chart.text)
-        items = root.findall('.//item')
-        if len(items) < 60: return None
+        df_fdr = fdr.DataReader(code, start_date)
+        if df_fdr.empty or len(df_fdr) < 60:
+            return None
         
-        data = []
-        for item in items:
-            vals = item.get('data').split('|')
-            data.append({'close': float(vals[4])})
-            
-        df = pd.DataFrame(data)
+        df_fdr = df_fdr.tail(100) # 최근 100개 데이터 사용
+        df = pd.DataFrame({'close': df_fdr['Close']}).reset_index(drop=True)
         
         df['SMA20'] = df['close'].rolling(window=20).mean()
         df['SMA60'] = df['close'].rolling(window=60).mean()
@@ -593,6 +579,49 @@ def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
     except Exception as e:
         return f"⚠️ AI 시장 분석 중 오류가 발생했습니다: {e}"
 
+@st.cache_data(ttl=1800)
+def fetch_etf_market_data():
+    try:
+        return fdr.StockListing('ETF/KR')
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=1800)
+def fetch_etf_weekly_returns(df_etf):
+    from concurrent.futures import ThreadPoolExecutor
+    
+    # 거래대금 상위 50개만 필터링하여 수익률 연산 (부하 분산)
+    df_top = df_etf.sort_values(by='Amount', ascending=False).head(50)
+    start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+    
+    def fetch_return(row):
+        symbol = row['Symbol']
+        name = row['Name']
+        try:
+            hist = fdr.DataReader(symbol, start_date)
+            if len(hist) > 2:
+                ret = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100
+                return {
+                    "종목코드": symbol,
+                    "종목명": name,
+                    "현재가": f"{int(row['Price']):,}원",
+                    "1주일 수익률": ret
+                }
+        except Exception:
+            pass
+        return None
+
+    rows = [row for _, row in df_top.iterrows()]
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(fetch_return, rows))
+        
+    results = [r for r in results if r is not None]
+    df_res = pd.DataFrame(results)
+    if not df_res.empty:
+        df_res = df_res.sort_values(by='1주일 수익률', ascending=False).head(10)
+        df_res['1주일 수익률'] = df_res['1주일 수익률'].apply(lambda x: f"+{x:.2f}%" if x > 0 else f"{x:.2f}%")
+    return df_res
+
 # 각 메뉴별 UI 화면 구성
 if menu == "종합 대시보드":
     st.subheader("오늘의 투자 핵심 요약")
@@ -645,11 +674,11 @@ elif menu == "시장 자금 & 업종 분석":
             top_sectors = fetch_1month_sector_trends()
             
             if top_sectors:
-            df_sectors = pd.DataFrame(top_sectors)
-            df_sectors.index = range(1, len(df_sectors) + 1)
-            st.dataframe(df_sectors[['업종/테마', '변동']], width='stretch')
-        else:
-            st.error("업종 데이터를 불러오는 데 실패했습니다.")
+                df_sectors = pd.DataFrame(top_sectors)
+                df_sectors.index = range(1, len(df_sectors) + 1)
+                st.dataframe(df_sectors[['업종/테마', '변동']], width='stretch')
+            else:
+                st.error("업종 데이터를 불러오는 데 실패했습니다.")
             
     with tab2:
         st.write("외국인 및 기관이 7일간 연속/집중 매수하는 코스피/코스닥 상위 10개 종목을 도출하고 매수 사유(관련 최신 뉴스)를 분석합니다.")
@@ -955,61 +984,47 @@ elif menu == "개별종목분석":
     
     # Tab 2: ETF List
     with tab2:
-        st.info("💡 분석을 원하는 **ETF 최대 10개**의 **ETF명**(예: KODEX 200) 또는 **6자리 종목코드**를 입력하세요. 콤마(,)로 구분해주세요.")
+        st.markdown("### 📊 ETF 시장 실시간 핫 트렌드 (Hot Trends)")
+        st.write("시장 내 거래량, 수익률, 신규 상장 트렌드를 분석하여 상위 10선 리스트를 제공합니다.")
         
-        etf_list_input = st.text_area("ETF명 또는 종목코드 입력 (콤마로 구분, 최대 10개)", height=100, key="etf_input")
-        
-        if st.button("ETF 분석 시작", key="etf_analyze") and etf_list_input:
-            # 입력값 파싱
-            inputs = [x.strip() for x in etf_list_input.split(',')]
-            inputs = inputs[:10]  # 최대 10개로 제한
+        with st.spinner("ETF 시장 트렌드 데이터를 수집 중입니다..."):
+            df_etf = fetch_etf_market_data()
             
-            code_map = get_stock_code_map()
-            stock_codes = []
+        if df_etf.empty:
+            st.error("ETF 데이터를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
+        else:
+            col1, col2, col3 = st.columns(3)
             
-            # 종목코드로 변환
-            for inp in inputs:
-                if inp.isdigit() and len(inp) == 6:
-                    stock_codes.append(inp)
+            with col1:
+                st.markdown("#### 💰 자금유입 (거래대금) 상위 10선")
+                df_inflow = df_etf.sort_values(by='Amount', ascending=False).head(10).copy()
+                df_inflow_display = pd.DataFrame({
+                    "종목명": df_inflow['Name'],
+                    "종목코드": df_inflow['Symbol'],
+                    "현재가": df_inflow['Price'].apply(lambda x: f"{int(x):,}원"),
+                    "거래대금": df_inflow['Amount'].apply(lambda x: f"{x/100:.1f}억 원" if x < 10000 else f"{x/10000:.2f}조 원")
+                })
+                st.dataframe(df_inflow_display, hide_index=True, use_container_width=True)
+                
+            with col2:
+                st.markdown("#### 📈 1주일 수익률 상위 10선")
+                with st.spinner("주간 수익률 분석 중..."):
+                    df_weekly = fetch_etf_weekly_returns(df_etf)
+                if not df_weekly.empty:
+                    st.dataframe(df_weekly[['종목명', '종목코드', '현재가', '1주일 수익률']], hide_index=True, use_container_width=True)
                 else:
-                    code = code_map.get(inp)
-                    if code:
-                        stock_codes.append(code)
-            
-            if not stock_codes:
-                st.warning("올바른 ETF명 또는 6자리 종목코드를 입력해주세요.")
-            else:
-                # 분석 수행
-                analysis_results = []
-                progress_bar = st.progress(0)
-                
-                for idx, code in enumerate(stock_codes):
-                    with st.spinner(f"분석 중... ({idx+1}/{len(stock_codes)})"):
-                        fundamentals = fetch_stock_name_and_fundamentals(code)
-                        if fundamentals:
-                            tech = analyze_stock_technical(code)
-                            if tech:
-                                total_score = calculate_stock_score(fundamentals, tech)
-                                macd_signal = '매수' if tech['macd'] > tech['signal'] else '매도'
-                                analysis_results.append({
-                                    "종목명": fundamentals['name'],
-                                    "총점": total_score,
-                                    "현재주가": f"{int(tech['price']):,}원",
-                                    "영업이익률": f"{fundamentals['op_margin']}%",
-                                    "ROE": f"{fundamentals['roe']}%",
-                                    "PBR": f"{fundamentals['pbr']}배",
-                                    "RSI": f"{tech['rsi']:.2f}",
-                                    "MACD": macd_signal,
-                                    "1개월수익률": f"{tech['one_month_return']:.2f}%"
-                                })
-                    progress_bar.progress((idx + 1) / len(stock_codes))
-                
-                # 결과 테이블 표시
-                if analysis_results:
-                    st.markdown("---")
-                    st.markdown("### 📊 분석 결과")
-                    df_results = pd.DataFrame(analysis_results)
-                    st.dataframe(df_results, width='stretch')
+                    st.warning("수익률 데이터를 연산할 수 없습니다.")
+                    
+            with col3:
+                st.markdown("#### 🆕 신규 상장 ETF 10선")
+                df_new = df_etf.sort_values(by='Symbol', ascending=False).head(10).copy()
+                df_new_display = pd.DataFrame({
+                    "종목명": df_new['Name'],
+                    "종목코드": df_new['Symbol'],
+                    "현재가": df_new['Price'].apply(lambda x: f"{int(x):,}원"),
+                    "시가총액": df_new['MarCap'].apply(lambda x: f"{float(x):,.0f}억 원" if float(x) < 10000 else f"{float(x)/10000:.2f}조 원")
+                })
+                st.dataframe(df_new_display, hide_index=True, use_container_width=True)
     
     # Tab 3: 개별종목 분석 (기존 방식)
     with tab3:
