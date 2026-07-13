@@ -20,7 +20,7 @@ st.title("📈 나만의 AI 투자 조수 대시보드")
 st.markdown("시장의 자금 쏠림, 주주 수급, 주요 뉴스 및 기술적 매수 신호를 분석합니다.")
 
 # 사이드바 메뉴 구성
-menu = st.sidebar.selectbox("메뉴 선택", ["종합 대시보드", "시장 자금 & 업종 분석", "주요 기업 헤드라인 뉴스", "외인 수급 & 기술적 조건 스크리너", "최우수 애널리스트 추천 종목", "가치재평가주", "개별종목분석"])
+menu = st.sidebar.selectbox("메뉴 선택", ["종합 대시보드", "시장 자금 & 업종 분석", "주요 기업 헤드라인 뉴스", "외인 수급 & 기술적 조건 스크리너", "최우수 애널리스트 추천 종목", "가치재평가주", "퀀트 투자 리스트", "개별종목분석"])
 
 # 차단 없는 네이버 뉴스 RSS 엔진
 def fetch_headlines_rss(keyword):
@@ -501,6 +501,31 @@ def get_stock_code_map():
         pass
     return code_map
 
+@st.cache_data(ttl=1800)
+def build_quant_filter_candidates():
+    """퀀트 필터 조건을 테스트할 수 있도록 대표 종목들의 펀더멘털 데이터를 수집합니다."""
+    sample_codes = ["005930", "000660", "035420", "035720", "068270", "051910", "006400", "207940", "030200", "323410"]
+    rows = []
+    for code in sample_codes:
+        try:
+            fundamentals = fetch_stock_name_and_fundamentals(code)
+            if not fundamentals:
+                continue
+            rows.append({
+                "종목코드": code,
+                "종목명": fundamentals["name"],
+                "PER": fundamentals["per"],
+                "PBR": fundamentals["pbr"],
+                "ROE": fundamentals["roe"],
+                "영업이익률": fundamentals["op_margin"],
+                "시가총액": None,
+                "매출성장률": None,
+                "업종": "기타",
+            })
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
 def get_ai_summary(news_list):
     try:
         genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
@@ -872,6 +897,67 @@ elif menu == "가치재평가주":
         high_growth_stocks = ["에코프로비엠", "포스코퓨처엠", "알테오젠", "루닛", "엘앤에프", "나노신소재", "제이엘케이", "뷰노", "에코프로", "코스메카코리아"]
         for idx, stock in enumerate(high_growth_stocks, 1):
             st.markdown(f"**{idx}. {stock}** (글로벌 메가 트렌드 편승 및 폭발적인 실적 퀀텀점프)")
+
+elif menu == "퀀트 투자 리스트":
+    st.subheader("🧠 퀀트 투자 리스트")
+    st.markdown("조건을 입력하면 pandas로 필터링된 종목 리스트를 바로 확인할 수 있습니다.")
+    st.info("예시 조건: PER ≤ 15, PBR ≤ 1.5, ROE ≥ 10, 영업이익률 ≥ 5")
+
+    with st.expander("📌 필터 조건 설정", expanded=True):
+        col1, col2, col3, col4, col5 = st.columns(5)
+        with col1:
+            per_limit = st.number_input("PER 상한선", min_value=0.0, value=15.0, step=0.5)
+        with col2:
+            pbr_limit = st.number_input("PBR 상한선", min_value=0.0, value=1.5, step=0.1)
+        with col3:
+            roe_min = st.number_input("ROE 하한선 (%)", min_value=0.0, value=10.0, step=0.5)
+        with col4:
+            op_margin_min = st.number_input("영업이익률 하한선 (%)", min_value=0.0, value=5.0, step=0.5)
+        with col5:
+            revenue_growth_min = st.number_input("매출성장률 하한선 (%)", min_value=-100.0, value=10.0, step=1.0)
+
+        col6, col7, col8 = st.columns(3)
+        with col6:
+            market_cap_min = st.number_input("시가총액 최소값(억원)", min_value=0, value=1000, step=100)
+        with col7:
+            included_sector = st.text_input("업종 키워드(예: 반도체, 바이오)", value="")
+        with col8:
+            top_n = st.slider("표시 종목 수", min_value=5, max_value=50, value=20, step=5)
+
+        sort_column = st.selectbox("정렬 기준", ["ROE", "영업이익률", "PER", "PBR", "매출성장률"])
+
+    with st.spinner("펀더멘털 데이터를 수집하고 조건을 적용 중입니다..."):
+        df_candidates = build_quant_filter_candidates()
+
+    if df_candidates.empty:
+        st.warning("종목 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.")
+    else:
+        df_candidates = df_candidates.dropna(subset=["PER", "PBR", "ROE", "영업이익률"]).copy()
+        mask = (
+            (df_candidates["PER"] > 0) &
+            (df_candidates["PER"] <= per_limit) &
+            (df_candidates["PBR"] > 0) &
+            (df_candidates["PBR"] <= pbr_limit) &
+            (df_candidates["ROE"] >= roe_min) &
+            (df_candidates["영업이익률"] >= op_margin_min)
+        )
+        filtered = df_candidates.loc[mask].copy()
+
+        if market_cap_min > 0:
+            filtered = filtered.loc[filtered["시가총액"].isna() | (filtered["시가총액"] >= market_cap_min)]
+        if included_sector:
+            filtered = filtered.loc[filtered["업종"].astype(str).str.contains(included_sector, case=False, na=False)]
+        if revenue_growth_min is not None:
+            filtered = filtered.loc[filtered["매출성장률"].isna() | (filtered["매출성장률"] >= revenue_growth_min)]
+
+        if filtered.empty:
+            st.warning("입력한 조건에 맞는 종목이 없습니다. 기준을 완화해 보세요.")
+        else:
+            filtered = filtered.sort_values(by=sort_column, ascending=False)
+            filtered = filtered.head(top_n)
+            st.success("조건에 맞는 종목 리스트")
+            st.dataframe(filtered[["종목명", "종목코드", "PER", "PBR", "ROE", "영업이익률", "매출성장률", "시가총액", "업종"]], hide_index=True, use_container_width=True)
+            st.caption(f"적용 조건: PER ≤ {per_limit}, PBR ≤ {pbr_limit}, ROE ≥ {roe_min}%, 영업이익률 ≥ {op_margin_min}%, 매출성장률 ≥ {revenue_growth_min}%, 시가총액 ≥ {market_cap_min}억, 업종 키워드: {included_sector or '전체'}")
 
 elif menu == "개별종목분석":
     st.subheader("🤖 개별종목분석")
