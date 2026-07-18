@@ -1,10 +1,9 @@
 import streamlit as st
 import pandas as pd
-import FinanceDataReader as fdr
 import requests
 from bs4 import BeautifulSoup
 import re
-from datetime import datetime, timedelta
+from datetime import datetime
 import time
 import xml.etree.ElementTree as ET
 # pyrefly: ignore [missing-import]
@@ -20,7 +19,7 @@ st.title("📈 나만의 AI 투자 조수 대시보드")
 st.markdown("시장의 자금 쏠림, 주주 수급, 주요 뉴스 및 기술적 매수 신호를 분석합니다.")
 
 # 사이드바 메뉴 구성
-menu = st.sidebar.selectbox("메뉴 선택", ["종합 대시보드", "시장 자금 & 업종 분석", "주요 기업 헤드라인 뉴스", "외인 수급 & 기술적 조건 스크리너", "최우수 애널리스트 추천 종목", "가치재평가주", "퀀트 투자 리스트", "개별종목분석"])
+menu = st.sidebar.selectbox("메뉴 선택", ["종합 대시보드", "시장 자금 & 업종 분석", "주요 기업 헤드라인 뉴스", "외인 수급 & 기술적 조건 스크리너", "최우수 애널리스트 추천 종목", "가치재평가주", "개별종목분석"])
 
 # 차단 없는 네이버 뉴스 RSS 엔진
 def fetch_headlines_rss(keyword):
@@ -105,6 +104,7 @@ def fetch_market_index(market_type="KOSPI", retries=3):
 @st.cache_data(ttl=3600) # 1시간 단위 캐싱 (1달 추세이므로 자주 변하지 않음)
 def fetch_1month_sector_trends():
     """대표 섹터 ETF들의 과거 1달(22영업일) 주가 데이터를 통해 진짜 자금 유입 업종 분석"""
+    import xml.etree.ElementTree as ET
     
     # 핵심 산업 섹터와 해당 섹터를 대표하는 ETF 종목코드 매핑
     sector_etfs = {
@@ -121,18 +121,22 @@ def fetch_1month_sector_trends():
     }
     
     results = []
-    # 영업일 기준 22일(약 1달)을 확보하기 위해 약 45일 전 데이터부터 조회
-    start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+    headers = {"User-Agent": "Mozilla/5.0"}
     
     for sector, symbol in sector_etfs.items():
+        # 영업일 기준 22일(약 1달) 데이터 요청
+        url = f"https://fchart.stock.naver.com/sise.nhn?symbol={symbol}&timeframe=day&count=22&requestType=0"
         try:
-            df = fdr.DataReader(symbol, start_date)
-            if df.empty or len(df) < 22:
-                continue
+            res = requests.get(url, headers=headers, timeout=5)
+            root = ET.fromstring(res.text)
+            items = root.findall('.//item')
+            if not items: continue
             
-            df_recent = df.tail(22)
-            start_price = float(df_recent.iloc[0]['Close']) # 1달 전 종가
-            end_price = float(df_recent.iloc[-1]['Close'])    # 현재 종가
+            first_day = items[0].get('data').split('|')
+            last_day = items[-1].get('data').split('|')
+            
+            start_price = int(first_day[4]) # 1달 전 종가
+            end_price = int(last_day[4])    # 현재 종가
             
             # 1달 수익률 산출
             return_rate = (end_price - start_price) / start_price * 100
@@ -270,6 +274,7 @@ def run_logical_screener():
     """
     import pandas as pd
     import requests
+    import xml.etree.ElementTree as ET
     from bs4 import BeautifulSoup
     
     url_quant = "https://finance.naver.com/sise/sise_quant.naver"
@@ -289,17 +294,20 @@ def run_logical_screener():
 
     scored_stocks = []
     
-    # 100 영업일 분량의 데이터를 충분히 확보하기 위해 약 150일 전 날짜부터 조회
-    start_date = (datetime.now() - timedelta(days=150)).strftime('%Y-%m-%d')
-    
     for s in stocks:
         try:
-            df_fdr = fdr.DataReader(s['code'], start_date)
-            if df_fdr.empty or len(df_fdr) < 60:
-                continue
+            url_chart = f"https://fchart.stock.naver.com/sise.nhn?symbol={s['code']}&timeframe=day&count=100&requestType=0"
+            res_chart = requests.get(url_chart, headers=headers, timeout=3)
+            root = ET.fromstring(res_chart.text)
+            items = root.findall('.//item')
+            if len(items) < 60: continue
             
-            df_fdr = df_fdr.tail(100) # 최근 100개 데이터 사용
-            df = pd.DataFrame({'close': df_fdr['Close']}).reset_index(drop=True)
+            data = []
+            for item in items:
+                vals = item.get('data').split('|')
+                data.append({'close': float(vals[4])})
+            
+            df = pd.DataFrame(data)
             
             # 이동평균선
             df['SMA20'] = df['close'].rolling(window=20).mean()
@@ -396,17 +404,6 @@ def fetch_stock_name_and_fundamentals(code):
         pbr = soup.select_one('#_pbr').text if soup.select_one('#_pbr') else "0"
         cns_per = soup.select_one('#_cns_per').text if soup.select_one('#_cns_per') else "0"
         
-# --- [수정] 동일업종 PER 크롤링 로직 추가 ---
-        sector_per = "0"
-        sector_per_elem = soup.select_one('#tab_con1 table.tb_type1 tr td em')
-        if not sector_per_elem:
-            for th in soup.select('.aside_invest table.tbl_type tr th'):
-                if '동일업종 PER' in th.text:
-                    td = th.find_next_sibling('td')
-                    if td: sector_per = td.text.strip()
-        else:
-            sector_per = sector_per_elem.text.strip()
-
         op_margin, roe = "0", "0"
         tables = soup.select('table.tb_type1_ifrs')
         if tables:
@@ -439,7 +436,6 @@ def fetch_stock_name_and_fundamentals(code):
             "per": clean_num(per),
             "pbr": clean_num(pbr),
             "cns_per": clean_num(cns_per),
-            "sector_per": clean_num(sector_per),
             "op_margin": clean_num(op_margin),
             "roe": clean_num(roe)
         }
@@ -447,20 +443,21 @@ def fetch_stock_name_and_fundamentals(code):
         return None
 
 def analyze_stock_technical(code):
-    start_date = (datetime.now() - timedelta(days=150)).strftime('%Y-%m-%d')
+    url_chart = f"https://fchart.stock.naver.com/sise.nhn?symbol={code}&timeframe=day&count=100&requestType=0"
+    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        df_fdr = fdr.DataReader(code, start_date)
-        if df_fdr.empty or len(df_fdr) < 60:
-            return None
+        res_chart = requests.get(url_chart, headers=headers, timeout=3)
+        root = ET.fromstring(res_chart.text)
+        items = root.findall('.//item')
+        if len(items) < 60: return None
         
-        df_fdr = df_fdr.tail(100) # 최근 100개 데이터 사용
-                
-# --- [수정] 거래량 데이터도 함께 수집 ---
-        df = pd.DataFrame({
-            'close': df_fdr['Close'],
-            'volume': df_fdr['Volume']
-        }).reset_index(drop=True)
-
+        data = []
+        for item in items:
+            vals = item.get('data').split('|')
+            data.append({'close': float(vals[4])})
+            
+        df = pd.DataFrame(data)
+        
         df['SMA20'] = df['close'].rolling(window=20).mean()
         df['SMA60'] = df['close'].rolling(window=60).mean()
         
@@ -482,11 +479,6 @@ def analyze_stock_technical(code):
         start_price = df.iloc[-22]['close'] if len(df) >= 22 else df.iloc[0]['close']
         one_month_return = (last['close'] - start_price) / start_price * 100
         
-# --- [수정] 5일 평균 거래량 대비 당일 증가율 계산 ---
-        avg_volume_5d = df['volume'].iloc[-6:-1].mean() if len(df) >= 6 else 1.0
-        if avg_volume_5d == 0: avg_volume_5d = 1.0
-        volume_ratio = (last['volume'] / avg_volume_5d) * 100
-
         return {
             "price": last['close'],
             "sma20": last['SMA20'],
@@ -494,8 +486,7 @@ def analyze_stock_technical(code):
             "macd": last['MACD'],
             "signal": last['Signal'],
             "rsi": last['RSI'],
-            "one_month_return": one_month_return,
-            "volume_ratio": volume_ratio # 반환값 추가
+            "one_month_return": one_month_return
         }
     except Exception:
         return None
@@ -523,31 +514,6 @@ def get_stock_code_map():
     except Exception:
         pass
     return code_map
-
-@st.cache_data(ttl=1800)
-def build_quant_filter_candidates():
-    """퀀트 필터 조건을 테스트할 수 있도록 대표 종목들의 펀더멘털 데이터를 수집합니다."""
-    sample_codes = ["005930", "000660", "035420", "035720", "068270", "051910", "006400", "207940", "030200", "323410"]
-    rows = []
-    for code in sample_codes:
-        try:
-            fundamentals = fetch_stock_name_and_fundamentals(code)
-            if not fundamentals:
-                continue
-            rows.append({
-                "종목코드": code,
-                "종목명": fundamentals["name"],
-                "PER": fundamentals["per"],
-                "PBR": fundamentals["pbr"],
-                "ROE": fundamentals["roe"],
-                "영업이익률": fundamentals["op_margin"],
-                "시가총액": None,
-                "매출성장률": None,
-                "업종": "기타",
-            })
-        except Exception:
-            continue
-    return pd.DataFrame(rows)
 
 def get_ai_summary(news_list):
     try:
@@ -627,49 +593,6 @@ def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
     except Exception as e:
         return f"⚠️ AI 시장 분석 중 오류가 발생했습니다: {e}"
 
-@st.cache_data(ttl=1800)
-def fetch_etf_market_data():
-    try:
-        return fdr.StockListing('ETF/KR')
-    except Exception:
-        return pd.DataFrame()
-
-@st.cache_data(ttl=1800)
-def fetch_etf_weekly_returns(df_etf):
-    from concurrent.futures import ThreadPoolExecutor
-    
-    # 거래대금 상위 50개만 필터링하여 수익률 연산 (부하 분산)
-    df_top = df_etf.sort_values(by='Amount', ascending=False).head(50)
-    start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
-    
-    def fetch_return(row):
-        symbol = row['Symbol']
-        name = row['Name']
-        try:
-            hist = fdr.DataReader(symbol, start_date)
-            if len(hist) > 2:
-                ret = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100
-                return {
-                    "종목코드": symbol,
-                    "종목명": name,
-                    "현재가": f"{int(row['Price']):,}원",
-                    "1주일 수익률": ret
-                }
-        except Exception:
-            pass
-        return None
-
-    rows = [row for _, row in df_top.iterrows()]
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(fetch_return, rows))
-        
-    results = [r for r in results if r is not None]
-    df_res = pd.DataFrame(results)
-    if not df_res.empty:
-        df_res = df_res.sort_values(by='1주일 수익률', ascending=False).head(10)
-        df_res['1주일 수익률'] = df_res['1주일 수익률'].apply(lambda x: f"+{x:.2f}%" if x > 0 else f"{x:.2f}%")
-    return df_res
-
 # 각 메뉴별 UI 화면 구성
 if menu == "종합 대시보드":
     st.subheader("오늘의 투자 핵심 요약")
@@ -722,11 +645,11 @@ elif menu == "시장 자금 & 업종 분석":
             top_sectors = fetch_1month_sector_trends()
             
             if top_sectors:
-                df_sectors = pd.DataFrame(top_sectors)
-                df_sectors.index = range(1, len(df_sectors) + 1)
-                st.dataframe(df_sectors[['업종/테마', '변동']], width='stretch')
-            else:
-                st.error("업종 데이터를 불러오는 데 실패했습니다.")
+            df_sectors = pd.DataFrame(top_sectors)
+            df_sectors.index = range(1, len(df_sectors) + 1)
+            st.dataframe(df_sectors[['업종/테마', '변동']], width='stretch')
+        else:
+            st.error("업종 데이터를 불러오는 데 실패했습니다.")
             
     with tab2:
         st.write("외국인 및 기관이 7일간 연속/집중 매수하는 코스피/코스닥 상위 10개 종목을 도출하고 매수 사유(관련 최신 뉴스)를 분석합니다.")
@@ -921,67 +844,6 @@ elif menu == "가치재평가주":
         for idx, stock in enumerate(high_growth_stocks, 1):
             st.markdown(f"**{idx}. {stock}** (글로벌 메가 트렌드 편승 및 폭발적인 실적 퀀텀점프)")
 
-elif menu == "퀀트 투자 리스트":
-    st.subheader("🧠 퀀트 투자 리스트")
-    st.markdown("조건을 입력하면 pandas로 필터링된 종목 리스트를 바로 확인할 수 있습니다.")
-    st.info("예시 조건: PER ≤ 15, PBR ≤ 1.5, ROE ≥ 10, 영업이익률 ≥ 5")
-
-    with st.expander("📌 필터 조건 설정", expanded=True):
-        col1, col2, col3, col4, col5 = st.columns(5)
-        with col1:
-            per_limit = st.number_input("PER 상한선", min_value=0.0, value=15.0, step=0.5)
-        with col2:
-            pbr_limit = st.number_input("PBR 상한선", min_value=0.0, value=1.5, step=0.1)
-        with col3:
-            roe_min = st.number_input("ROE 하한선 (%)", min_value=0.0, value=10.0, step=0.5)
-        with col4:
-            op_margin_min = st.number_input("영업이익률 하한선 (%)", min_value=0.0, value=5.0, step=0.5)
-        with col5:
-            revenue_growth_min = st.number_input("매출성장률 하한선 (%)", min_value=-100.0, value=10.0, step=1.0)
-
-        col6, col7, col8 = st.columns(3)
-        with col6:
-            market_cap_min = st.number_input("시가총액 최소값(억원)", min_value=0, value=1000, step=100)
-        with col7:
-            included_sector = st.text_input("업종 키워드(예: 반도체, 바이오)", value="")
-        with col8:
-            top_n = st.slider("표시 종목 수", min_value=5, max_value=50, value=20, step=5)
-
-        sort_column = st.selectbox("정렬 기준", ["ROE", "영업이익률", "PER", "PBR", "매출성장률"])
-
-    with st.spinner("펀더멘털 데이터를 수집하고 조건을 적용 중입니다..."):
-        df_candidates = build_quant_filter_candidates()
-
-    if df_candidates.empty:
-        st.warning("종목 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.")
-    else:
-        df_candidates = df_candidates.dropna(subset=["PER", "PBR", "ROE", "영업이익률"]).copy()
-        mask = (
-            (df_candidates["PER"] > 0) &
-            (df_candidates["PER"] <= per_limit) &
-            (df_candidates["PBR"] > 0) &
-            (df_candidates["PBR"] <= pbr_limit) &
-            (df_candidates["ROE"] >= roe_min) &
-            (df_candidates["영업이익률"] >= op_margin_min)
-        )
-        filtered = df_candidates.loc[mask].copy()
-
-        if market_cap_min > 0:
-            filtered = filtered.loc[filtered["시가총액"].isna() | (filtered["시가총액"] >= market_cap_min)]
-        if included_sector:
-            filtered = filtered.loc[filtered["업종"].astype(str).str.contains(included_sector, case=False, na=False)]
-        if revenue_growth_min is not None:
-            filtered = filtered.loc[filtered["매출성장률"].isna() | (filtered["매출성장률"] >= revenue_growth_min)]
-
-        if filtered.empty:
-            st.warning("입력한 조건에 맞는 종목이 없습니다. 기준을 완화해 보세요.")
-        else:
-            filtered = filtered.sort_values(by=sort_column, ascending=False)
-            filtered = filtered.head(top_n)
-            st.success("조건에 맞는 종목 리스트")
-            st.dataframe(filtered[["종목명", "종목코드", "PER", "PBR", "ROE", "영업이익률", "매출성장률", "시가총액", "업종"]], hide_index=True, use_container_width=True)
-            st.caption(f"적용 조건: PER ≤ {per_limit}, PBR ≤ {pbr_limit}, ROE ≥ {roe_min}%, 영업이익률 ≥ {op_margin_min}%, 매출성장률 ≥ {revenue_growth_min}%, 시가총액 ≥ {market_cap_min}억, 업종 키워드: {included_sector or '전체'}")
-
 elif menu == "개별종목분석":
     st.subheader("🤖 개별종목분석")
     st.markdown("기술적 지표(10%), 최신 뉴스 및 수급(40%), 경영지표(20%), 밸류에이션(10%), 시장 트렌드(20%)를 종합 분석합니다.")
@@ -990,138 +852,64 @@ elif menu == "개별종목분석":
     tab1, tab2, tab3 = st.tabs(["📊 개별종목 List", "🏢 ETF List", "🔍 개별종목 분석"])
     
     # 공통 계산 함수
-    
-def calculate_stock_score(fundamentals, tech, news_list):
-    """개선된 점수 체계화 모델 (뉴스/수급 40점 + 상대 PER 10점 반영)"""
-    
-    # --------------------------------------------------
-    # 1. 뉴스 및 수급 점수 체계화 (40점 만점)
-    # --------------------------------------------------
-    pos_keywords = ['공급계약', '특허', '흑자전환', 'M&A', '인수', '개발', '상승', '돌파', '수주', '호실적']
-    neg_keywords = ['적자', '하락', '감소', '취소', '소송', '과징금', '유상증자', '횡령', '부도']
-    
-    pos_count = 0
-    neg_count = 0
-    
-    # 가중치 언론사 및 공시 필터링
-    premium_sources = ['연합인포맥스', '이데일리', '매일경제', '한국경제', '공시', 'DART']
-    
-    for n in news_list:
-        title = n['title']
-        press = n['press']
+    def calculate_stock_score(fundamentals, tech):
+        """종목 총점 계산"""
+        # 1. 뉴스 및 수급 모멘텀 (40%)
+        news_score = 20 # 기본점수
         
-        # 기본 감성 단어 확인
-        p_match = sum(1 for kw in pos_keywords if kw in title)
-        n_match = sum(1 for kw in neg_keywords if kw in title)
+        # 2. 시장 트렌드 (20%) - 1개월 수익률 기준
+        trend_score = 10
+        if tech['one_month_return'] > 5:
+            trend_score = 20
+        elif tech['one_month_return'] > 0:
+            trend_score = 15
+        elif tech['one_month_return'] < -10:
+            trend_score = 0
         
-        # 신뢰도 높은 소스이거나 공시인 경우 가중치 (+1)
-        source_weight = 2 if any(ps in press for ps in premium_sources) else 1
+        # 3. 기술적 지표 (10%)
+        tech_score = 5
+        if tech['price'] > tech['sma20'] and tech['macd'] > tech['signal']:
+            tech_score = 10
+        elif tech['rsi'] <= 40:
+            tech_score = 8 # 눌림목
         
-        if p_match > n_match:
-            pos_count += 1 * source_weight
-        elif n_match > p_match:
-            neg_count += 1 * source_weight
-
-    # A. 뉴스 감성 점수 (20점 만점)
-    total_news = len(news_list)
-    if total_news > 0:
-        # (긍정 - 부정) / 전체 비율을 0~20 구간으로 매핑
-        sentiment_ratio = (pos_count - neg_count) / total_news
-        # -1~1 사이의 값을 0~20 점수로 변환
-        sentiment_score = ((sentiment_ratio + 1) / 2) * 20
-    else:
-        sentiment_score = 10.0 # 뉴스 없을 시 중립 점수
+        # 4. 경영지표 (20%) - 우선순위: 영업이익률 > ROE
+        mgmt_score = 0
+        if fundamentals['op_margin'] >= 10: mgmt_score += 12
+        elif fundamentals['op_margin'] >= 5: mgmt_score += 8
+        else: mgmt_score += 4
         
-    # B. 뉴스 노출 빈도 점수 (10점 만점)
-    if total_news >= 5: freq_score = 10
-    elif total_news >= 3: freq_score = 7
-    elif total_news >= 1: freq_score = 4
-    else: freq_score = 0
-    
-    # C. 거래량 모멘텀 점수 (10점 만점)
-    v_ratio = tech.get('volume_ratio', 100.0)
-    if v_ratio >= 200: vol_score = 10      # 평소 대비 거래량 2배 폭발
-    elif v_ratio >= 150: vol_score = 8
-    elif v_ratio >= 100: vol_score = 6     # 평소 수준 유지
-    elif v_ratio >= 50: vol_score = 3
-    else: vol_score = 0
-    
-    news_suqub_total = int(sentiment_score + freq_score + vol_score)
-    news_suqub_total = min(40, max(0, news_suqub_total)) # 40점 방어선
-    
-    # --------------------------------------------------
-    # 2. 업종별 상대 PER 전략 (10점 만점)
-    # --------------------------------------------------
-    val_score = 0
-    per = fundamentals['cns_per'] if fundamentals['cns_per'] > 0 else fundamentals['per']
-    sector_per = fundamentals.get('sector_per', 0.0)
-    
-    if per > 0 and sector_per > 0:
-        relative_per_index = per / sector_per
+        if fundamentals['roe'] >= 10: mgmt_score += 8
+        elif fundamentals['roe'] >= 5: mgmt_score += 5
+        else: mgmt_score += 2
         
-        if relative_per_index < 0.7:
-            val_score = 6  # 매우 저평가
-        elif 0.7 <= relative_per_index < 0.9:
-            val_score = 4  # 적정 저평가
-        elif 0.9 <= relative_per_index < 1.1:
-            val_score = 2  # 보통
-        else:
-            val_score = 0  # 고평가
-    else:
-        # PER 정보가 없거나 비교 불가능할 경우 기존 기본값 부여
-        val_score = 3
+        # 5. 밸류에이션 (10%) - 우선순위: 추정PER > PBR
+        val_score = 0
+        per = fundamentals['cns_per'] if fundamentals['cns_per'] > 0 else fundamentals['per']
+        if 0 < per < 15: val_score += 6
+        elif 15 <= per < 30: val_score += 3
         
-    # PBR 보조 점수 (기존 밸류에이션 점수 중 PBR 비중 유지, 최대 4점)
-    if 0 < fundamentals['pbr'] < 1.5: val_score += 4
-    elif 1.5 <= fundamentals['pbr'] < 3: val_score += 2
+        if 0 < fundamentals['pbr'] < 1.5: val_score += 4
+        elif 1.5 <= fundamentals['pbr'] < 3: val_score += 2
+        
+        total_score = news_score + trend_score + tech_score + mgmt_score + val_score
+        return int(total_score)
     
-    # --------------------------------------------------
-    # 3. 나머지 점수 체계 유지 (경영 20점 + 기술/트렌드 30점 = 총 50점)
-    # --------------------------------------------------
-    # 시장 트렌드 (20점)
-    trend_score = 10
-    if tech['one_month_return'] > 5: trend_score = 20
-    elif tech['one_month_return'] > 0: trend_score = 15
-    elif tech['one_month_return'] < -10: trend_score = 0
-    
-    # 기술적 지표 (10점)
-    tech_score = 5
-    if tech['price'] > tech['sma20'] and tech['macd'] > tech['signal']: tech_score = 10
-    elif tech['rsi'] <= 40: tech_score = 8 
-    
-    # 경영지표 (20점)
-    mgmt_score = 0
-    if fundamentals['op_margin'] >= 10: mgmt_score += 12
-    elif fundamentals['op_margin'] >= 5: mgmt_score += 8
-    else: mgmt_score += 4
-    
-    if fundamentals['roe'] >= 10: mgmt_score += 8
-    elif fundamentals['roe'] >= 5: mgmt_score += 5
-    else: mgmt_score += 2
-    
-    total_score = news_suqub_total + val_score + trend_score + tech_score + mgmt_score
-    return int(total_score), news_suqub_total, val_score
-
-if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완벽히 일치시켰습니다.
-
-    # 1. 탭 정의
-    tab1, tab2, tab3 = st.tabs(["개별종목 List", "ETF List", "개별종목 분석"])
-
-    # ==========================================
     # Tab 1: 개별종목 List
-    # ==========================================
     with tab1:
         st.info("💡 분석을 원하는 **개별종목 최대 10개**의 **종목명**(예: 삼성전자) 또는 **6자리 종목코드**(예: 005930)를 입력하세요. 콤마(,)로 구분해주세요.")
         
         stock_list_input = st.text_area("종목명 또는 종목코드 입력 (콤마로 구분, 최대 10개)", height=100)
         
         if st.button("개별종목 분석 시작", key="stock_list_analyze") and stock_list_input:
+            # 입력값 파싱
             inputs = [x.strip() for x in stock_list_input.split(',')]
             inputs = inputs[:10]  # 최대 10개로 제한
             
             code_map = get_stock_code_map()
             stock_codes = []
             
+            # 종목코드로 변환
             for inp in inputs:
                 if inp.isdigit() and len(inp) == 6:
                     stock_codes.append(inp)
@@ -1133,6 +921,7 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
             if not stock_codes:
                 st.warning("올바른 종목명 또는 6자리 종목코드를 입력해주세요.")
             else:
+                # 분석 수행
                 analysis_results = []
                 progress_bar = st.progress(0)
                 
@@ -1142,8 +931,7 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                         if fundamentals:
                             tech = analyze_stock_technical(code)
                             if tech:
-                                news = fetch_headlines_rss(fundamentals['name'])
-                                total_score, _, _ = calculate_stock_score(fundamentals, tech, news)
+                                total_score = calculate_stock_score(fundamentals, tech)
                                 macd_signal = '매수' if tech['macd'] > tech['signal'] else '매도'
                                 analysis_results.append({
                                     "종목명": fundamentals['name'],
@@ -1158,61 +946,72 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                                 })
                     progress_bar.progress((idx + 1) / len(stock_codes))
                 
+                # 결과 테이블 표시
                 if analysis_results:
                     st.markdown("---")
                     st.markdown("### 📊 분석 결과")
                     df_results = pd.DataFrame(analysis_results)
-                    st.dataframe(df_results, use_container_width=True)
-
-    # ==========================================
+                    st.dataframe(df_results, width='stretch')
+    
     # Tab 2: ETF List
-    # ==========================================
     with tab2:
-        st.markdown("### 📊 ETF 시장 실시간 핫 트렌드 (Hot Trends)")
-        st.write("시장 내 거래량, 수익률, 신규 상장 트렌드를 분석하여 상위 10선 리스트를 제공합니다.")
+        st.info("💡 분석을 원하는 **ETF 최대 10개**의 **ETF명**(예: KODEX 200) 또는 **6자리 종목코드**를 입력하세요. 콤마(,)로 구분해주세요.")
         
-        with st.spinner("ETF 시장 트렌드 데이터를 수집 중입니다..."):
-            df_etf = fetch_etf_market_data()
+        etf_list_input = st.text_area("ETF명 또는 종목코드 입력 (콤마로 구분, 최대 10개)", height=100, key="etf_input")
+        
+        if st.button("ETF 분석 시작", key="etf_analyze") and etf_list_input:
+            # 입력값 파싱
+            inputs = [x.strip() for x in etf_list_input.split(',')]
+            inputs = inputs[:10]  # 최대 10개로 제한
             
-        if df_etf.empty:
-            st.error("ETF 데이터를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
-        else:
-            col1, col2, col3 = st.columns(3)
+            code_map = get_stock_code_map()
+            stock_codes = []
             
-            with col1:
-                st.markdown("#### 💰 자금유입 (거래대금) 상위 10선")
-                df_inflow = df_etf.sort_values(by='Amount', ascending=False).head(10).copy()
-                df_inflow_display = pd.DataFrame({
-                    "종목명": df_inflow['Name'],
-                    "종목코드": df_inflow['Symbol'],
-                    "현재가": df_inflow['Price'].apply(lambda x: f"{int(x):,}원"),
-                    "거래대금": df_inflow['Amount'].apply(lambda x: f"{x/100:.1f}억 원" if x < 10000 else f"{x/10000:.2f}조 원")
-                })
-                st.dataframe(df_inflow_display, hide_index=True, use_container_width=True)
-                
-            with col2:
-                st.markdown("#### 📈 1주일 수익률 상위 10선")
-                with st.spinner("주간 수익률 분석 중..."):
-                    df_weekly = fetch_etf_weekly_returns(df_etf)
-                if not df_weekly.empty:
-                    st.dataframe(df_weekly[['종목명', '종목코드', '현재가', '1주일 수익률']], hide_index=True, use_container_width=True)
+            # 종목코드로 변환
+            for inp in inputs:
+                if inp.isdigit() and len(inp) == 6:
+                    stock_codes.append(inp)
                 else:
-                    st.warning("수익률 데이터를 연산할 수 없습니다.")
-                    
-            with col3:
-                st.markdown("#### 🆕 신규 상장 ETF 10선")
-                df_new = df_etf.sort_values(by='Symbol', ascending=False).head(10).copy()
-                df_new_display = pd.DataFrame({
-                    "종목명": df_new['Name'],
-                    "종목코드": df_new['Symbol'],
-                    "현재가": df_new['Price'].apply(lambda x: f"{int(x):,}원"),
-                    "시가총액": df_new['MarCap'].apply(lambda x: f"{float(x):,.0f}억 원" if float(x) < 10000 else f"{float(x)/10000:.2f}조 원")
-                })
-                st.dataframe(df_new_display, hide_index=True, use_container_width=True)
-
-    # ==========================================
-    # Tab 3: 개별종목 분석
-    # ==========================================
+                    code = code_map.get(inp)
+                    if code:
+                        stock_codes.append(code)
+            
+            if not stock_codes:
+                st.warning("올바른 ETF명 또는 6자리 종목코드를 입력해주세요.")
+            else:
+                # 분석 수행
+                analysis_results = []
+                progress_bar = st.progress(0)
+                
+                for idx, code in enumerate(stock_codes):
+                    with st.spinner(f"분석 중... ({idx+1}/{len(stock_codes)})"):
+                        fundamentals = fetch_stock_name_and_fundamentals(code)
+                        if fundamentals:
+                            tech = analyze_stock_technical(code)
+                            if tech:
+                                total_score = calculate_stock_score(fundamentals, tech)
+                                macd_signal = '매수' if tech['macd'] > tech['signal'] else '매도'
+                                analysis_results.append({
+                                    "종목명": fundamentals['name'],
+                                    "총점": total_score,
+                                    "현재주가": f"{int(tech['price']):,}원",
+                                    "영업이익률": f"{fundamentals['op_margin']}%",
+                                    "ROE": f"{fundamentals['roe']}%",
+                                    "PBR": f"{fundamentals['pbr']}배",
+                                    "RSI": f"{tech['rsi']:.2f}",
+                                    "MACD": macd_signal,
+                                    "1개월수익률": f"{tech['one_month_return']:.2f}%"
+                                })
+                    progress_bar.progress((idx + 1) / len(stock_codes))
+                
+                # 결과 테이블 표시
+                if analysis_results:
+                    st.markdown("---")
+                    st.markdown("### 📊 분석 결과")
+                    df_results = pd.DataFrame(analysis_results)
+                    st.dataframe(df_results, width='stretch')
+    
+    # Tab 3: 개별종목 분석 (기존 방식)
     with tab3:
         st.info("💡 분석을 원하는 종목의 **종목명**(예: 삼성전자) 또는 **6자리 종목코드**(예: 005930)를 입력하세요.")
         
@@ -1243,11 +1042,28 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                         if tech is None:
                             st.error("기술적 분석을 위한 충분한 차트 데이터가 없습니다.")
                         else:
-                            total_score, news_score, val_score = calculate_stock_score(fundamentals, tech, news)
-                            
-                            trend_score = 20 if tech['one_month_return'] > 5 else (15 if tech['one_month_return'] > 0 else (0 if tech['one_month_return'] < -10 else 10))
-                            tech_score = 10 if (tech['price'] > tech['sma20'] and tech['macd'] > tech['signal']) else (8 if tech['rsi'] <= 40 else 5)
-                            
+                            # 1. 뉴스 및 수급 모멘텀 (40%)
+                            news_score = 20 # 기본점수
+                            if news:
+                                news_score = 40 # 뉴스가 있으면 모멘텀 우수로 간주
+                                
+                            # 2. 시장 트렌드 (20%) - 1개월 수익률 기준
+                            trend_score = 10
+                            if tech['one_month_return'] > 5:
+                                trend_score = 20
+                            elif tech['one_month_return'] > 0:
+                                trend_score = 15
+                            elif tech['one_month_return'] < -10:
+                                trend_score = 0
+                                
+                            # 3. 기술적 지표 (10%)
+                            tech_score = 5
+                            if tech['price'] > tech['sma20'] and tech['macd'] > tech['signal']:
+                                tech_score = 10
+                            elif tech['rsi'] <= 40:
+                                tech_score = 8 # 눌림목
+                                
+                            # 4. 경영지표 (20%) - 우선순위: 영업이익률 > ROE
                             mgmt_score = 0
                             if fundamentals['op_margin'] >= 10: mgmt_score += 12
                             elif fundamentals['op_margin'] >= 5: mgmt_score += 8
@@ -1256,6 +1072,17 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                             if fundamentals['roe'] >= 10: mgmt_score += 8
                             elif fundamentals['roe'] >= 5: mgmt_score += 5
                             else: mgmt_score += 2
+                            
+                            # 5. 밸류에이션 (10%) - 우선순위: 추정PER > PBR
+                            val_score = 0
+                            per = fundamentals['cns_per'] if fundamentals['cns_per'] > 0 else fundamentals['per']
+                            if 0 < per < 15: val_score += 6
+                            elif 15 <= per < 30: val_score += 3
+                            
+                            if 0 < fundamentals['pbr'] < 1.5: val_score += 4
+                            elif 1.5 <= fundamentals['pbr'] < 3: val_score += 2
+                            
+                            total_score = news_score + trend_score + tech_score + mgmt_score + val_score
                             
                             opinion = "매도"
                             color = "red"
@@ -1274,7 +1101,7 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                             
                             col1, col2, col3, col4 = st.columns(4)
                             col1.metric("종합 점수", f"{total_score}점")
-                            col2.metric("뉴스/수급 (40)", f"{news_score}점")
+                            col2.metric("뉴스/모멘텀 (40)", f"{news_score}점")
                             col3.metric("경영/밸류 (30)", f"{mgmt_score + val_score}점")
                             col4.metric("기술/트렌드 (30)", f"{tech_score + trend_score}점")
                             
@@ -1297,4 +1124,3 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                                         st.markdown(f"{i}. [{n['title']}]({n['link']}) ({n['press']})")
                                 else:
                                     st.write("최근 관련 뉴스가 없습니다.")
-
