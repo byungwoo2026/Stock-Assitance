@@ -54,52 +54,53 @@ def fetch_headlines_rss(keyword):
     return headlines
 
 # 코스피/코스닥 데이터 안정적 수집 함수 (주말/새벽 서버 오류 및 차단 방지)
+# NOTE(2026-07-20): 기존 HTML 스크래핑 방식은 "상승/하락" 텍스트를 문자열로 판별하다가
+# 방향(부호)이 실제와 반대로 표시되는 버그가 있어, 부호가 이미 포함된 네이버 JSON API로 교체함.
 @st.cache_data(ttl=300) # 5분 캐싱으로 잦은 요청 방지
 def fetch_market_index(market_type="KOSPI", retries=3):
-    url = f"https://finance.naver.com/sise/sise_index.naver?code={market_type}"
+    url = f"https://polling.finance.naver.com/api/realtime/domestic/index/{market_type}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-    
+
     for attempt in range(retries):
         try:
-            # 타임아웃을 설정하여 서버 응답 지연 시 무한 대기 방지
             res = requests.get(url, headers=headers, timeout=5)
-            res.raise_for_status() # 4xx, 5xx 에러 발생 시 예외 처리
-            
-            soup = BeautifulSoup(res.text, 'html.parser')
-            now_value = soup.find('em', id='now_value')
-            change_value = soup.find('span', id='change_value_and_rate')
-            
-            if now_value and change_value:
-                # 텍스트 내 불필요한 공백 제거
-                index_val = now_value.text.strip()
-                change_val = change_value.text.strip().split()[-1] # 상승/하락 폭만 추출
-                
-                # 상승, 하락, 보합 기호에 맞게 +/- 추가
-                if '상승' in change_value.text:
-                    change_val = "+" + change_val
-                elif '하락' in change_value.text:
-                    change_val = "-" + change_val
-                
-                return {"index": index_val, "change": change_val, "status": "success"}
-            else:
-                raise ValueError("DOM 구조를 찾을 수 없습니다.")
-                
+            res.raise_for_status()
+            data = res.json()
+            item = data["datas"][0]
+
+            close_price = str(item.get("closePrice", "")).replace(",", "")
+            ratio = str(item.get("fluctuationsRatio", "")).replace(",", "")
+            direction_code = str(item.get("compareToPreviousPrice", {}).get("code", ""))
+
+            if not close_price or not ratio:
+                raise ValueError("응답 형식을 해석할 수 없습니다.")
+
+            ratio_val = abs(float(ratio))
+            # 네이버 방향 코드: 2=상승, 5=하락 (그 외 보합 등은 부호 없이 처리)
+            if direction_code == "5":
+                ratio_val = -ratio_val
+            elif direction_code == "2":
+                ratio_val = abs(ratio_val)
+
+            change_val = f"{ratio_val:+.2f}%"
+
+            return {"index": f"{float(close_price):,.2f}", "change": change_val, "status": "success"}
+
         except requests.exceptions.Timeout:
             if attempt < retries - 1:
                 time.sleep(1)
                 continue
             return {"index": "조회 지연", "change": "-", "status": "timeout"}
-            
+
         except requests.exceptions.RequestException:
-            # 주말이나 새벽 점검 등 네트워크 오류 시 재시도
             if attempt < retries - 1:
                 time.sleep(2)
                 continue
             return {"index": "서버 점검/오류", "change": "-", "status": "network_error"}
-            
-        except Exception as e:
+
+        except Exception:
             return {"index": "데이터 오류", "change": "-", "status": "error"}
 
 @st.cache_data(ttl=3600) # 1시간 단위 캐싱 (1달 추세이므로 자주 변하지 않음)
@@ -676,6 +677,25 @@ def fetch_etf_weekly_returns(df_etf):
         df_res['1주일 수익률'] = df_res['1주일 수익률'].apply(lambda x: f"+{x:.2f}%" if x > 0 else f"{x:.2f}%")
     return df_res
 
+def render_index_metric(label, data):
+    """한국 증시 관례에 맞춰 상승=빨강, 하락=파랑으로 지수를 표시 (st.metric은 초록/빨강만 지원해 커스텀 HTML 사용)"""
+    if data['status'] != 'success':
+        st.metric(label=label, value=data['index'], delta=None)
+        return
+
+    change_str = data['change']  # 예: "+4.46%" 또는 "-5.33%"
+    is_down = change_str.startswith('-')
+    color = "#1857e0" if is_down else "#d60000"  # 파랑(하락) / 빨강(상승)
+    arrow = "▼" if is_down else "▲"
+
+    st.markdown(f"""
+        <div style="padding: 4px 0;">
+            <div style="font-size: 0.875rem; color: rgba(49,51,63,0.6);">{label}</div>
+            <div style="font-size: 2.25rem; font-weight: 600; line-height: 1.2;">{data['index']}</div>
+            <div style="font-size: 0.875rem; color: {color}; font-weight: 600;">{arrow} {change_str}</div>
+        </div>
+    """, unsafe_allow_html=True)
+
 # 각 메뉴별 UI 화면 구성
 if menu == "종합 대시보드":
     st.subheader("오늘의 투자 핵심 요약")
@@ -686,11 +706,9 @@ if menu == "종합 대시보드":
     
     m_col1, m_col2, m_col3 = st.columns(3)
     with m_col1:
-        delta_kpi = kospi_data['change'] if kospi_data['status'] == 'success' else None
-        st.metric(label="KOSPI", value=kospi_data['index'], delta=delta_kpi)
+        render_index_metric("KOSPI", kospi_data)
     with m_col2:
-        delta_kdq = kosdaq_data['change'] if kosdaq_data['status'] == 'success' else None
-        st.metric(label="KOSDAQ", value=kosdaq_data['index'], delta=delta_kdq)
+        render_index_metric("KOSDAQ", kosdaq_data)
         
     st.markdown("---")
     
