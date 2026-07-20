@@ -1224,7 +1224,8 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                     st.warning("수익률 데이터를 연산할 수 없습니다.")
                     
             with col3:
-                st.markdown("#### 🆕 신규 상장 ETF 10선")
+                st.markdown("#### 🆕 신규 상장 추정 ETF 10선")
+                st.caption("※ 실제 상장일 데이터가 아닌, 종목코드가 큰 순서(대체로 최근 상장분에 부여)로 추정한 목록입니다.")
                 df_new = df_etf.sort_values(by='Symbol', ascending=False).head(10).copy()
                 df_new_display = pd.DataFrame({
                     "종목명": df_new['Name'],
