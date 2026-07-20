@@ -644,9 +644,14 @@ def fetch_etf_market_data():
 @st.cache_data(ttl=1800)
 def fetch_etf_weekly_returns(df_etf):
     from concurrent.futures import ThreadPoolExecutor
-    
+
+    # 레버리지/인버스 상품 제외 (이름에 해당 키워드 포함된 종목 필터링)
+    exclude_keywords = ['레버리지', '인버스', '2X']
+    exclude_pattern = '|'.join(exclude_keywords)
+    df_filtered = df_etf[~df_etf['Name'].str.contains(exclude_pattern, case=False, na=False)]
+
     # 거래대금 상위 50개만 필터링하여 수익률 연산 (부하 분산)
-    df_top = df_etf.sort_values(by='Amount', ascending=False).head(50)
+    df_top = df_filtered.sort_values(by='Amount', ascending=False).head(50)
     start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
     
     def fetch_return(row):
@@ -1216,6 +1221,7 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                 
             with col2:
                 st.markdown("#### 📈 1주일 수익률 상위 10선")
+                st.caption("※ 레버리지/인버스 상품은 제외한 순위입니다.")
                 with st.spinner("주간 수익률 분석 중..."):
                     df_weekly = fetch_etf_weekly_returns(df_etf)
                 if not df_weekly.empty:
