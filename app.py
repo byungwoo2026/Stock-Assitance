@@ -9,7 +9,7 @@ import time
 import xml.etree.ElementTree as ET
 # pyrefly: ignore [missing-import]
 try:
-    import google.generativeai as genai
+    from groq import Groq
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
@@ -551,8 +551,7 @@ def build_quant_filter_candidates():
 
 def get_ai_summary(news_list):
     try:
-        genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
         news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list])
         prompt = f"""
         당신은 전문 주식 투자 분석가입니다. 다음 실시간 뉴스 리스트를 꼼꼼히 분석하여 
@@ -562,15 +561,17 @@ def get_ai_summary(news_list):
         [뉴스 리스트]
         {news_text}
         """
-        response = model.generate_content(prompt)
-        return response.text
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content
     except Exception as e:
         return f"⚠️ AI 분석 중 오류가 발생했습니다. (Secrets 설정이나 키 값을 확인해 주세요): {e}"
 
 def get_individual_stock_ai_analysis(fundamentals, tech, news_list):
     try:
-        genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
         news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list]) if news_list else "최근 관련 뉴스 없음"
         prompt = f"""
         당신은 전문 주식 투자 분석가(리서치 센터장)입니다. 
@@ -599,15 +600,17 @@ def get_individual_stock_ai_analysis(fundamentals, tech, news_list):
         3. **시장 모멘텀 및 뉴스 분석**: 최근 뉴스들의 호재/악재 성격 및 수급 영향 평가.
         4. **최종 AI 투자 전략 & 가이드**: 추천 매매 전략(분할 매수, 관망, 매도 등)과 목표/손절 대응 팁.
         """
-        response = model.generate_content(prompt)
-        return response.text
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content
     except Exception as e:
         return f"⚠️ AI 분석 리포트 생성 중 오류가 발생했습니다: {e}"
 
 def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
     try:
-        genai.configure(api_key=st.secrets["GOOGLE_API_KEY"])
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
         sectors_text = "\n".join([f"- {s['업종/테마']}: {s['변동']}" for s in top_sectors]) if top_sectors else "업종 정보 없음"
         prompt = f"""
         당신은 금융 전략가이자 투자 비서입니다. 오늘의 한국 증시 동향을 종합하여 투자 전략을 브리핑해주세요.
@@ -622,8 +625,11 @@ def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
         위 데이터를 바탕으로 시장의 흐름을 냉철하게 분석하고, 투자자가 참고할 수 있는 짤막하고 명쾌한 'AI 투자 전략 보고서'를 3~4문장 단위로 단락을 나누어 작성해주세요. 
         글자 크기가 너무 크지 않도록 마크다운 구조(강조 등)를 활용하여 정중하고 명확한 어조로 요약해 주세요.
         """
-        response = model.generate_content(prompt)
-        return response.text
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content
     except Exception as e:
         return f"⚠️ AI 시장 분석 중 오류가 발생했습니다: {e}"
 
@@ -704,11 +710,11 @@ if menu == "종합 대시보드":
     st.markdown("---")
     if GENAI_AVAILABLE:
         st.markdown("### 🤖 AI 투자 비서의 데일리 시장 분석 & 전략")
-        with st.spinner("Gemini가 오늘의 시장 상황과 최근 자금 흐름을 종합 분석하고 있습니다..."):
+        with st.spinner("AI가 오늘의 시장 상황과 최근 자금 흐름을 종합 분석하고 있습니다..."):
             market_briefing = get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors)
             st.info(market_briefing)
     else:
-        st.info("💡 Google Generative AI 패키지가 설치되지 않아 AI 분석 기능을 사용할 수 없습니다.")
+        st.info("💡 Groq 패키지가 설치되지 않아 AI 분석 기능을 사용할 수 없습니다.")
 
 elif menu == "시장 자금 & 업종 분석":
     st.subheader("📊 시장 자금 흐름 & 스마트머니 수급 분석")
@@ -797,7 +803,7 @@ elif menu == "주요 기업 헤드라인 뉴스":
                 # 1. AI 투자 비서 상자를 먼저 상단에 띄웁니다.
                    if GENAI_AVAILABLE:
                        st.markdown("### 🤖 AI 투자 비서의 3줄 시장 분석")
-                       with st.spinner("Gemini가 실시간 호재/악재 감성 분석을 진행하고 있습니다..."):
+                       with st.spinner("AI가 실시간 호재/악재 감성 분석을 진행하고 있습니다..."):
                            ai_briefing = get_ai_summary(news_list)
                            st.info(ai_briefing)
                        st.markdown("---")
