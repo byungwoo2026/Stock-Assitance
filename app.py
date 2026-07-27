@@ -238,15 +238,34 @@ def fetch_upper_limit_stocks():
 @st.cache_data(ttl=3600)
 def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10):
     gubun = 9000 if investor_type == "foreign" else 1000
-    sosok = 0 if market_type == "KOSPI" else 1
-    # 네이버 금융 순매수 상위 페이지 활용 (연속 매수 트렌드 반영)
-    url = f"https://finance.naver.com/sise/sise_deal_rank.naver?investor_gubun={gubun}&sosok={sosok}"
-    
+    sosok = "01" if market_type == "KOSPI" else "02"  # 반드시 2자리 문자열("01"/"02") — 정수 0/1은 404 발생
+    # NOTE(2026-07-27): 겉page(sise_deal_rank.naver)는 실제 데이터가 없는 껍데기이고,
+    # 진짜 표 데이터는 iframe으로 별도 로드되는 sise_deal_rank_iframe.naver 에 있음 (개발자도구 Network 탭으로 확인)
+    url = f"https://finance.naver.com/sise/sise_deal_rank_iframe.naver?sosok={sosok}&investor_gubun={gubun}&type=buy"
+
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         res = requests.get(url, headers=headers, timeout=5)
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
+
+        # 이 페이지는 "이전 영업일"과 "최근 영업일" 두 날짜의 순매수 상위가 나란히(표 2개) 표시되는 구조.
+        # 앞에서부터 그냥 모으면 예전 날짜 데이터를 가져올 위험이 있어, 날짜가 더 최근인(가장 마지막) 표만 사용.
+        tables = soup.select('table.type_5')
+        if len(tables) >= 2:
+            target_table = tables[-1]  # 가장 마지막(=가장 최근 날짜) 표
+            stocks = []
+            for a in target_table.find_all('a'):
+                href = a.get('href', '')
+                if 'main.naver?code=' in href:
+                    name = a.text.strip()
+                    if name and name not in stocks:
+                        stocks.append(name)
+                    if len(stocks) >= top_n:
+                        break
+            return stocks
+
+        # 표 구조가 예상과 다르면(방어적 처리), 페이지 전체에서 종목 링크만 모아 상위 top_n개 사용
         stocks = []
         for a in soup.find_all('a'):
             href = a.get('href', '')
@@ -257,7 +276,7 @@ def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10)
                 if len(stocks) >= top_n:
                     break
         return stocks
-    except Exception as e:
+    except Exception:
         return []
 
 # 최우수 애널리스트 추천 종목 필터 기준 (코드에 고정된 값 — 매경 순위가 바뀌면 아래 두 값을 함께 수동 갱신해야 함)
@@ -271,7 +290,7 @@ def fetch_top_analyst_recommendations():
     # 최근 매일경제 베스트 애널리스트(리서치센터 부문) 평가 최상위권 증권사 집중 필터링
     best_research_centers = ["신한투자증권", "하나증권", "메리츠증권", "KB증권", "NH투자증권"]
     per_broker_limit = 4   # 증권사 1곳당 최대 노출 개수 (특정 증권사가 결과를 독점하지 않도록 제한)
-    max_pages = 5          # 최신 페이지 1개만 보면 그날 유독 리포트를 많이 낸 한두 증권사가 상위를 다 채워버릴 수 있어 여러 페이지 조회
+    max_pages = 60         # 메리츠/KB/NH 등은 리포트 발간 빈도가 낮아 앞쪽 페이지만으로는 안 걸릴 수 있어, 충분히 깊게 조회 (5개 증권사 모두 채워지면 중간에 조기 종료됨)
 
     broker_results = {bc: [] for bc in best_research_centers}
     seen = set()
@@ -793,8 +812,16 @@ def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
     try:
         client = Groq(api_key=st.secrets["GROQ_API_KEY"])
         sectors_text = "\n".join([f"- {s['업종/테마']}: {s['변동']}" for s in top_sectors]) if top_sectors else "업종 정보 없음"
+
+        # 지수/업종 숫자만으로 추론하지 않도록, 오늘자 실제 시장 뉴스 헤드라인을 함께 조회해서 근거로 제공
+        market_news = fetch_headlines_rss("코스피 코스닥 증시")
+        if market_news:
+            news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in market_news])
+        else:
+            news_text = "조회된 관련 뉴스 없음"
+
         prompt = f"""
-        당신은 금융 전략가이자 투자 비서입니다. 오늘의 한국 증시 동향을 종합하여 투자 전략을 브리핑해주세요.
+        당신은 금융 전략가이자 투자 비서입니다. 아래 [시장 지수], [업종 데이터], [오늘의 실제 시장 뉴스]를 종합하여 투자 전략을 브리핑해주세요.
 
         [시장 지수]
         - KOSPI: {kospi_data.get('index', 'N/A')} ({kospi_data.get('change', 'N/A')})
@@ -803,12 +830,21 @@ def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
         [최근 1달 자금 유입 TOP 5 업종/테마]
         {sectors_text}
 
-        위 데이터를 바탕으로 시장의 흐름을 냉철하게 분석하고, 투자자가 참고할 수 있는 짤막하고 명쾌한 'AI 투자 전략 보고서'를 3~4문장 단위로 단락을 나누어 작성해주세요. 
-        글자 크기가 너무 크지 않도록 마크다운 구조(강조 등)를 활용하여 정중하고 명확한 어조로 요약해 주세요.
+        [오늘의 실제 시장 뉴스 헤드라인]
+        {news_text}
+
+        위 데이터를 바탕으로 시장의 흐름을 냉철하게 분석하고, 투자자가 참고할 수 있는 짤막하고 명쾌한 'AI 투자 전략 보고서'를 3~4문장 단위로 단락을 나누어 작성해주세요.
+
+        반드시 지켜야 할 사항:
+        1. 위에 제공된 뉴스에 실제로 언급된 내용만 근거로 사용하세요. 뉴스에 없는 사실을 지어내지 마세요.
+        2. 뉴스가 지수 등락과 직접적인 관련이 없거나 부족하다면, 추측하지 말고 "관련 뉴스 근거는 뚜렷하지 않으며, 지수 데이터상으로는 ~한 흐름입니다"처럼 데이터와 뉴스를 구분해서 솔직하게 설명하세요.
+        3. 응답은 반드시 한국어로만 작성하세요. 다른 언어 단어를 섞지 마세요.
+        4. 글자 크기가 너무 크지 않도록 마크다운 구조(강조 등)를 활용하여 정중하고 명확한 어조로 요약해 주세요.
         """
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}]
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
         )
         return response.choices[0].message.content
     except Exception as e:
@@ -962,7 +998,8 @@ if menu == "종합 대시보드":
     st.markdown("---")
     if GENAI_AVAILABLE:
         st.markdown("### 🤖 AI 투자 비서의 데일리 시장 분석 & 전략")
-        with st.spinner("AI가 오늘의 시장 상황과 최근 자금 흐름을 종합 분석하고 있습니다..."):
+        st.caption("※ 지수/업종 데이터뿐 아니라, 실제 시장 뉴스 헤드라인을 근거로 작성합니다 (뉴스에 없는 내용은 추측하지 않도록 지시되어 있습니다).")
+        with st.spinner("AI가 오늘의 시장 상황과 실제 뉴스를 종합 분석하고 있습니다..."):
             market_briefing = get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors)
             st.info(market_briefing)
     else:
@@ -1137,12 +1174,13 @@ elif menu == "최우수 애널리스트 추천 종목":
     """)
     st.markdown("---")
     
-    with st.spinner("최우수 리서치센터의 최근 1주일 추천 리포트를 수집 중입니다..."):
+    with st.spinner("최우수 리서치센터의 최근 추천 리포트를 수집 중입니다... (증권사에 따라 최대 60페이지까지 조회하여 다소 시간이 걸릴 수 있습니다)"):
         recom_list = fetch_top_analyst_recommendations()
         
     if recom_list:
         st.success("매경 베스트 리서치센터 최상위 증권사들이 발간한 핵심 추천 종목입니다.")
         st.caption("※ 특정 증권사가 결과를 독점하지 않도록, 5개 증권사별 최근 리포트를 최대 4건씩 균형 있게 표시합니다.")
+        st.caption("※ 증권사에 따라 네이버 금융에 리포트가 게시되는 빈도가 달라, 일부 증권사는 이번 조회에서 적게 나오거나 안 나올 수 있습니다.")
         df_recom = pd.DataFrame(recom_list)
         df_recom.index = range(1, len(df_recom) + 1)
         
