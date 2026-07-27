@@ -20,8 +20,47 @@ st.set_page_config(page_title="나만의 투자 조수", layout="wide")
 st.title("📈 나만의 AI 투자 조수 대시보드")
 st.markdown("시장의 자금 쏠림, 주주 수급, 주요 뉴스 및 기술적 매수 신호를 분석합니다.")
 
-# 사이드바 메뉴 구성
-menu = st.sidebar.selectbox("메뉴 선택", ["종합 대시보드", "시장 자금 & 업종 분석", "주요 기업 헤드라인 뉴스", "외인 수급 & 기술적 조건 스크리너", "최우수 애널리스트 추천 종목", "가치재평가주", "퀀트 투자 리스트", "개별종목분석"])
+# 화면 상단 가로 버튼(탭)형 메뉴 — st.radio를 버튼처럼 보이도록 CSS로 스타일링
+MENU_OPTIONS = ["종합 대시보드", "시장 자금 & 업종 분석", "주요 기업 헤드라인 뉴스", "외인 수급 & 기술적 조건 스크리너", "최우수 애널리스트 추천 종목", "가치재평가주", "퀀트 투자 리스트", "개별종목분석"]
+
+st.markdown("""
+<style>
+/* 상단 가로 메뉴를 탭/버튼처럼 스타일링 */
+div[role="radiogroup"] {
+    flex-direction: row;
+    flex-wrap: wrap;
+    gap: 8px;
+    border-bottom: 2px solid #e6e6e6;
+    padding-bottom: 12px;
+    margin-bottom: 8px;
+}
+div[role="radiogroup"] > label {
+    background-color: #f0f2f6;
+    padding: 8px 16px;
+    border-radius: 8px 8px 0 0;
+    cursor: pointer;
+    border: 1px solid #e6e6e6;
+    border-bottom: none;
+    transition: background-color 0.15s ease;
+}
+div[role="radiogroup"] > label:hover {
+    background-color: #e2e6ee;
+}
+div[role="radiogroup"] > label[data-baseweb="radio"]:has(input:checked) {
+    background-color: #ff4b4b;
+    border-color: #ff4b4b;
+}
+div[role="radiogroup"] > label[data-baseweb="radio"]:has(input:checked) div {
+    color: white !important;
+}
+/* 각 라디오 버튼의 동그라미(원형 선택 표시)는 숨겨서 순수 버튼처럼 보이게 함 */
+div[role="radiogroup"] > label > div:first-child {
+    display: none;
+}
+</style>
+""", unsafe_allow_html=True)
+
+menu = st.radio("메뉴 선택", MENU_OPTIONS, horizontal=True, label_visibility="collapsed")
 
 # 차단 없는 네이버 뉴스 RSS 엔진
 def fetch_headlines_rss(keyword):
@@ -227,45 +266,71 @@ ANALYST_LIST_LAST_UPDATED = "2026-07-27"
 
 @st.cache_data(ttl=3600)
 def fetch_top_analyst_recommendations():
-    url = "https://finance.naver.com/research/company_list.naver"
     headers = {"User-Agent": "Mozilla/5.0"}
     
-    # 최근 매일경제 베스트 애널리스트(리서치센터 부문) 평가 최상위권 증권사 집중 필터링 (1위 신한, 2위 하나, 3위 메리츠 등)
+    # 최근 매일경제 베스트 애널리스트(리서치센터 부문) 평가 최상위권 증권사 집중 필터링
     best_research_centers = ["신한투자증권", "하나증권", "메리츠증권", "KB증권", "NH투자증권"]
-    
+    per_broker_limit = 4   # 증권사 1곳당 최대 노출 개수 (특정 증권사가 결과를 독점하지 않도록 제한)
+    max_pages = 5          # 최신 페이지 1개만 보면 그날 유독 리포트를 많이 낸 한두 증권사가 상위를 다 채워버릴 수 있어 여러 페이지 조회
+
+    broker_results = {bc: [] for bc in best_research_centers}
+    seen = set()
+
     try:
-        res = requests.get(url, headers=headers, timeout=5)
-        res.encoding = res.apparent_encoding
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
+        for page in range(1, max_pages + 1):
+            url = f"https://finance.naver.com/research/company_list.naver?page={page}"
+            res = requests.get(url, headers=headers, timeout=5)
+            res.encoding = res.apparent_encoding
+            soup = BeautifulSoup(res.text, 'html.parser')
+
+            rows_found = 0
+            for tr in soup.select('table.type_1 tr'):
+                tds = tr.select('td')
+                if len(tds) >= 5:
+                    rows_found += 1
+                    stock = tds[0].text.strip()
+                    title = tds[1].text.strip()
+                    broker = tds[2].text.strip()
+                    date_str = tds[4].text.strip()
+
+                    matched_bc = next((bc for bc in best_research_centers if bc in broker), None)
+                    if not matched_bc:
+                        continue
+                    if len(broker_results[matched_bc]) >= per_broker_limit:
+                        continue
+
+                    dedup_key = (stock, title, broker)
+                    if dedup_key in seen:
+                        continue
+                    seen.add(dedup_key)
+
+                    link_tag = tds[1].select_one('a')
+                    link = "https://finance.naver.com" + link_tag['href'] if link_tag else "#"
+
+                    broker_results[matched_bc].append({
+                        "종목명": stock,
+                        "리포트 제목": title,
+                        "발간 증권사": broker,
+                        "발간일": date_str,
+                        "링크": link
+                    })
+
+            # 페이지에 표시할 행이 없으면(마지막 페이지 도달) 더 조회할 필요 없음
+            if rows_found == 0:
+                break
+            # 5개 증권사 모두 한도만큼 채워졌으면 더 이상 페이지를 조회하지 않음
+            if all(len(v) >= per_broker_limit for v in broker_results.values()):
+                break
+
+        # 특정 증권사가 결과를 독점하지 않도록, 증권사별로 번갈아가며 최종 리스트 구성
         results = []
-        for tr in soup.select('table.type_1 tr'):
-            tds = tr.select('td')
-            if len(tds) >= 5:
-                stock = tds[0].text.strip()
-                title = tds[1].text.strip()
-                broker = tds[2].text.strip()
-                date_str = tds[4].text.strip()
-                
-                is_best_center = any(bc in broker for bc in best_research_centers)
-                if not is_best_center:
-                    continue
-                    
-                link_tag = tds[1].select_one('a')
-                link = "https://finance.naver.com" + link_tag['href'] if link_tag else "#"
-                    
-                results.append({
-                    "종목명": stock,
-                    "리포트 제목": title,
-                    "발간 증권사": broker,
-                    "발간일": date_str,
-                    "링크": link
-                })
-                
-                if len(results) >= 20:
-                    break
+        for i in range(per_broker_limit):
+            for bc in best_research_centers:
+                if i < len(broker_results[bc]):
+                    results.append(broker_results[bc][i])
+
         return results
-    except Exception as e:
+    except Exception:
         return []
 
 @st.cache_data(ttl=3600)
@@ -1077,6 +1142,7 @@ elif menu == "최우수 애널리스트 추천 종목":
         
     if recom_list:
         st.success("매경 베스트 리서치센터 최상위 증권사들이 발간한 핵심 추천 종목입니다.")
+        st.caption("※ 특정 증권사가 결과를 독점하지 않도록, 5개 증권사별 최근 리포트를 최대 4건씩 균형 있게 표시합니다.")
         df_recom = pd.DataFrame(recom_list)
         df_recom.index = range(1, len(df_recom) + 1)
         
