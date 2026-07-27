@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timedelta
 import time
 import xml.etree.ElementTree as ET
+import json
 # pyrefly: ignore [missing-import]
 try:
     from groq import Groq
@@ -220,13 +221,17 @@ def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10)
     except Exception as e:
         return []
 
+# 최우수 애널리스트 추천 종목 필터 기준 (코드에 고정된 값 — 매경 순위가 바뀌면 아래 두 값을 함께 수동 갱신해야 함)
+ANALYST_RANKING_BASIS = "매일경제 베스트 애널리스트 종합평가(리서치센터 부문) 최상위 5개사 기준"
+ANALYST_LIST_LAST_UPDATED = "2026-07-27"
+
 @st.cache_data(ttl=3600)
 def fetch_top_analyst_recommendations():
     url = "https://finance.naver.com/research/company_list.naver"
     headers = {"User-Agent": "Mozilla/5.0"}
     
     # 최근 매일경제 베스트 애널리스트(리서치센터 부문) 평가 최상위권 증권사 집중 필터링 (1위 신한, 2위 하나, 3위 메리츠 등)
-    best_research_centers = ["신한투자증권", "하나증권", "메리츠증권"]
+    best_research_centers = ["신한투자증권", "하나증권", "메리츠증권", "KB증권", "NH투자증권"]
     
     try:
         res = requests.get(url, headers=headers, timeout=5)
@@ -744,6 +749,55 @@ def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
     except Exception as e:
         return f"⚠️ AI 시장 분석 중 오류가 발생했습니다: {e}"
 
+
+def classify_news_sentiment_ai(news_list):
+    """뉴스 제목들의 감성(긍정/중립/부정)을 Groq에게 문맥까지 고려해 판정하도록 맡김.
+    (기존 방식인 '단순 키워드 매칭'은 문맥을 무시해 "적자 축소"처럼 부정 키워드가 있어도 실제로는
+    긍정적인 기사를 오분류하는 문제가 있었음)
+    반환: {인덱스: "긍정"/"중립"/"부정"} 딕셔너리. 호출 실패/개수 불일치 시 None을 반환하여
+    호출부가 기존 키워드 매칭 방식으로 자동 대체(fallback)하도록 함.
+    """
+    if not news_list or not GENAI_AVAILABLE:
+        return None
+    try:
+        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+        titles_text = "\n".join([f"{i+1}. {n['title']}" for i, n in enumerate(news_list)])
+        prompt = f"""
+        당신은 주식 뉴스 감성 분석 전문가입니다. 아래 번호가 매겨진 뉴스 제목들을 각각 읽고,
+        해당 기업의 주가에 미칠 영향을 기준으로 "긍정", "중립", "부정" 중 하나로만 판정하세요.
+        단어만 보지 말고 반드시 문맥을 고려하세요. 예를 들어 "적자 폭 축소"는 '적자'라는 단어가 있어도
+        실제로는 긍정적 신호이고, "역대급 실적에도 불구하고 주가 하락"은 반대로 해석해야 합니다.
+
+        [뉴스 제목 목록]
+        {titles_text}
+
+        다른 설명 없이, 아래 JSON 배열 형식으로만 정확히 {len(news_list)}개 항목을 응답하세요:
+        [{{"번호": 1, "판정": "긍정"}}, {{"번호": 2, "판정": "중립"}}]
+        """
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+        )
+        raw = response.choices[0].message.content.strip()
+        raw = re.sub(r'^```(json)?\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
+        parsed = json.loads(raw)
+
+        sentiment_map = {}
+        for item in parsed:
+            idx = int(item.get("번호")) - 1
+            verdict = item.get("판정", "중립")
+            if verdict not in ("긍정", "중립", "부정"):
+                verdict = "중립"
+            sentiment_map[idx] = verdict
+
+        # 응답 개수가 뉴스 개수와 안 맞으면 신뢰할 수 없으므로 폴백 처리
+        if len(sentiment_map) != len(news_list):
+            return None
+        return sentiment_map
+    except Exception:
+        return None
+
 @st.cache_data(ttl=1800)
 def fetch_etf_market_data():
     try:
@@ -1008,10 +1062,13 @@ elif menu == "외인 수급 & 기술적 조건 스크리너":
 elif menu == "최우수 애널리스트 추천 종목":
     st.subheader("🏆 2026 최우수 애널리스트 & 주요 증권사 추천 종목")
     
-    st.info("""
+    st.info(f"""
     💡 **신뢰도 향상 로직 안내**: 네이버 금융 등 공개 포털에서는 리포트 목록에 작성자(애널리스트) 실명이 제공되지 않아 개별 인물 단위의 필터링이 어렵습니다. 
-    이를 해결하기 위해, 최근 **매일경제 베스트 애널리스트 종합 평가(리서치센터 부문)에서 최상위권(1위 신한투자증권, 2위 하나증권, 3위 메리츠증권)**에 
-    오른 '리서치 명가' 3곳의 리포트만을 집중 선별하여 데이터의 신뢰성을 극대화했습니다.
+    이를 해결하기 위해, 최근 **매일경제 베스트 애널리스트 종합 평가(리서치센터 부문)에서 최상위권(신한투자증권, 하나증권, 메리츠증권, KB증권, NH투자증권)**에 
+    오른 '리서치 명가' 5곳의 리포트만을 집중 선별하여 데이터의 신뢰성을 극대화했습니다.
+
+    📌 **선정 기준**: {ANALYST_RANKING_BASIS}
+    🗓️ **이 3개사 리스트 최종 확인/갱신일**: {ANALYST_LIST_LAST_UPDATED} (매경 순위가 갱신되면 코드도 함께 수동으로 갱신해야 합니다)
     """)
     st.markdown("---")
     
@@ -1184,22 +1241,32 @@ def calculate_stock_score(fundamentals, tech, news_list):
     
     # 가중치 언론사 및 공시 필터링
     premium_sources = ['연합인포맥스', '이데일리', '매일경제', '한국경제', '공시', 'DART']
-    
-    for n in news_list:
+
+    # 문맥을 반영한 AI 감성 판정 시도 (실패 시 None → 아래에서 키워드 매칭으로 자동 대체)
+    ai_sentiment_map = classify_news_sentiment_ai(news_list)
+
+    for idx, n in enumerate(news_list):
         title = n['title']
         press = n['press']
         
-        # 기본 감성 단어 확인
-        p_match = sum(1 for kw in pos_keywords if kw in title)
-        n_match = sum(1 for kw in neg_keywords if kw in title)
-        
         # 신뢰도 높은 소스이거나 공시인 경우 가중치 (+1)
         source_weight = 2 if any(ps in press for ps in premium_sources) else 1
-        
-        if p_match > n_match:
-            pos_count += 1 * source_weight
-        elif n_match > p_match:
-            neg_count += 1 * source_weight
+
+        if ai_sentiment_map is not None:
+            # AI가 문맥을 고려해 판정한 감성 사용
+            verdict = ai_sentiment_map.get(idx, "중립")
+            if verdict == "긍정":
+                pos_count += 1 * source_weight
+            elif verdict == "부정":
+                neg_count += 1 * source_weight
+        else:
+            # 폴백: 기본 감성 단어 매칭
+            p_match = sum(1 for kw in pos_keywords if kw in title)
+            n_match = sum(1 for kw in neg_keywords if kw in title)
+            if p_match > n_match:
+                pos_count += 1 * source_weight
+            elif n_match > p_match:
+                neg_count += 1 * source_weight
 
     # A. 뉴스 감성 점수 (20점 만점)
     total_news = len(news_list)
@@ -1458,6 +1525,7 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                             col2.metric("뉴스/수급 (40)", f"{news_score}점")
                             col3.metric("경영/밸류 (30)", f"{mgmt_score + val_score}점")
                             col4.metric("기술/트렌드 (30)", f"{tech_score + trend_score}점")
+                            st.caption("※ 뉴스/수급 점수는 AI가 각 뉴스 제목의 문맥을 읽고 판정한 감성(긍정/중립/부정)을 기반으로 계산됩니다. (AI 판정 실패 시 키워드 매칭 방식으로 자동 대체)")
                             
                             st.markdown("#### 🔍 상세 지표 분석")
                             t1, t2, t3 = st.tabs(["재무 및 밸류에이션", "기술적 지표 및 트렌드", "관련 최신 뉴스"])
