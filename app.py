@@ -408,7 +408,34 @@ def fetch_stock_name_and_fundamentals(code):
         else:
             sector_per = sector_per_elem.text.strip()
 
+        def clean_num(val):
+            val = val.replace(',','').replace('%','').strip()
+            try:
+                return float(val) if val and val != '-' else 0.0
+            except:
+                return 0.0
+
+        def parse_annual_series(tb, must_include, must_exclude=None):
+            """연간 실적 표(tb_type1_ifrs)에서 특정 항목 행의 전체 연도별 수치를 리스트로 반환 ('-'/빈값/추정치 오류는 제외)"""
+            for tr in tb.select('tbody tr'):
+                th = tr.select_one('th')
+                if not th:
+                    continue
+                th_text = th.text.strip()
+                if all(kw in th_text for kw in must_include) and not (must_exclude and any(ex in th_text for ex in must_exclude)):
+                    values = []
+                    for td in tr.select('td'):
+                        raw = td.text.strip().replace(',', '')
+                        if raw and raw not in ('-', ''):
+                            try:
+                                values.append(float(raw))
+                            except ValueError:
+                                continue
+                    return values
+            return []
+
         op_margin, roe = "0", "0"
+        op_margin_series, revenue_series = [], []
         tables = soup.select('table.tb_type1_ifrs')
         if tables:
             tb = tables[0]
@@ -427,14 +454,21 @@ def fetch_stock_name_and_fundamentals(code):
                             roe = tds[-2].text.strip()
                             if not roe.replace('.','').replace('-','').isdigit():
                                 roe = tds[-3].text.strip()
-                                
-        def clean_num(val):
-            val = val.replace(',','').replace('%','').strip()
-            try:
-                return float(val) if val and val != '-' else 0.0
-            except:
-                return 0.0
-                
+
+            # 최근 확인 가능한 전체 연도의 영업이익률 / 매출액 시계열 (3개년 평균·성장률 계산용)
+            op_margin_series = parse_annual_series(tb, ['영업이익률'])
+            revenue_series = parse_annual_series(tb, ['매출액'], must_exclude=['증가율', '성장률'])
+
+        # 연간 매출액 시계열로부터 연도별 YoY 성장률 계산 → 평균값을 "매출성장률"로 사용
+        revenue_growth_points = []
+        for i in range(1, len(revenue_series)):
+            prev, cur = revenue_series[i - 1], revenue_series[i]
+            if prev != 0:
+                revenue_growth_points.append((cur - prev) / abs(prev) * 100)
+        revenue_growth_avg = sum(revenue_growth_points) / len(revenue_growth_points) if revenue_growth_points else None
+
+        op_margin_avg = sum(op_margin_series) / len(op_margin_series) if op_margin_series else None
+
         return {
             "name": name,
             "per": clean_num(per),
@@ -442,7 +476,11 @@ def fetch_stock_name_and_fundamentals(code):
             "cns_per": clean_num(cns_per),
             "sector_per": clean_num(sector_per),
             "op_margin": clean_num(op_margin),
-            "roe": clean_num(roe)
+            "roe": clean_num(roe),
+            "op_margin_avg": op_margin_avg,          # 확인 가능한 연도 전체 평균 영업이익률 (없으면 None)
+            "op_margin_years": len(op_margin_series),
+            "revenue_growth": revenue_growth_avg,     # 확인 가능한 연도들의 평균 매출성장률(%) (없으면 None)
+            "revenue_growth_years": len(revenue_growth_points),
         }
     except Exception as e:
         return None
@@ -525,29 +563,101 @@ def get_stock_code_map():
         pass
     return code_map
 
-@st.cache_data(ttl=1800)
-def build_quant_filter_candidates():
-    """퀀트 필터 조건을 테스트할 수 있도록 대표 종목들의 펀더멘털 데이터를 수집합니다."""
-    sample_codes = ["005930", "000660", "035420", "035720", "068270", "051910", "006400", "207940", "030200", "323410"]
-    rows = []
-    for code in sample_codes:
-        try:
-            fundamentals = fetch_stock_name_and_fundamentals(code)
-            if not fundamentals:
+@st.cache_data(ttl=21600)  # 6시간 캐싱 (시가총액/업종은 하루 중 자주 바뀌지 않음)
+def fetch_market_universe():
+    """KRX 전종목의 실제 시가총액(KRX-MARCAP)과 실제 업종분류(KRX-DESC)를 가져와 병합"""
+    try:
+        df_marcap = fdr.StockListing('KRX')[['Code', 'Name', 'Market', 'Marcap']]
+        df_marcap['시가총액(억원)'] = df_marcap['Marcap'] / 1e8
+
+        df_desc = fdr.StockListing('KRX-DESC')[['Code', 'Sector']]
+
+        df = pd.merge(df_marcap, df_desc, on='Code', how='left')
+        df['Sector'] = df['Sector'].fillna('업종정보없음')
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def scan_fundamentals(codes, max_workers=15):
+    """주어진 종목코드 리스트에 대해 개별 페이지 펀더멘털(PER/PBR/ROE/영업이익률/매출성장률)을 병렬 수집"""
+    from concurrent.futures import ThreadPoolExecutor
+    results = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(fetch_stock_name_and_fundamentals, code): code for code in codes}
+        for future in futures:
+            code = futures[future]
+            try:
+                data = future.result()
+                if data:
+                    results[code] = data
+            except Exception:
                 continue
-            rows.append({
-                "종목코드": code,
-                "종목명": fundamentals["name"],
-                "PER": fundamentals["per"],
-                "PBR": fundamentals["pbr"],
-                "ROE": fundamentals["roe"],
-                "영업이익률": fundamentals["op_margin"],
-                "시가총액": None,
-                "매출성장률": None,
-                "업종": "기타",
-            })
-        except Exception:
+    return results
+
+
+@st.cache_data(ttl=1800)
+def build_quant_filter_candidates(market_cap_min=0, included_sector="", max_scan=150):
+    """실제 시가총액/업종 데이터로 먼저 후보를 좁힌 뒤, 그 안에서만 개별 페이지를 스캔하여 펀더멘털을 수집합니다."""
+    universe = fetch_market_universe()
+    if universe.empty:
+        return pd.DataFrame()
+
+    candidates = universe.copy()
+    if market_cap_min and market_cap_min > 0:
+        candidates = candidates[candidates['시가총액(억원)'] >= market_cap_min]
+    if included_sector:
+        candidates = candidates[candidates['Sector'].astype(str).str.contains(included_sector, case=False, na=False)]
+
+    # 스캔 부하를 제한하기 위해 (필터 통과 종목 중) 시가총액 상위 max_scan개까지만 실제 조회
+    candidates = candidates.sort_values('시가총액(억원)', ascending=False).head(max_scan)
+
+    fundamentals_map = scan_fundamentals(candidates['Code'].tolist())
+
+    rows = []
+    for _, row in candidates.iterrows():
+        f = fundamentals_map.get(row['Code'])
+        if not f:
             continue
+        rows.append({
+            "종목코드": row['Code'],
+            "종목명": f["name"],
+            "PER": f["per"],
+            "PBR": f["pbr"],
+            "ROE": f["roe"],
+            "영업이익률": f["op_margin"],
+            "시가총액": row['시가총액(억원)'],
+            "매출성장률": f["revenue_growth"],  # 확인 가능한 연도들의 평균 YoY 성장률(%), 데이터 없으면 None
+            "업종": row['Sector'],
+        })
+    return pd.DataFrame(rows)
+
+@st.cache_data(ttl=1800)
+def scan_value_candidates(scan_size):
+    """가치재평가주 메뉴용: 시가총액 상위 scan_size개 종목의 PBR/영업이익률/매출성장률을 실시간 스캔"""
+    universe = fetch_market_universe()
+    if universe.empty:
+        return pd.DataFrame()
+
+    top_universe = universe.sort_values('시가총액(억원)', ascending=False).head(scan_size)
+    fundamentals_map = scan_fundamentals(top_universe['Code'].tolist())
+
+    rows = []
+    for _, row in top_universe.iterrows():
+        f = fundamentals_map.get(row['Code'])
+        if not f:
+            continue
+        rows.append({
+            "종목코드": row['Code'],
+            "종목명": f["name"],
+            "PBR": f["pbr"],
+            "영업이익률평균": f["op_margin_avg"],
+            "영업이익률_확인연도수": f["op_margin_years"],
+            "매출성장률평균": f["revenue_growth"],
+            "매출성장률_확인연도수": f["revenue_growth_years"],
+            "시가총액": row['시가총액(억원)'],
+            "업종": row['Sector'],
+        })
     return pd.DataFrame(rows)
 
 def get_ai_summary(news_list):
@@ -922,37 +1032,67 @@ elif menu == "최우수 애널리스트 추천 종목":
 
 elif menu == "가치재평가주":
     st.subheader("💎 가치재평가주 (Value Re-evaluation) 스크리닝")
-    
+
     st.info("""
-    💡 **스크리닝 안내**: 전 종목 3개년 재무제표(매출성장률, 이익률 등) 실시간 전수 조사는 방대한 연산이 필요하여 대시보드 지연을 유발할 수 있습니다. 
-    따라서 본 모듈은 최근 시장 트렌드 및 기관/외국인 컨센서스 데이터를 바탕으로 해당 조건(저 PBR, 고수익성, 초고속 성장)에 
-    가장 완벽하게 부합하여 '가치재평가'가 이뤄지고 있는 대표 핵심 종목 10선씩을 큐레이션하여 제공합니다.
+    💡 **스크리닝 방식**: 시가총액 상위 N개 종목을 대상으로 각 종목의 실제 PBR·영업이익률·매출액 데이터를 실시간으로 조회하여,
+    조건(저 PBR / 고수익성 / 고성장)에 부합하는 상위 10종목을 그때그때 계산합니다. (고정된 예시 리스트가 아닙니다)
+
+    ⚠️ 단, 스캔 대상을 "시가총액 상위 N개"로 한정하기 때문에, 고성장/고수익성 테마에 흔한 중소형주가 스캔 범위 밖에 있을 수 있습니다.
+    더 폭넓게 보고 싶다면 아래 스캔 수를 늘려주세요 (다만 조회 시간이 늘어납니다).
     """)
     st.markdown("---")
-    
-    tab1, tab2, tab3 = st.tabs(["📉 1. 저 PBR 종목 (상위 10선)", "💰 2. 매출이익 40% 이상 (최근 3개년)", "🚀 3. 매출성장률 연 50% 이상 (최근 3개년)"])
-    
-    with tab1:
-        st.markdown("#### 기업가치 대비 극도로 저평가된 저 PBR 핵심 우량주")
-        low_pbr_stocks = ["KB금융", "하나금융지주", "신한지주", "한국전력", "현대차", "기아", "기업은행", "삼성물산", "DB손해보험", "SK"]
-        for idx, stock in enumerate(low_pbr_stocks, 1):
-            st.markdown(f"**{idx}. {stock}** (주주환원 및 밸류업 기대감 수혜주)")
-            
-    with tab2:
-        st.markdown("#### 최근 3개년 꾸준히 40% 이상의 독보적인 매출/영업이익률을 기록 중인 기업")
-        high_margin_stocks = ["클래시스", "휴젤", "리노공업", "케어젠", "파마리서치", "메디톡스", "더존비즈온", "아프리카TV", "티씨케이", "HPSP"]
-        for idx, stock in enumerate(high_margin_stocks, 1):
-            st.markdown(f"**{idx}. {stock}** (압도적인 기술력 및 해자 기반의 고수익성 유지)")
-            
-    with tab3:
-        st.markdown("#### 최근 3개년 평균 연간 매출 성장률 50%를 상회하는 초고속 성장 기업")
-        high_growth_stocks = ["에코프로비엠", "포스코퓨처엠", "알테오젠", "루닛", "엘앤에프", "나노신소재", "제이엘케이", "뷰노", "에코프로", "코스메카코리아"]
-        for idx, stock in enumerate(high_growth_stocks, 1):
-            st.markdown(f"**{idx}. {stock}** (글로벌 메가 트렌드 편승 및 폭발적인 실적 퀀텀점프)")
+
+    scan_size = st.slider("스캔 대상 시가총액 상위 종목 수", min_value=50, max_value=500, value=300, step=50)
+    st.caption("※ 종목마다 개별 페이지를 실시간 조회하므로, 스캔 수를 늘리면 정확도(대상 폭)는 넓어지지만 조회 시간도 늘어납니다 (300종목 기준 약 30초~1분 소요).")
+    run_value_scan = st.button("💎 실시간 스캔 시작")
+
+    if run_value_scan:
+        with st.spinner(f"시가총액 상위 {scan_size}개 종목의 PBR/영업이익률/매출액 데이터를 실시간 조회 중입니다..."):
+            st.session_state['value_scan_df'] = scan_value_candidates(scan_size)
+            st.session_state['value_scan_size'] = scan_size
+
+    if st.session_state.get('value_scan_df') is not None and not st.session_state['value_scan_df'].empty:
+        df_scan = st.session_state['value_scan_df']
+        scanned_n = st.session_state.get('value_scan_size', scan_size)
+
+        tab1, tab2, tab3 = st.tabs(["📉 1. 저 PBR 종목 (상위 10선)", "💰 2. 고수익성 종목 (영업이익률 평균 상위)", "🚀 3. 고성장 종목 (매출성장률 평균 상위)"])
+
+        with tab1:
+            st.markdown("#### 기업가치 대비 저평가된 저 PBR 상위 10종목")
+            low_pbr = df_scan[df_scan['PBR'] > 0].sort_values('PBR', ascending=True).head(10)
+            if low_pbr.empty:
+                st.warning("조건에 맞는 종목을 찾지 못했습니다.")
+            else:
+                st.dataframe(low_pbr[['종목명', '종목코드', 'PBR', '시가총액', '업종']], hide_index=True, use_container_width=True)
+                st.caption(f"※ 시가총액 상위 {scanned_n}개 종목 중 PBR이 0보다 크면서 가장 낮은 순")
+
+        with tab2:
+            st.markdown("#### 확인 가능한 연도 기준, 영업이익률 평균이 가장 높은 상위 10종목")
+            high_margin = df_scan.dropna(subset=['영업이익률평균']).sort_values('영업이익률평균', ascending=False).head(10)
+            if high_margin.empty:
+                st.warning("조건에 맞는 종목을 찾지 못했습니다.")
+            else:
+                display = high_margin[['종목명', '종목코드', '영업이익률평균', '영업이익률_확인연도수', '시가총액', '업종']].copy()
+                display['영업이익률평균'] = display['영업이익률평균'].apply(lambda x: f"{x:.2f}%")
+                st.dataframe(display, hide_index=True, use_container_width=True)
+                st.caption("※ '영업이익률_확인연도수'는 네이버 금융에 공시된 연간 실적 중 실제로 확인 가능했던 연도 수입니다(기업마다 상이할 수 있음).")
+
+        with tab3:
+            st.markdown("#### 확인 가능한 연도 기준, 평균 매출성장률(YoY)이 가장 높은 상위 10종목")
+            high_growth = df_scan.dropna(subset=['매출성장률평균']).sort_values('매출성장률평균', ascending=False).head(10)
+            if high_growth.empty:
+                st.warning("조건에 맞는 종목을 찾지 못했습니다.")
+            else:
+                display = high_growth[['종목명', '종목코드', '매출성장률평균', '매출성장률_확인연도수', '시가총액', '업종']].copy()
+                display['매출성장률평균'] = display['매출성장률평균'].apply(lambda x: f"{x:+.2f}%")
+                st.dataframe(display, hide_index=True, use_container_width=True)
+                st.caption("※ '매출성장률_확인연도수'는 평균 계산에 사용된 연도별 YoY 성장률 개수입니다(기업마다 상이할 수 있음).")
+    else:
+        st.info("위 '실시간 스캔 시작' 버튼을 눌러 조회를 시작하세요.")
 
 elif menu == "퀀트 투자 리스트":
     st.subheader("🧠 퀀트 투자 리스트")
-    st.markdown("조건을 입력하면 pandas로 필터링된 종목 리스트를 바로 확인할 수 있습니다.")
+    st.markdown("조건을 입력하면 실제 KRX 상장 종목 데이터를 실시간으로 조회하여 조건에 맞는 리스트를 보여줍니다.")
     st.info("예시 조건: PER ≤ 15, PBR ≤ 1.5, ROE ≥ 10, 영업이익률 ≥ 5")
 
     with st.expander("📌 필터 조건 설정", expanded=True):
@@ -976,40 +1116,50 @@ elif menu == "퀀트 투자 리스트":
         with col8:
             top_n = st.slider("표시 종목 수", min_value=5, max_value=50, value=20, step=5)
 
+        max_scan = st.slider(
+            "스캔 대상 최대 종목 수 (시가총액/업종 조건 통과 종목 중 시가총액 상위 N개만 상세 조회)",
+            min_value=30, max_value=400, value=150, step=10
+        )
+        st.caption("※ 종목마다 개별 페이지를 실시간 조회하므로, 스캔 수를 늘리면 정확도(대상 폭)는 넓어지지만 조회 시간도 늘어납니다.")
+
         sort_column = st.selectbox("정렬 기준", ["ROE", "영업이익률", "PER", "PBR", "매출성장률"])
 
-    with st.spinner("펀더멘털 데이터를 수집하고 조건을 적용 중입니다..."):
-        df_candidates = build_quant_filter_candidates()
+    run_scan = st.button("🔍 조건에 맞는 종목 스캔 시작")
 
-    if df_candidates.empty:
-        st.warning("종목 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해주세요.")
-    else:
-        df_candidates = df_candidates.dropna(subset=["PER", "PBR", "ROE", "영업이익률"]).copy()
-        mask = (
-            (df_candidates["PER"] > 0) &
-            (df_candidates["PER"] <= per_limit) &
-            (df_candidates["PBR"] > 0) &
-            (df_candidates["PBR"] <= pbr_limit) &
-            (df_candidates["ROE"] >= roe_min) &
-            (df_candidates["영업이익률"] >= op_margin_min)
-        )
-        filtered = df_candidates.loc[mask].copy()
+    if run_scan:
+        with st.spinner(f"시가총액/업종 조건으로 후보를 추린 뒤 상위 {max_scan}개 종목의 펀더멘털을 실시간 조회 중입니다..."):
+            df_candidates = build_quant_filter_candidates(
+                market_cap_min=market_cap_min,
+                included_sector=included_sector,
+                max_scan=max_scan,
+            )
 
-        if market_cap_min > 0:
-            filtered = filtered.loc[filtered["시가총액"].isna() | (filtered["시가총액"] >= market_cap_min)]
-        if included_sector:
-            filtered = filtered.loc[filtered["업종"].astype(str).str.contains(included_sector, case=False, na=False)]
-        if revenue_growth_min is not None:
+        if df_candidates.empty:
+            st.warning("조건에 맞는 종목을 찾지 못했거나 데이터를 불러오지 못했습니다. 조건을 완화하거나 잠시 후 다시 시도해주세요.")
+        else:
+            df_candidates = df_candidates.dropna(subset=["PER", "PBR", "ROE", "영업이익률"]).copy()
+            mask = (
+                (df_candidates["PER"] > 0) &
+                (df_candidates["PER"] <= per_limit) &
+                (df_candidates["PBR"] > 0) &
+                (df_candidates["PBR"] <= pbr_limit) &
+                (df_candidates["ROE"] >= roe_min) &
+                (df_candidates["영업이익률"] >= op_margin_min)
+            )
+            filtered = df_candidates.loc[mask].copy()
+
+            # 매출성장률: 확인 가능한 연도 데이터가 없는 종목(None)은 조건 판단에서 제외하지 않고 통과시킴
             filtered = filtered.loc[filtered["매출성장률"].isna() | (filtered["매출성장률"] >= revenue_growth_min)]
 
-        if filtered.empty:
-            st.warning("입력한 조건에 맞는 종목이 없습니다. 기준을 완화해 보세요.")
-        else:
-            filtered = filtered.sort_values(by=sort_column, ascending=False)
-            filtered = filtered.head(top_n)
-            st.success("조건에 맞는 종목 리스트")
-            st.dataframe(filtered[["종목명", "종목코드", "PER", "PBR", "ROE", "영업이익률", "매출성장률", "시가총액", "업종"]], hide_index=True, use_container_width=True)
-            st.caption(f"적용 조건: PER ≤ {per_limit}, PBR ≤ {pbr_limit}, ROE ≥ {roe_min}%, 영업이익률 ≥ {op_margin_min}%, 매출성장률 ≥ {revenue_growth_min}%, 시가총액 ≥ {market_cap_min}억, 업종 키워드: {included_sector or '전체'}")
+            if filtered.empty:
+                st.warning("입력한 조건에 맞는 종목이 없습니다. 기준을 완화해 보세요.")
+            else:
+                filtered = filtered.sort_values(by=sort_column, ascending=False)
+                filtered = filtered.head(top_n)
+                st.success(f"조건에 맞는 종목 리스트 (시가총액 상위 {max_scan}개 종목 중 스캔)")
+                st.dataframe(filtered[["종목명", "종목코드", "PER", "PBR", "ROE", "영업이익률", "매출성장률", "시가총액", "업종"]], hide_index=True, use_container_width=True)
+                st.caption(f"적용 조건: PER ≤ {per_limit}, PBR ≤ {pbr_limit}, ROE ≥ {roe_min}%, 영업이익률 ≥ {op_margin_min}%, 매출성장률 ≥ {revenue_growth_min}%(데이터 없는 종목은 통과), 시가총액 ≥ {market_cap_min}억, 업종 키워드: {included_sector or '전체'}")
+                st.caption("※ 매출성장률은 네이버 금융에 공시된 연간 매출액 중 확인 가능한 연도들의 평균 YoY 성장률입니다 (기업별로 확인 가능한 연도 수가 다를 수 있습니다).")
 
 elif menu == "개별종목분석":
     st.subheader("🤖 개별종목분석")
