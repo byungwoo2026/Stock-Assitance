@@ -63,17 +63,18 @@ div[role="radiogroup"] > label > div:first-child {
 menu = st.radio("메뉴 선택", MENU_OPTIONS, horizontal=True, label_visibility="collapsed")
 
 # 차단 없는 네이버 뉴스 RSS 엔진
-def fetch_headlines_rss(keyword):
+@st.cache_data(ttl=3600)  # 1시간 캐싱
+def fetch_headlines_rss(keyword, max_n=5, period="7d"):
     headlines = []
     # 네이버 공식 뉴스 RSS 검색 URL (정확도순)
-    url = f"https://news.google.com/rss/search?q={keyword}+when:7d&hl=ko&gl=KR&ceid=KR:ko"
+    url = f"https://news.google.com/rss/search?q={keyword}+when:{period}&hl=ko&gl=KR&ceid=KR:ko"
     
     try:
         response = requests.get(url)
         root = ET.fromstring(response.text) # 파이썬 기본 XML 파서 사용
         items = root.findall('.//item')
         
-        for item in items[:5]: # 상위 5개 헤드라인 추출
+        for item in items[:max_n]: # 상위 N개 헤드라인 추출
             title_elem = item.find('title')
             link_elem = item.find('link')
             
@@ -808,13 +809,106 @@ def get_individual_stock_ai_analysis(fundamentals, tech, news_list):
     except Exception as e:
         return f"⚠️ AI 분석 리포트 생성 중 오류가 발생했습니다: {e}"
 
+@st.cache_data(ttl=600)  # 10분 캐싱 (등락 확인 목적이라 지수 캐싱(5분)보단 조금 여유있게)
+def fetch_semiconductor_snapshot():
+    """반도체 대표 종목(업종 ETF + 삼성전자 + SK하이닉스)의 당일 등락 정보를 수집"""
+    targets = {
+        "반도체 업종(TIGER 반도체TOP10)": "091230",
+        "삼성전자": "005930",
+        "SK하이닉스": "000660",
+    }
+    results = {}
+    start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+    for name, code in targets.items():
+        try:
+            df = fdr.DataReader(code, start_date)
+            if len(df) >= 2:
+                prev_close = float(df['Close'].iloc[-2])
+                last_close = float(df['Close'].iloc[-1])
+                change_pct = (last_close - prev_close) / prev_close * 100
+                results[name] = {"price": last_close, "change": change_pct}
+        except Exception:
+            continue
+    return results
+
+def fetch_multi_angle_news(queries, per_query=4, max_total=8, period="7d"):
+    """여러 키워드로 나눠 뉴스를 조회한 뒤 제목 기준 중복을 제거해 하나의 리스트로 합침
+    (한 키워드만 쓰면 특정 각도의 뉴스만 잡혀서, 수급/업황/실적/이슈 등 다각도로 조회)"""
+    seen_titles = set()
+    combined = []
+    for q in queries:
+        for n in fetch_headlines_rss(q, max_n=per_query, period=period):
+            if n['title'] not in seen_titles:
+                seen_titles.add(n['title'])
+                combined.append(n)
+    return combined[:max_total]
+
+@st.cache_data(ttl=3600)  # 1시간 캐싱
+def get_price_move_reason_analysis(kospi_data, semi_data):
+    """코스피 지수와 반도체 대표 종목들이 오늘 왜 이렇게 움직였는지, 다각도로 조회한 실제 뉴스를 근거로 AI가 논리적으로 추정 분석
+    반환값: (분석 텍스트, 코스피 관련 뉴스 리스트, 반도체 관련 뉴스 리스트) — 뉴스 리스트는 화면에 원문 링크를 걸어주기 위해 함께 반환"""
+    # 단일 키워드로는 근거가 얕을 수 있어, 수급/업황/실적/이슈 등 여러 각도로 나눠 검색 후 통합
+    # "오늘 왜 이렇게 움직였는지"가 목적이므로 최근 1일(period="1d") 뉴스로 한정해 며칠 전 뉴스가 섞이는 것을 방지
+    kospi_news = fetch_multi_angle_news(
+        ["코스피 마감", "코스피 외국인 순매수", "코스피 증시 이슈"], per_query=4, max_total=8, period="1d"
+    )
+    semi_news = fetch_multi_angle_news(
+        ["반도체 주가", "반도체 수출 업황", "삼성전자 SK하이닉스 주가", "반도체 D램 가격"], per_query=4, max_total=8, period="1d"
+    )
+
+    try:
+        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+
+        semi_text = "\n".join(
+            [f"- {name}: {d['price']:,.0f}원 ({d['change']:+.2f}%)" for name, d in semi_data.items()]
+        ) if semi_data else "반도체 데이터 없음"
+
+        kospi_news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in kospi_news]) if kospi_news else "조회된 관련 뉴스 없음"
+        semi_news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in semi_news]) if semi_news else "조회된 관련 뉴스 없음"
+
+        prompt = f"""
+        당신은 냉철하고 논리적인 시장 분석가입니다. 아래 [코스피 지수], [반도체 대표 종목 당일 등락],
+        [수급/업황/실적 등 여러 각도로 조회한 실제 뉴스 헤드라인]을 종합하여
+        오늘 코스피와 반도체 관련 종목이 왜 이렇게 움직였는지 합리적으로 추정 분석해주세요.
+
+        [코스피 지수]
+        - KOSPI: {kospi_data.get('index', 'N/A')} ({kospi_data.get('change', 'N/A')})
+
+        [반도체 대표 종목 당일 등락]
+        {semi_text}
+
+        [코스피 관련 뉴스 (수급/증시 이슈 등 여러 각도)]
+        {kospi_news_text}
+
+        [반도체 관련 뉴스 (업황/수출/가격/개별종목 등 여러 각도)]
+        {semi_news_text}
+
+        반드시 지켜야 할 사항:
+        1. 위에 제공된 뉴스에 실제로 언급된 내용만 근거로 사용하세요. 뉴스에 없는 사실을 지어내지 마세요.
+        2. 여러 뉴스가 있다면 개별 헤드라인을 단순 나열하지 말고, 서로 연결지어(예: 수급 동향 + 업황 뉴스 + 가격 동향) 하나의 논리적인 흐름으로 종합 설명하세요.
+        3. 뉴스 근거가 뚜렷하지 않다면 추측하지 말고 "이 부분은 명확한 뉴스 근거가 없어 추정입니다"처럼 솔직하게 밝히세요.
+        4. 코스피 등락 원인과 반도체 등락 원인을 구분해서 각각 3~4문장으로 설명해주세요.
+        5. 응답은 반드시 한국어로만, 마크다운으로 가독성 있게 작성하세요.
+        """
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+        return response.choices[0].message.content, kospi_news, semi_news
+    except Exception as e:
+        return f"⚠️ AI 등락 원인 분석 중 오류가 발생했습니다: {e}", kospi_news, semi_news
+
+@st.cache_data(ttl=3600)  # 1시간 캐싱
 def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
+    """반환값: (브리핑 텍스트, 근거로 사용한 시장 뉴스 리스트) — 뉴스 리스트는 화면에 원문 링크를 걸어주기 위해 함께 반환"""
+    # 지수/업종 숫자만으로 추론하지 않도록, 오늘자 실제 시장 뉴스 헤드라인을 함께 조회해서 근거로 제공
+    market_news = fetch_headlines_rss("코스피 코스닥 증시", period="1d")
+
     try:
         client = Groq(api_key=st.secrets["GROQ_API_KEY"])
         sectors_text = "\n".join([f"- {s['업종/테마']}: {s['변동']}" for s in top_sectors]) if top_sectors else "업종 정보 없음"
 
-        # 지수/업종 숫자만으로 추론하지 않도록, 오늘자 실제 시장 뉴스 헤드라인을 함께 조회해서 근거로 제공
-        market_news = fetch_headlines_rss("코스피 코스닥 증시")
         if market_news:
             news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in market_news])
         else:
@@ -846,9 +940,9 @@ def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         )
-        return response.choices[0].message.content
+        return response.choices[0].message.content, market_news
     except Exception as e:
-        return f"⚠️ AI 시장 분석 중 오류가 발생했습니다: {e}"
+        return f"⚠️ AI 시장 분석 중 오류가 발생했습니다: {e}", market_news
 
 
 def classify_news_sentiment_ai(news_list):
@@ -1053,6 +1147,14 @@ def render_index_metric(label, data):
         </div>
     """, unsafe_allow_html=True)
 
+def render_news_links(news_list, expander_label="📰 참고한 관련 기사 보기"):
+    """AI 분석에 근거로 사용된 뉴스 제목들을 원문 링크와 함께 접이식으로 표시"""
+    if not news_list:
+        return
+    with st.expander(expander_label):
+        for n in news_list:
+            st.markdown(f"- [{n['title']}]({n['link']})  \n  <span style='color:gray; font-size:0.85rem;'>{n['press']}</span>", unsafe_allow_html=True)
+
 # 각 메뉴별 UI 화면 구성
 if menu == "종합 대시보드":
     st.subheader("오늘의 투자 핵심 요약")
@@ -1066,7 +1168,33 @@ if menu == "종합 대시보드":
         render_index_metric("KOSPI", kospi_data)
     with m_col2:
         render_index_metric("KOSDAQ", kosdaq_data)
-        
+
+    st.markdown("---")
+
+    # 반도체 대표 종목 당일 등락 스냅샷
+    st.markdown("#### 🔧 반도체 대표 종목 당일 등락")
+    with st.spinner("반도체 대표 종목 시세를 수집 중입니다..."):
+        semi_data = fetch_semiconductor_snapshot()
+    if semi_data:
+        semi_cols = st.columns(len(semi_data))
+        for s_col, (name, d) in zip(semi_cols, semi_data.items()):
+            with s_col:
+                st.metric(label=name, value=f"{d['price']:,.0f}원", delta=f"{d['change']:+.2f}%")
+    else:
+        st.warning("반도체 데이터를 불러오지 못했습니다.")
+
+    if GENAI_AVAILABLE:
+        with st.spinner("AI가 코스피·반도체 등락 원인을 분석하고 있습니다..."):
+            reason_analysis, kospi_news_used, semi_news_used = get_price_move_reason_analysis(kospi_data, semi_data)
+        st.info(f"**🔍 오늘 코스피·반도체 등락 원인 분석 (AI 추정)**\n\n{reason_analysis}")
+        news_col1, news_col2 = st.columns(2)
+        with news_col1:
+            render_news_links(kospi_news_used, "📰 코스피 관련 참고 기사")
+        with news_col2:
+            render_news_links(semi_news_used, "📰 반도체 관련 참고 기사")
+    else:
+        st.info("💡 Groq 패키지가 설치되지 않아 AI 등락 원인 분석 기능을 사용할 수 없습니다.")
+
     st.markdown("---")
     
     col1, col2 = st.columns(2)
@@ -1087,8 +1215,9 @@ if menu == "종합 대시보드":
         st.markdown("### 🤖 AI 투자 비서의 데일리 시장 분석 & 전략")
         st.caption("※ 지수/업종 데이터뿐 아니라, 실제 시장 뉴스 헤드라인을 근거로 작성합니다 (뉴스에 없는 내용은 추측하지 않도록 지시되어 있습니다).")
         with st.spinner("AI가 오늘의 시장 상황과 실제 뉴스를 종합 분석하고 있습니다..."):
-            market_briefing = get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors)
+            market_briefing, market_news_used = get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors)
             st.info(market_briefing)
+            render_news_links(market_news_used, "📰 참고한 시장 뉴스")
     else:
         st.info("💡 Groq 패키지가 설치되지 않아 AI 분석 기능을 사용할 수 없습니다.")
 
