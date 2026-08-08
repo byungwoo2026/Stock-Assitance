@@ -92,6 +92,12 @@ def fetch_headlines_rss(keyword, max_n=5, period="7d"):
                 headlines.append({"title": title, "press": press, "link": link})
     except Exception as e:
         st.error(f"RSS 피드 읽기 오류: {e}")
+        # 🔍 임시 진단 코드 — 원인 확정되면 제거 예정
+        try:
+            st.code(f"[진단] 상태코드: {response.status_code} / Content-Type: {response.headers.get('Content-Type')}")
+            st.code(repr(response.text[:400]))
+        except Exception:
+            st.warning("[진단] response 자체를 못 받아왔음 (요청 단계에서 실패)")
     return headlines
 
 # 코스피/코스닥 데이터 안정적 수집 함수 (주말/새벽 서버 오류 및 차단 방지)
