@@ -1603,32 +1603,31 @@ def calculate_stock_score(fundamentals, tech, news_list):
             elif n_match > p_match:
                 neg_count += 1 * source_weight
 
-    # A. 뉴스 감성 점수 (20점 만점)
+    # A. 뉴스 감성 점수 (15점 만점, 뉴스 있으면 0~15 전 구간 선형)
     total_news = len(news_list)
     if total_news > 0:
-        # (긍정 - 부정) / 전체 비율을 0~20 구간으로 매핑
+        # (긍정 - 부정) / 전체 비율을 0~15 구간으로 매핑
         sentiment_ratio = (pos_count - neg_count) / total_news
-        # -1~1 사이의 값을 0~20 점수로 변환
-        sentiment_score = ((sentiment_ratio + 1) / 2) * 20
+        sentiment_score = ((sentiment_ratio + 1) / 2) * 15
     else:
-        sentiment_score = 10.0 # 뉴스 없을 시 중립 점수
+        sentiment_score = 5.0 # 뉴스 없을 시 기본 점수
         
-    # B. 뉴스 노출 빈도 점수 (10점 만점)
+    # B. 뉴스 노출 빈도 점수 (10점 만점, 변경 없음)
     if total_news >= 5: freq_score = 10
     elif total_news >= 3: freq_score = 7
     elif total_news >= 1: freq_score = 4
     else: freq_score = 0
     
-    # C. 거래량 모멘텀 점수 (10점 만점)
+    # C. 거래량 모멘텀 점수 (15점 만점, 기존 10점 만점 기준값의 ×1.5)
     v_ratio = tech.get('volume_ratio', 100.0)
-    if v_ratio >= 200: vol_score = 10      # 평소 대비 거래량 2배 폭발
-    elif v_ratio >= 150: vol_score = 8
-    elif v_ratio >= 100: vol_score = 6     # 평소 수준 유지
-    elif v_ratio >= 50: vol_score = 3
+    if v_ratio >= 200: vol_score = 15      # 평소 대비 거래량 2배 폭발
+    elif v_ratio >= 150: vol_score = 12
+    elif v_ratio >= 100: vol_score = 9     # 평소 수준 유지
+    elif v_ratio >= 50: vol_score = 4.5
     else: vol_score = 0
     
     news_suqub_total = int(sentiment_score + freq_score + vol_score)
-    news_suqub_total = min(40, max(0, news_suqub_total)) # 40점 방어선
+    news_suqub_total = min(40, max(0, news_suqub_total)) # 40점 방어선 (15+10+15=40, 총합 동일)
     
     # --------------------------------------------------
     # 2. 업종별 상대 PER 전략 (10점 만점)
