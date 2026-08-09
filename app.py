@@ -69,8 +69,21 @@ def fetch_headlines_rss(keyword, max_n=5, period="7d"):
     # 네이버 공식 뉴스 RSS 검색 URL (정확도순)
     url = f"https://news.google.com/rss/search?q={keyword}+when:{period}&hl=ko&gl=KR&ceid=KR:ko"
     
+    # 브라우저처럼 보이도록 User-Agent 지정 (Google이 봇으로 판단해 차단할 확률을 낮춤)
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                      "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    }
+
     try:
-        response = requests.get(url)
+        response = requests.get(url, headers=headers, timeout=10)
+
+        # User-Agent를 넣어도 Google이 여전히 차단(503 등)할 수 있으므로,
+        # 200이 아니면 XML 파싱을 아예 시도하지 않고 조용히 빈 리스트로 반환
+        if response.status_code != 200:
+            st.caption(f"⚠️ 뉴스 조회 일시 실패(상태코드 {response.status_code}) — 이 종목은 뉴스 점수를 중립으로 처리합니다.")
+            return headlines
+
         root = ET.fromstring(response.text) # 파이썬 기본 XML 파서 사용
         items = root.findall('.//item')
         
@@ -90,14 +103,10 @@ def fetch_headlines_rss(keyword, max_n=5, period="7d"):
                 
             if title:
                 headlines.append({"title": title, "press": press, "link": link})
-    except Exception as e:
-        st.error(f"RSS 피드 읽기 오류: {e}")
-        # 🔍 임시 진단 코드 — 원인 확정되면 제거 예정
-        try:
-            st.code(f"[진단] 상태코드: {response.status_code} / Content-Type: {response.headers.get('Content-Type')}")
-            st.code(repr(response.text[:400]))
-        except Exception:
-            st.warning("[진단] response 자체를 못 받아왔음 (요청 단계에서 실패)")
+    except Exception:
+        # 상태코드는 200인데 XML 파싱 자체가 실패하는 등 예외 상황도
+        # 화면을 빨간 에러박스로 깨뜨리지 않고 조용히 넘어가도록 처리
+        st.caption("⚠️ 뉴스 조회 중 예기치 못한 오류 — 이 종목은 뉴스 점수를 중립으로 처리합니다.")
     return headlines
 
 # 코스피/코스닥 데이터 안정적 수집 함수 (주말/새벽 서버 오류 및 차단 방지)
@@ -1693,7 +1702,8 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
             
             code_map = get_stock_code_map()
             stock_codes = []
-            
+            failed_inputs = []  # 종목코드 매핑에 실패한 입력값 추적용
+
             for inp in inputs:
                 if inp.isdigit() and len(inp) == 6:
                     stock_codes.append(inp)
@@ -1701,7 +1711,15 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                     code = code_map.get(inp)
                     if code:
                         stock_codes.append(code)
-            
+                    else:
+                        failed_inputs.append(inp)
+
+            if failed_inputs:
+                st.warning(
+                    f"⚠️ 다음 종목을 찾지 못해 분석에서 제외했습니다: **{', '.join(failed_inputs)}**\n\n"
+                    f"KRX 정식 종목명(예: '현대차'가 안 되면 '현대자동차')이나 6자리 종목코드로 다시 입력해보세요."
+                )
+
             if not stock_codes:
                 st.warning("올바른 종목명 또는 6자리 종목코드를 입력해주세요.")
             else:
