@@ -646,26 +646,43 @@ def analyze_stock_technical(code):
 
 @st.cache_data(ttl=86400)
 def get_stock_code_map():
-    url = 'http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13'
+    """종목명 -> 6자리 코드 매핑 테이블.
+    1차로는 이미 안정적으로 작동 중인 fetch_market_universe()(FinanceDataReader 기반)를 사용하고,
+    그것이 실패할 때만 kind.krx.co.kr 직접 스크래핑으로 폴백한다.
+    (kind.krx.co.kr는 Streamlit Cloud 공유 IP가 차단당할 수 있어 기본 경로로 쓰기 위험함)
+    """
     code_map = {}
+    # 1차: 이미 검증된 FinanceDataReader 소스 우선 사용
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        res = requests.get(url, headers=headers, timeout=10)
-        res.encoding = 'euc-kr'
-        soup = BeautifulSoup(res.text, 'html.parser')
-        rows = soup.find_all('tr')
-        for row in rows:
-            tds = row.find_all('td')
-            if len(tds) >= 3:
-                company_name = tds[0].text.strip()
-                code_text = tds[2].text.strip()
-                if len(code_text) >= 5:
-                    if code_text.isdigit():
-                        code_map[company_name] = f"{int(code_text):06d}"
-                    else:
-                        code_map[company_name] = code_text
+        universe = fetch_market_universe()
+        if not universe.empty:
+            for _, row in universe.iterrows():
+                code_map[row['Name']] = row['Code']
     except Exception:
         pass
+
+    # 2차 폴백: 위가 실패했을 때만 기존 kind.krx.co.kr 스크래핑 시도
+    if not code_map:
+        url = 'http://kind.krx.co.kr/corpgeneral/corpList.do?method=download&searchType=13'
+        try:
+            headers = {"User-Agent": "Mozilla/5.0"}
+            res = requests.get(url, headers=headers, timeout=10)
+            res.encoding = 'euc-kr'
+            soup = BeautifulSoup(res.text, 'html.parser')
+            rows = soup.find_all('tr')
+            for row in rows:
+                tds = row.find_all('td')
+                if len(tds) >= 3:
+                    company_name = tds[0].text.strip()
+                    code_text = tds[2].text.strip()
+                    if len(code_text) >= 5:
+                        if code_text.isdigit():
+                            code_map[company_name] = f"{int(code_text):06d}"
+                        else:
+                            code_map[company_name] = code_text
+        except Exception:
+            pass
+
     return code_map
 
 @st.cache_data(ttl=21600)  # 6시간 캐싱 (시가총액/업종은 하루 중 자주 바뀌지 않음)
