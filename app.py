@@ -795,7 +795,7 @@ def get_ai_summary(news_list):
         {news_text}
         """
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}]
         )
         return response.choices[0].message.content
@@ -834,7 +834,7 @@ def get_individual_stock_ai_analysis(fundamentals, tech, news_list):
         4. **최종 AI 투자 전략 & 가이드**: 추천 매매 전략(분할 매수, 관망, 매도 등)과 목표/손절 대응 팁.
         """
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}]
         )
         return response.choices[0].message.content
@@ -923,7 +923,7 @@ def get_price_move_reason_analysis(kospi_data, semi_data):
         5. 응답은 반드시 한국어로만, 마크다운으로 가독성 있게 작성하세요.
         """
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         )
@@ -968,7 +968,7 @@ def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
         4. 글자 크기가 너무 크지 않도록 마크다운 구조(강조 등)를 활용하여 정중하고 명확한 어조로 요약해 주세요.
         """
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3,
         )
@@ -1002,7 +1002,7 @@ def classify_news_sentiment_ai(news_list):
         [{{"번호": 1, "판정": "긍정"}}, {{"번호": 2, "판정": "중립"}}]
         """
         response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+            model="openai/gpt-oss-120b",
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
