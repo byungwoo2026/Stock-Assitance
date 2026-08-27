@@ -1444,7 +1444,7 @@ elif menu == "가치재평가주":
 
     st.info("""
     💡 **스크리닝 방식**: 시가총액 상위 N개 종목을 대상으로 각 종목의 실제 PBR·영업이익률·매출액 데이터를 실시간으로 조회하여,
-    조건(저 PBR / 고수익성 / 고성장)에 부합하는 상위 10종목을 그때그때 계산합니다. (고정된 예시 리스트가 아닙니다)
+    조건(저 PBR / 고수익성 / 고성장)에 부합하는 상위 20종목을 그때그때 계산합니다. (고정된 예시 리스트가 아닙니다)
 
     ⚠️ 단, 스캔 대상을 "시가총액 상위 N개"로 한정하기 때문에, 고성장/고수익성 테마에 흔한 중소형주가 스캔 범위 밖에 있을 수 있습니다.
     더 폭넓게 보고 싶다면 아래 스캔 수를 늘려주세요 (다만 조회 시간이 늘어납니다).
@@ -1464,11 +1464,11 @@ elif menu == "가치재평가주":
         df_scan = st.session_state['value_scan_df']
         scanned_n = st.session_state.get('value_scan_size', scan_size)
 
-        tab1, tab2, tab3 = st.tabs(["📉 1. 저 PBR 종목 (상위 10선)", "💰 2. 고수익성 종목 (영업이익률 평균 상위)", "🚀 3. 고성장 종목 (매출성장률 평균 상위)"])
+        tab1, tab2, tab3 = st.tabs(["📉 1. 저 PBR 종목 (상위 20선)", "💰 2. 고수익성 종목 (영업이익률 평균 상위)", "🚀 3. 고성장 종목 (매출성장률 평균 상위)"])
 
         with tab1:
-            st.markdown("#### 기업가치 대비 저평가된 저 PBR 상위 10종목")
-            low_pbr = df_scan[df_scan['PBR'] > 0].sort_values('PBR', ascending=True).head(10)
+            st.markdown("#### 기업가치 대비 저평가된 저 PBR 상위 20종목")
+            low_pbr = df_scan[df_scan['PBR'] > 0].sort_values('PBR', ascending=True).head(20)
             if low_pbr.empty:
                 st.warning("조건에 맞는 종목을 찾지 못했습니다.")
             else:
@@ -1476,8 +1476,8 @@ elif menu == "가치재평가주":
                 st.caption(f"※ 시가총액 상위 {scanned_n}개 종목 중 PBR이 0보다 크면서 가장 낮은 순")
 
         with tab2:
-            st.markdown("#### 확인 가능한 연도 기준, 영업이익률 평균이 가장 높은 상위 10종목")
-            high_margin = df_scan.dropna(subset=['영업이익률평균']).sort_values('영업이익률평균', ascending=False).head(10)
+            st.markdown("#### 확인 가능한 연도 기준, 영업이익률 평균이 가장 높은 상위 20종목")
+            high_margin = df_scan.dropna(subset=['영업이익률평균']).sort_values('영업이익률평균', ascending=False).head(20)
             if high_margin.empty:
                 st.warning("조건에 맞는 종목을 찾지 못했습니다.")
             else:
@@ -1487,8 +1487,8 @@ elif menu == "가치재평가주":
                 st.caption("※ '영업이익률_확인연도수'는 네이버 금융에 공시된 연간 실적 중 실제로 확인 가능했던 연도 수입니다(기업마다 상이할 수 있음).")
 
         with tab3:
-            st.markdown("#### 확인 가능한 연도 기준, 평균 매출성장률(YoY)이 가장 높은 상위 10종목")
-            high_growth = df_scan.dropna(subset=['매출성장률평균']).sort_values('매출성장률평균', ascending=False).head(10)
+            st.markdown("#### 확인 가능한 연도 기준, 평균 매출성장률(YoY)이 가장 높은 상위 20종목")
+            high_growth = df_scan.dropna(subset=['매출성장률평균']).sort_values('매출성장률평균', ascending=False).head(20)
             if high_growth.empty:
                 st.warning("조건에 맞는 종목을 찾지 못했습니다.")
             else:
