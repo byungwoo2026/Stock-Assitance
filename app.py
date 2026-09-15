@@ -8,12 +8,28 @@ from datetime import datetime, timedelta
 import time
 import xml.etree.ElementTree as ET
 import json
+import threading
 # pyrefly: ignore [missing-import]
 try:
     from groq import Groq
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
+
+_thread_local = threading.local()
+
+def get_naver_session():
+    """스레드별로 재사용되는 requests.Session.
+    m.stock.naver.com은 매 요청마다 새 TLS 연결을 맺으면 요청당 약 1~6초가 걸리지만,
+    연결을 재사용(keep-alive)하면 이후 요청은 수십 ms로 줄어든다.
+    (같은 스레드 안에서 여러 페이지/종목을 순차 조회하는 함수들에서 반드시 이 세션을 사용할 것)
+    """
+    session = getattr(_thread_local, 'session', None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": "Mozilla/5.0"})
+        _thread_local.session = session
+    return session
 
 st.set_page_config(page_title="나만의 투자 조수", layout="wide")
 
@@ -208,48 +224,58 @@ def fetch_1month_sector_trends():
 
 @st.cache_data(ttl=3600)
 def fetch_top_market_cap(market_type="KOSPI", top_n=20):
-    sosok = 0 if market_type == "KOSPI" else 1
-    url = f"https://finance.naver.com/sise/sise_market_sum.naver?sosok={sosok}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    # NOTE(2026-09-16): finance.naver.com의 sise_market_sum.naver 등 메인 시세 페이지가
+    # Next.js 기반으로 전면 개편되어 서버 렌더링 HTML이 사라짐 → 모바일 웹이 쓰는
+    # m.stock.naver.com JSON API로 대체 (pageSize 최대 100)
+    url = f"https://m.stock.naver.com/api/stocks/marketValue/{market_type}?page=1&pageSize={min(top_n, 100)}"
     try:
-        res = requests.get(url, headers=headers, timeout=5)
-        res.encoding = res.apparent_encoding
-        soup = BeautifulSoup(res.text, 'html.parser')
-        companies = []
-        for a in soup.select('a.tltle')[:top_n]:
-            companies.append(a.text.strip())
-        return companies
+        res = get_naver_session().get(url, timeout=5)
+        data = res.json()
+        return [s['stockName'] for s in data.get('stocks', [])]
     except Exception as e:
         st.error(f"시가총액 데이터 수집 오류: {e}")
         return []
 
 @st.cache_data(ttl=3600)
 def fetch_upper_limit_stocks():
-    url = "https://finance.naver.com/sise/sise_upper.naver"
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        res = requests.get(url, headers=headers, timeout=5)
-        res.encoding = res.apparent_encoding
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        tables = soup.select('table.type_5')
-        results = {"KOSPI": [], "KOSDAQ": []}
-        
-        if len(tables) >= 2:
-            for tr in tables[0].select('tr'):
-                for a in tr.select('a'):
-                    if 'main.naver?code=' in a.get('href', ''):
-                        results["KOSPI"].append(a.text.strip())
-                        break
-                        
-            for tr in tables[1].select('tr'):
-                for a in tr.select('a'):
-                    if 'main.naver?code=' in a.get('href', ''):
-                        results["KOSDAQ"].append(a.text.strip())
-                        break
-        return results
-    except Exception as e:
-        return {"KOSPI": [], "KOSDAQ": []}
+    # NOTE(2026-09-16): finance.naver.com/sise/sise_upper.naver가 Next.js 개편으로
+    # 서버 렌더링 HTML을 제공하지 않게 되어, m.stock.naver.com의 시가총액 순위 API를
+    # 전 종목 페이지네이션으로 훑어 상한가(compareToPreviousPrice.code == "1") 종목만 필터링.
+    # (m.stock.naver.com은 매 요청 새 TLS 연결 시 느려서, 세션 재사용 + 순차 조회가
+    #  오히려 세션 없는 병렬 요청보다 훨씬 빠르다 — 연결 재사용 시 페이지당 수십 ms 수준)
+    session = get_naver_session()
+    results = {"KOSPI": [], "KOSDAQ": []}
+    PAGE_SIZE = 100
+    MAX_PAGES_SAFETY = 60  # 응답 이상으로 totalCount가 비정상적으로 크게 와도 무한 조회 방지
+
+    def fetch_page(market, page):
+        url = f"https://m.stock.naver.com/api/stocks/marketValue/{market}?page={page}&pageSize={PAGE_SIZE}"
+        res = session.get(url, timeout=5)
+        res.raise_for_status()
+        return res.json()
+
+    for market in results.keys():
+        try:
+            first_page = fetch_page(market, 1)
+        except Exception:
+            continue
+
+        total_count = first_page.get('totalCount', 0)
+        total_pages = min(-(-total_count // PAGE_SIZE), MAX_PAGES_SAFETY)  # 올림 나눗셈
+        all_pages = [first_page]
+
+        for page in range(2, total_pages + 1):
+            try:
+                all_pages.append(fetch_page(market, page))
+            except Exception:
+                continue
+
+        for page_data in all_pages:
+            for s in page_data.get('stocks', []):
+                if (s.get('compareToPreviousPrice') or {}).get('code') == '1':
+                    results[market].append(s['stockName'])
+
+    return results
 
 @st.cache_data(ttl=3600)
 def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10):
@@ -259,17 +285,17 @@ def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10)
     # 진짜 표 데이터는 iframe으로 별도 로드되는 sise_deal_rank_iframe.naver 에 있음 (개발자도구 Network 탭으로 확인)
     url = f"https://finance.naver.com/sise/sise_deal_rank_iframe.naver?sosok={sosok}&investor_gubun={gubun}&type=buy"
 
-    headers = {"User-Agent": "Mozilla/5.0"}
     try:
-        res = requests.get(url, headers=headers, timeout=5)
+        res = get_naver_session().get(url, timeout=5)
         res.encoding = res.apparent_encoding
         soup = BeautifulSoup(res.text, 'html.parser')
 
-        # 이 페이지는 "이전 영업일"과 "최근 영업일" 두 날짜의 순매수 상위가 나란히(표 2개) 표시되는 구조.
-        # 앞에서부터 그냥 모으면 예전 날짜 데이터를 가져올 위험이 있어, 날짜가 더 최근인(가장 마지막) 표만 사용.
-        tables = soup.select('table.type_5')
-        if len(tables) >= 2:
-            target_table = tables[-1]  # 가장 마지막(=가장 최근 날짜) 표
+        # 이 페이지는 "이전 영업일"과 "최근 영업일" 두 날짜의 순매수 상위가 나란히(날짜별 박스 2개) 표시되는 구조.
+        # NOTE(2026-09-16): 표 class가 기존 type_5에서 type_1로 변경됨. 날짜 박스(.box_type_ms) 기준으로
+        # 가장 마지막(=가장 최근 날짜) 박스 안의 표만 사용.
+        date_boxes = soup.select('.box_type_ms')
+        target_table = date_boxes[-1].select_one('table.type_1') if date_boxes else None
+        if target_table:
             stocks = []
             for a in target_table.find_all('a'):
                 href = a.get('href', '')
@@ -301,8 +327,6 @@ ANALYST_LIST_LAST_UPDATED = "2026-07-27"
 
 @st.cache_data(ttl=3600)
 def fetch_top_analyst_recommendations():
-    headers = {"User-Agent": "Mozilla/5.0"}
-    
     # 최근 매일경제 베스트 애널리스트(리서치센터 부문) 평가 최상위권 증권사 집중 필터링
     best_research_centers = ["신한투자증권", "하나증권", "메리츠증권", "KB증권", "NH투자증권"]
     per_broker_limit = 4   # 증권사 1곳당 최대 노출 개수 (특정 증권사가 결과를 독점하지 않도록 제한)
@@ -312,48 +336,47 @@ def fetch_top_analyst_recommendations():
     seen = set()
 
     try:
+        # NOTE(2026-09-16): finance.naver.com/research/company_list.naver가 Next.js 개편으로
+        # 서버 렌더링 표를 더 이상 제공하지 않아, 모바일 웹이 쓰는 JSON API로 대체.
+        # m.stock.naver.com은 매 요청 새 TLS 연결 시 느리므로(요청당 1초 이상) 세션을 재사용해
+        # 순차 조회 — 연결이 재사용되면 최대 60페이지를 조회해도 수 초 이내로 끝난다.
+        session = get_naver_session()
         for page in range(1, max_pages + 1):
-            url = f"https://finance.naver.com/research/company_list.naver?page={page}"
-            res = requests.get(url, headers=headers, timeout=5)
-            res.encoding = res.apparent_encoding
-            soup = BeautifulSoup(res.text, 'html.parser')
-
-            rows_found = 0
-            for tr in soup.select('table.type_1 tr'):
-                tds = tr.select('td')
-                if len(tds) >= 5:
-                    rows_found += 1
-                    stock = tds[0].text.strip()
-                    title = tds[1].text.strip()
-                    broker = tds[2].text.strip()
-                    date_str = tds[4].text.strip()
-
-                    matched_bc = next((bc for bc in best_research_centers if bc in broker), None)
-                    if not matched_bc:
-                        continue
-                    if len(broker_results[matched_bc]) >= per_broker_limit:
-                        continue
-
-                    dedup_key = (stock, title, broker)
-                    if dedup_key in seen:
-                        continue
-                    seen.add(dedup_key)
-
-                    link_tag = tds[1].select_one('a')
-                    link = "https://finance.naver.com" + link_tag['href'] if link_tag else "#"
-
-                    broker_results[matched_bc].append({
-                        "종목명": stock,
-                        "리포트 제목": title,
-                        "발간 증권사": broker,
-                        "발간일": date_str,
-                        "링크": link
-                    })
-
-            # 페이지에 표시할 행이 없으면(마지막 페이지 도달) 더 조회할 필요 없음
-            if rows_found == 0:
+            url = f"https://m.stock.naver.com/api/research/company?page={page}"
+            res = session.get(url, timeout=5)
+            if res.status_code != 200:
                 break
-            # 5개 증권사 모두 한도만큼 채워졌으면 더 이상 페이지를 조회하지 않음
+            reports = res.json()
+            if not reports:
+                break
+
+            for item in reports:
+                stock = item.get('itemName', '')
+                title = item.get('title', '')
+                broker = item.get('brokerName', '')
+                date_str = item.get('writeDate', '')
+                link = item.get('endUrl', '#')
+
+                matched_bc = next((bc for bc in best_research_centers if bc in broker), None)
+                if not matched_bc:
+                    continue
+                if len(broker_results[matched_bc]) >= per_broker_limit:
+                    continue
+
+                dedup_key = (stock, title, broker)
+                if dedup_key in seen:
+                    continue
+                seen.add(dedup_key)
+
+                broker_results[matched_bc].append({
+                    "종목명": stock,
+                    "리포트 제목": title,
+                    "발간 증권사": broker,
+                    "발간일": date_str,
+                    "링크": link
+                })
+
+            # 5개 증권사 모두 한도만큼 채워졌으면 더 이상 조회할 필요 없음
             if all(len(v) >= per_broker_limit for v in broker_results.values()):
                 break
 
@@ -374,22 +397,21 @@ def run_logical_screener():
     개선된 논리적 스크리닝 기법 (점수 기반 랭킹 시스템):
     엄격한 AND 조건(0개 종목 검출 방지) 대신, 주도주(거래량 상위)를 대상으로 기술적 타점 점수(100점 만점)를 매겨 상위 20개를 항상 제시.
     """
-    import pandas as pd
-    import requests
-    from bs4 import BeautifulSoup
-    
-    url_quant = "https://finance.naver.com/sise/sise_quant.naver"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    # NOTE(2026-09-16): finance.naver.com/sise/sise_quant.naver가 Next.js 개편으로
+    # 서버 렌더링 표를 더 이상 제공하지 않아, m.stock.naver.com 시가총액 API로 KOSPI/KOSDAQ
+    # 상위 종목 풀을 모은 뒤 거래대금 기준으로 재정렬해 '거래 활발한 주도주' 상위 100개를 추출.
+    session = get_naver_session()
     try:
-        res = requests.get(url_quant, headers=headers, timeout=5)
-        res.encoding = res.apparent_encoding
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        stocks = []
-        for a in soup.select('a.tltle')[:100]: # 시장 주도주(거래량 상위 100개) 추출
-            code = a['href'].split('code=')[-1]
-            name = a.text.strip()
-            stocks.append({'code': code, 'name': name})
+        pool = []
+        for market in ("KOSPI", "KOSDAQ"):
+            res = session.get(
+                f"https://m.stock.naver.com/api/stocks/marketValue/{market}?page=1&pageSize=100",
+                timeout=5
+            )
+            pool.extend(res.json().get('stocks', []))
+
+        pool.sort(key=lambda s: int(s.get('accumulatedTradingValueRaw') or 0), reverse=True)
+        stocks = [{'code': s['itemCode'], 'name': s['stockName']} for s in pool[:100]]
     except Exception:
         return []
 
@@ -486,83 +508,80 @@ def run_logical_screener():
 
 @st.cache_data(ttl=60)
 def fetch_stock_name_and_fundamentals(code):
-    url = f"https://finance.naver.com/item/main.naver?code={code}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    # NOTE(2026-09-16): finance.naver.com/item/main.naver가 Next.js 개편으로 서버 렌더링 HTML을
+    # 제공하지 않게 되어(#_per, tb_type1_ifrs 등 기존 선택자가 전부 무효화됨), 모바일 웹이 쓰는
+    # m.stock.naver.com JSON API(integration + finance/annual)로 전면 교체.
+    # 병렬 스캔(scan_fundamentals) 시 스레드별 세션을 재사용해야 TLS 연결 재사용 이점을 살릴 수 있음.
+    session = get_naver_session()
+
+    def clean_num(val):
+        if val is None:
+            return 0.0
+        val = str(val).replace(',', '').replace('%', '').replace('배', '').replace('원', '').strip()
+        try:
+            return float(val) if val and val != '-' else 0.0
+        except ValueError:
+            return 0.0
+
     try:
-        res = requests.get(url, headers=headers, timeout=5)
-        res.encoding = res.apparent_encoding
-        soup = BeautifulSoup(res.text, 'html.parser')
-        
-        name_elem = soup.select_one('.wrap_company h2 a')
-        if not name_elem:
+        res = session.get(f"https://m.stock.naver.com/api/stock/{code}/integration", timeout=5)
+        if res.status_code != 200:
             return None
-        name = name_elem.text.strip()
-        
-        per = soup.select_one('#_per').text if soup.select_one('#_per') else "0"
-        pbr = soup.select_one('#_pbr').text if soup.select_one('#_pbr') else "0"
-        cns_per = soup.select_one('#_cns_per').text if soup.select_one('#_cns_per') else "0"
-        
-# --- [수정] 동일업종 PER 크롤링 로직 추가 ---
-        sector_per = "0"
-        sector_per_elem = soup.select_one('#tab_con1 table.tb_type1 tr td em')
-        if not sector_per_elem:
-            for th in soup.select('.aside_invest table.tbl_type tr th'):
-                if '동일업종 PER' in th.text:
-                    td = th.find_next_sibling('td')
-                    if td: sector_per = td.text.strip()
-        else:
-            sector_per = sector_per_elem.text.strip()
+        integ = res.json()
+        name = integ.get('stockName')
+        if not name:
+            return None
 
-        def clean_num(val):
-            val = val.replace(',','').replace('%','').strip()
-            try:
-                return float(val) if val and val != '-' else 0.0
-            except:
-                return 0.0
+        total_infos = {item.get('code'): item.get('value') for item in (integ.get('totalInfos') or [])}
+        per = clean_num(total_infos.get('per'))
+        pbr = clean_num(total_infos.get('pbr'))
+        cns_per = clean_num(total_infos.get('cnsPer'))
 
-        def parse_annual_series(tb, must_include, must_exclude=None):
-            """연간 실적 표(tb_type1_ifrs)에서 특정 항목 행의 전체 연도별 수치를 리스트로 반환 ('-'/빈값/추정치 오류는 제외)"""
-            for tr in tb.select('tbody tr'):
-                th = tr.select_one('th')
-                if not th:
-                    continue
-                th_text = th.text.strip()
-                if all(kw in th_text for kw in must_include) and not (must_exclude and any(ex in th_text for ex in must_exclude)):
-                    values = []
-                    for td in tr.select('td'):
-                        raw = td.text.strip().replace(',', '')
-                        if raw and raw not in ('-', ''):
-                            try:
-                                values.append(float(raw))
-                            except ValueError:
-                                continue
-                    return values
-            return []
+        # 동일업종 PER: 신규 API에서 제공하지 않음 → 0으로 두면 아래 밸류에이션 로직이 기본 점수로 자동 처리
+        sector_per = 0.0
 
         op_margin, roe = "0", "0"
         op_margin_series, revenue_series = [], []
-        tables = soup.select('table.tb_type1_ifrs')
-        if tables:
-            tb = tables[0]
-            for tr in tb.select('tbody tr'):
-                th = tr.select_one('th')
-                if th:
-                    if '영업이익률' in th.text:
-                        tds = tr.select('td')
-                        if len(tds) >= 4:
-                            op_margin = tds[-2].text.strip()
-                            if not op_margin.replace('.','').replace('-','').isdigit():
-                                op_margin = tds[-3].text.strip()
-                    elif 'ROE' in th.text:
-                        tds = tr.select('td')
-                        if len(tds) >= 4:
-                            roe = tds[-2].text.strip()
-                            if not roe.replace('.','').replace('-','').isdigit():
-                                roe = tds[-3].text.strip()
+        try:
+            fin_res = session.get(f"https://m.stock.naver.com/api/stock/{code}/finance/annual", timeout=5)
+            finance_info = fin_res.json().get('financeInfo') if fin_res.status_code == 200 else None
+            row_list = (finance_info or {}).get('rowList') or []
+            title_list = (finance_info or {}).get('trTitleList') or []
 
-            # 최근 확인 가능한 전체 연도의 영업이익률 / 매출액 시계열 (3개년 평균·성장률 계산용)
-            op_margin_series = parse_annual_series(tb, ['영업이익률'])
-            revenue_series = parse_annual_series(tb, ['매출액'], must_exclude=['증가율', '성장률'])
+            ordered_keys = [t['key'] for t in sorted(title_list, key=lambda t: t['key'])]
+            actual_keys = [t['key'] for t in title_list if t.get('isConsensus') != 'Y']
+            latest_actual_key = max(actual_keys) if actual_keys else (ordered_keys[-1] if ordered_keys else None)
+
+            def row_by_title(title):
+                return next((row for row in row_list if row.get('title') == title), None)
+
+            def row_series(title, keys):
+                row = row_by_title(title)
+                if not row:
+                    return []
+                values = []
+                for k in keys:
+                    raw = (row.get('columns') or {}).get(k, {}).get('value')
+                    if raw and raw != '-':
+                        try:
+                            values.append(float(str(raw).replace(',', '')))
+                        except ValueError:
+                            continue
+                return values
+
+            if latest_actual_key:
+                op_margin_row = row_by_title('영업이익률')
+                if op_margin_row:
+                    op_margin = (op_margin_row.get('columns') or {}).get(latest_actual_key, {}).get('value') or "0"
+                roe_row = row_by_title('ROE')
+                if roe_row:
+                    roe = (roe_row.get('columns') or {}).get(latest_actual_key, {}).get('value') or "0"
+
+            # 확인 가능한 전체 연도의 영업이익률 / 매출액 시계열 (평균·성장률 계산용)
+            op_margin_series = row_series('영업이익률', ordered_keys)
+            revenue_series = row_series('매출액', ordered_keys)
+        except Exception:
+            pass
 
         # 연간 매출액 시계열로부터 연도별 YoY 성장률 계산 → 평균값을 "매출성장률"로 사용
         revenue_growth_points = []
@@ -576,10 +595,10 @@ def fetch_stock_name_and_fundamentals(code):
 
         return {
             "name": name,
-            "per": clean_num(per),
-            "pbr": clean_num(pbr),
-            "cns_per": clean_num(cns_per),
-            "sector_per": clean_num(sector_per),
+            "per": per,
+            "pbr": pbr,
+            "cns_per": cns_per,
+            "sector_per": sector_per,
             "op_margin": clean_num(op_margin),
             "roe": clean_num(roe),
             "op_margin_avg": op_margin_avg,          # 확인 가능한 연도 전체 평균 영업이익률 (없으면 None)
@@ -587,7 +606,7 @@ def fetch_stock_name_and_fundamentals(code):
             "revenue_growth": revenue_growth_avg,     # 확인 가능한 연도들의 평균 매출성장률(%) (없으면 None)
             "revenue_growth_years": len(revenue_growth_points),
         }
-    except Exception as e:
+    except Exception:
         return None
 
 def analyze_stock_technical(code):
@@ -1570,15 +1589,6 @@ elif menu == "퀀트 투자 리스트":
                 st.caption(f"적용 조건: PER ≤ {per_limit}, PBR ≤ {pbr_limit}, ROE ≥ {roe_min}%, 영업이익률 ≥ {op_margin_min}%, 매출성장률 ≥ {revenue_growth_min}%(데이터 없는 종목은 통과), 시가총액 ≥ {market_cap_min}억, 업종 키워드: {included_sector or '전체'}")
                 st.caption("※ 매출성장률은 네이버 금융에 공시된 연간 매출액 중 확인 가능한 연도들의 평균 YoY 성장률입니다 (기업별로 확인 가능한 연도 수가 다를 수 있습니다).")
 
-elif menu == "개별종목분석":
-    st.subheader("🤖 개별종목분석")
-    st.markdown("기술적 지표(10%), 최신 뉴스 및 수급(40%), 경영지표(20%), 밸류에이션(10%), 시장 트렌드(20%)를 종합 분석합니다.")
-    
-    # 3가지 하위 항목 탭
-    tab1, tab2, tab3 = st.tabs(["📊 개별종목 List", "🏢 ETF List", "🔍 개별종목 분석"])
-    
-    # 공통 계산 함수
-    
 def calculate_stock_score(fundamentals, tech, news_list):
     """개선된 점수 체계화 모델 (뉴스/수급 40점 + 상대 PER 10점 반영)"""
     
@@ -1700,6 +1710,8 @@ def calculate_stock_score(fundamentals, tech, news_list):
     return int(total_score), news_suqub_total, val_score
 
 if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완벽히 일치시켰습니다.
+    st.subheader("🤖 개별종목분석")
+    st.markdown("기술적 지표(10%), 최신 뉴스 및 수급(40%), 경영지표(20%), 밸류에이션(10%), 시장 트렌드(20%)를 종합 분석합니다.")
 
     # 1. 탭 정의
     tab1, tab2, tab3 = st.tabs(["개별종목 List", "ETF List", "개별종목 분석"])
