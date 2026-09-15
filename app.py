@@ -16,6 +16,31 @@ try:
 except ImportError:
     GENAI_AVAILABLE = False
 
+# Groq가 특정 모델을 예고 없이 단종시킨 전례가 있어(예: llama-3.3-70b-versatile),
+# 최우선 모델이 실패하면 다음 모델로 자동 전환. 가끔 갱신이 필요할 수 있음(2026-09-16 기준 확인).
+GROQ_MODEL_CANDIDATES = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+
+def call_groq_chat(messages, temperature=None, max_retries=2):
+    """Groq 채팅 완성 호출 공통 헬퍼.
+    모델별로 최대 max_retries회 짧게 재시도하고, 그래도 실패하면 다음 후보 모델로 넘어간다.
+    반환: (성공 여부, 성공 시 응답 텍스트 / 실패 시 마지막 에러 메시지)
+    """
+    last_err = None
+    for model in GROQ_MODEL_CANDIDATES:
+        for attempt in range(max_retries):
+            try:
+                client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+                kwargs = {"model": model, "messages": messages}
+                if temperature is not None:
+                    kwargs["temperature"] = temperature
+                response = client.chat.completions.create(**kwargs)
+                return True, response.choices[0].message.content
+            except Exception as e:
+                last_err = e
+                if attempt < max_retries - 1:
+                    time.sleep(0.5 * (attempt + 1))
+    return False, str(last_err)
+
 _thread_local = threading.local()
 
 def get_naver_session():
@@ -802,63 +827,54 @@ def scan_value_candidates(scan_size):
     return pd.DataFrame(rows)
 
 def get_ai_summary(news_list):
-    try:
-        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-        news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list])
-        prompt = f"""
-        당신은 전문 주식 투자 분석가입니다. 다음 실시간 뉴스 리스트를 꼼꼼히 분석하여 
-        투자자 입장에서 핵심 요약을 명확하게 '3줄'로 작성해주세요. 
-        그리고 종합 결론으로 이 뉴스가 해당 기업의 주가 흐름에 [긍정적 / 중립 / 부정적] 일지 판단하고 이유를 덧붙여주세요.
-        
-        [뉴스 리스트]
-        {news_text}
-        """
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"⚠️ AI 분석 중 오류가 발생했습니다. (Secrets 설정이나 키 값을 확인해 주세요): {e}"
+    news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list])
+    prompt = f"""
+    당신은 전문 주식 투자 분석가입니다. 다음 실시간 뉴스 리스트를 꼼꼼히 분석하여
+    투자자 입장에서 핵심 요약을 명확하게 '3줄'로 작성해주세요.
+    그리고 종합 결론으로 이 뉴스가 해당 기업의 주가 흐름에 [긍정적 / 중립 / 부정적] 일지 판단하고 이유를 덧붙여주세요.
 
+    [뉴스 리스트]
+    {news_text}
+    """
+    ok, content = call_groq_chat([{"role": "user", "content": prompt}])
+    if ok:
+        return content
+    return f"⚠️ AI 분석 중 오류가 발생했습니다. (Secrets 설정이나 키 값을 확인해 주세요): {content}"
+
+@st.cache_data(ttl=900)  # 15분 캐싱 (버튼 재클릭마다 불필요한 API 재호출 방지)
 def get_individual_stock_ai_analysis(fundamentals, tech, news_list):
-    try:
-        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-        news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list]) if news_list else "최근 관련 뉴스 없음"
-        prompt = f"""
-        당신은 전문 주식 투자 분석가(리서치 센터장)입니다. 
-        다음 개별 종목 정보를 바탕으로 투자자에게 깊이 있고 전문적인 'AI 심층 투자 분석 보고서'를 작성해주세요.
+    news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list]) if news_list else "최근 관련 뉴스 없음"
+    prompt = f"""
+    당신은 전문 주식 투자 분석가(리서치 센터장)입니다.
+    다음 개별 종목 정보를 바탕으로 투자자에게 깊이 있고 전문적인 'AI 심층 투자 분석 보고서'를 작성해주세요.
 
-        [종목 기본 정보]
-        - 종목명: {fundamentals['name']}
-        - 영업이익률: {fundamentals['op_margin']}%
-        - ROE: {fundamentals['roe']}%
-        - 추정 PER: {fundamentals['cns_per']}배 (후행 PER: {fundamentals['per']}배)
-        - PBR: {fundamentals['pbr']}배
+    [종목 기본 정보]
+    - 종목명: {fundamentals['name']}
+    - 영업이익률: {fundamentals['op_margin']}%
+    - ROE: {fundamentals['roe']}%
+    - 추정 PER: {fundamentals['cns_per']}배 (후행 PER: {fundamentals['per']}배)
+    - PBR: {fundamentals['pbr']}배
 
-        [기술적 지표 및 트렌드]
-        - 현재가: {int(tech['price']):,}원
-        - 최근 1개월 수익률: {tech['one_month_return']:.2f}%
-        - RSI (14): {tech['rsi']:.2f} (30 이하는 과매도, 70 이상은 과열)
-        - MACD 상태: {'매수 우위 (MACD > Signal)' if tech['macd'] > tech['signal'] else '매도 우위 (MACD <= Signal)'}
-        - 20일 이동평균선 위치: {'20일선 위 (상승추세)' if tech['price'] > tech['sma20'] else '20일선 아래 (조정/하락세)'}
+    [기술적 지표 및 트렌드]
+    - 현재가: {int(tech['price']):,}원
+    - 최근 1개월 수익률: {tech['one_month_return']:.2f}%
+    - RSI (14): {tech['rsi']:.2f} (30 이하는 과매도, 70 이상은 과열)
+    - MACD 상태: {'매수 우위 (MACD > Signal)' if tech['macd'] > tech['signal'] else '매도 우위 (MACD <= Signal)'}
+    - 20일 이동평균선 위치: {'20일선 위 (상승추세)' if tech['price'] > tech['sma20'] else '20일선 아래 (조정/하락세)'}
 
-        [관련 최신 뉴스 및 시장 평가]
-        {news_text}
+    [관련 최신 뉴스 및 시장 평가]
+    {news_text}
 
-        보고서는 가독성 있게 작성되어야 하며, 다음 내용을 포함해 주세요:
-        1. **재무 건전성 및 밸류에이션 평가**: 영업이익률/ROE를 통한 수익성 평가, PER/PBR 기준 고평가/저평가 여부 분석.
-        2. **차트 및 기술적 흐름 해석**: 이동평균선 추세, RSI 과매도/과열 강도, MACD 신호를 조합한 매수 타점 분석.
-        3. **시장 모멘텀 및 뉴스 분석**: 최근 뉴스들의 호재/악재 성격 및 수급 영향 평가.
-        4. **최종 AI 투자 전략 & 가이드**: 추천 매매 전략(분할 매수, 관망, 매도 등)과 목표/손절 대응 팁.
-        """
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.choices[0].message.content
-    except Exception as e:
-        return f"⚠️ AI 분석 리포트 생성 중 오류가 발생했습니다: {e}"
+    보고서는 가독성 있게 작성되어야 하며, 다음 내용을 포함해 주세요:
+    1. **재무 건전성 및 밸류에이션 평가**: 영업이익률/ROE를 통한 수익성 평가, PER/PBR 기준 고평가/저평가 여부 분석.
+    2. **차트 및 기술적 흐름 해석**: 이동평균선 추세, RSI 과매도/과열 강도, MACD 신호를 조합한 매수 타점 분석.
+    3. **시장 모멘텀 및 뉴스 분석**: 최근 뉴스들의 호재/악재 성격 및 수급 영향 평가.
+    4. **최종 AI 투자 전략 & 가이드**: 추천 매매 전략(분할 매수, 관망, 매도 등)과 목표/손절 대응 팁.
+    """
+    ok, content = call_groq_chat([{"role": "user", "content": prompt}])
+    if ok:
+        return content
+    return f"⚠️ AI 분석 리포트 생성 중 오류가 발생했습니다: {content}"
 
 @st.cache_data(ttl=600)  # 10분 캐싱 (등락 확인 목적이라 지수 캐싱(5분)보단 조금 여유있게)
 def fetch_semiconductor_snapshot():
@@ -894,10 +910,30 @@ def fetch_multi_angle_news(queries, per_query=4, max_total=8, period="7d"):
                 combined.append(n)
     return combined[:max_total]
 
+def summarize_news_sentiment(news_list):
+    """뉴스 헤드라인들의 긍정/중립/부정 개수를 AI로 집계 (classify_news_sentiment_ai 재사용).
+    AI 판정이 실패하면 굳이 부정확한 키워드 집계를 만들지 않고 None을 반환한다."""
+    if not news_list:
+        return None
+    sentiment_map = classify_news_sentiment_ai(news_list)
+    if not sentiment_map:
+        return None
+    counts = {"긍정": 0, "중립": 0, "부정": 0}
+    for verdict in sentiment_map.values():
+        counts[verdict] = counts.get(verdict, 0) + 1
+    return counts
+
+def _format_sentiment_text(counts):
+    if not counts:
+        return "판정 불가"
+    return f"긍정 {counts['긍정']}건 / 중립 {counts['중립']}건 / 부정 {counts['부정']}건"
+
 @st.cache_data(ttl=3600)  # 1시간 캐싱
 def get_price_move_reason_analysis(kospi_data, semi_data):
     """코스피 지수와 반도체 대표 종목들이 오늘 왜 이렇게 움직였는지, 다각도로 조회한 실제 뉴스를 근거로 AI가 논리적으로 추정 분석
-    반환값: (분석 텍스트, 코스피 관련 뉴스 리스트, 반도체 관련 뉴스 리스트) — 뉴스 리스트는 화면에 원문 링크를 걸어주기 위해 함께 반환"""
+    반환값: (분석 텍스트, 코스피 관련 뉴스 리스트, 반도체 관련 뉴스 리스트, meta)
+    meta = {"ts": "이 분석이 실제로 계산된 시각(HH:MM)", "sentiment": 뉴스 감성 집계 dict 또는 None}"""
+    ts = datetime.now().strftime('%H:%M')
     # 단일 키워드로는 근거가 얕을 수 있어, 수급/업황/실적/이슈 등 여러 각도로 나눠 검색 후 통합
     # "오늘 왜 이렇게 움직였는지"가 목적이므로 최근 1일(period="1d") 뉴스로 한정해 며칠 전 뉴스가 섞이는 것을 방지
     kospi_news = fetch_multi_angle_news(
@@ -906,94 +942,101 @@ def get_price_move_reason_analysis(kospi_data, semi_data):
     semi_news = fetch_multi_angle_news(
         ["반도체 주가", "반도체 수출 업황", "삼성전자 SK하이닉스 주가", "반도체 D램 가격"], per_query=4, max_total=8, period="1d"
     )
+    sentiment_counts = summarize_news_sentiment(kospi_news + semi_news)
+    meta = {"ts": ts, "sentiment": sentiment_counts}
 
-    try:
-        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
+    semi_text = "\n".join(
+        [f"- {name}: {d['price']:,.0f}원 ({d['change']:+.2f}%)" for name, d in semi_data.items()]
+    ) if semi_data else "반도체 데이터 없음"
 
-        semi_text = "\n".join(
-            [f"- {name}: {d['price']:,.0f}원 ({d['change']:+.2f}%)" for name, d in semi_data.items()]
-        ) if semi_data else "반도체 데이터 없음"
+    kospi_news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in kospi_news]) if kospi_news else "조회된 관련 뉴스 없음"
+    semi_news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in semi_news]) if semi_news else "조회된 관련 뉴스 없음"
 
-        kospi_news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in kospi_news]) if kospi_news else "조회된 관련 뉴스 없음"
-        semi_news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in semi_news]) if semi_news else "조회된 관련 뉴스 없음"
+    prompt = f"""
+    당신은 냉철하고 논리적인 시장 분석가입니다. 아래 [코스피 지수], [반도체 대표 종목 당일 등락],
+    [수급/업황/실적 등 여러 각도로 조회한 실제 뉴스 헤드라인], [뉴스 감성 집계]를 종합하여
+    오늘 코스피와 반도체 관련 종목이 왜 이렇게 움직였는지 합리적으로 추정 분석해주세요.
 
-        prompt = f"""
-        당신은 냉철하고 논리적인 시장 분석가입니다. 아래 [코스피 지수], [반도체 대표 종목 당일 등락],
-        [수급/업황/실적 등 여러 각도로 조회한 실제 뉴스 헤드라인]을 종합하여
-        오늘 코스피와 반도체 관련 종목이 왜 이렇게 움직였는지 합리적으로 추정 분석해주세요.
+    [코스피 지수]
+    - KOSPI: {kospi_data.get('index', 'N/A')} ({kospi_data.get('change', 'N/A')})
 
-        [코스피 지수]
-        - KOSPI: {kospi_data.get('index', 'N/A')} ({kospi_data.get('change', 'N/A')})
+    [반도체 대표 종목 당일 등락]
+    {semi_text}
 
-        [반도체 대표 종목 당일 등락]
-        {semi_text}
+    [코스피 관련 뉴스 (수급/증시 이슈 등 여러 각도)]
+    {kospi_news_text}
 
-        [코스피 관련 뉴스 (수급/증시 이슈 등 여러 각도)]
-        {kospi_news_text}
+    [반도체 관련 뉴스 (업황/수출/가격/개별종목 등 여러 각도)]
+    {semi_news_text}
 
-        [반도체 관련 뉴스 (업황/수출/가격/개별종목 등 여러 각도)]
-        {semi_news_text}
+    [위 뉴스 전체의 감성 집계]
+    {_format_sentiment_text(sentiment_counts)}
 
-        반드시 지켜야 할 사항:
-        1. 위에 제공된 뉴스에 실제로 언급된 내용만 근거로 사용하세요. 뉴스에 없는 사실을 지어내지 마세요.
-        2. 여러 뉴스가 있다면 개별 헤드라인을 단순 나열하지 말고, 서로 연결지어(예: 수급 동향 + 업황 뉴스 + 가격 동향) 하나의 논리적인 흐름으로 종합 설명하세요.
-        3. 뉴스 근거가 뚜렷하지 않다면 추측하지 말고 "이 부분은 명확한 뉴스 근거가 없어 추정입니다"처럼 솔직하게 밝히세요.
-        4. 코스피 등락 원인과 반도체 등락 원인을 구분해서 각각 3~4문장으로 설명해주세요.
-        5. 응답은 반드시 한국어로만, 마크다운으로 가독성 있게 작성하세요.
-        """
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-        )
-        return response.choices[0].message.content, kospi_news, semi_news
-    except Exception as e:
-        return f"⚠️ AI 등락 원인 분석 중 오류가 발생했습니다: {e}", kospi_news, semi_news
+    반드시 지켜야 할 사항:
+    1. 위에 제공된 뉴스에 실제로 언급된 내용만 근거로 사용하세요. 뉴스에 없는 사실을 지어내지 마세요.
+    2. 여러 뉴스가 있다면 개별 헤드라인을 단순 나열하지 말고, 서로 연결지어(예: 수급 동향 + 업황 뉴스 + 가격 동향) 하나의 논리적인 흐름으로 종합 설명하세요.
+    3. 뉴스 근거가 뚜렷하지 않다면 추측하지 말고 "이 부분은 명확한 뉴스 근거가 없어 추정입니다"처럼 솔직하게 밝히세요.
+    4. 코스피 등락 원인과 반도체 등락 원인을 구분해서 각각 3~4문장으로 설명해주세요.
+    5. 응답은 반드시 한국어로만, 마크다운으로 가독성 있게 작성하세요.
+    """
+    ok, content = call_groq_chat([{"role": "user", "content": prompt}], temperature=0.3)
+    if ok:
+        return content, kospi_news, semi_news, meta
+    return f"⚠️ AI 등락 원인 분석 중 오류가 발생했습니다: {content}", kospi_news, semi_news, meta
 
 @st.cache_data(ttl=3600)  # 1시간 캐싱
 def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
-    """반환값: (브리핑 텍스트, 근거로 사용한 시장 뉴스 리스트) — 뉴스 리스트는 화면에 원문 링크를 걸어주기 위해 함께 반환"""
+    """반환값: (브리핑 텍스트, 근거로 사용한 시장 뉴스 리스트, meta)
+    meta = {"ts": "이 분석이 실제로 계산된 시각(HH:MM)", "sentiment": 뉴스 감성 집계 dict 또는 None,
+            "foreign_top": 외국인 순매수 상위 종목명 리스트, "institution_top": 기관 순매수 상위 종목명 리스트}"""
+    ts = datetime.now().strftime('%H:%M')
     # 지수/업종 숫자만으로 추론하지 않도록, 오늘자 실제 시장 뉴스 헤드라인을 함께 조회해서 근거로 제공
     market_news = fetch_headlines_rss("코스피 코스닥 증시", period="1d")
+    sentiment_counts = summarize_news_sentiment(market_news)
+    # 시황 브리핑에 실제 수급 방향(외국인/기관 순매수)을 정량 근거로 반영
+    foreign_top = fetch_net_buying_top("foreign", "KOSPI", 5)
+    institution_top = fetch_net_buying_top("institution", "KOSPI", 5)
+    meta = {"ts": ts, "sentiment": sentiment_counts, "foreign_top": foreign_top, "institution_top": institution_top}
 
-    try:
-        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
-        sectors_text = "\n".join([f"- {s['업종/테마']}: {s['변동']}" for s in top_sectors]) if top_sectors else "업종 정보 없음"
+    sectors_text = "\n".join([f"- {s['업종/테마']}: {s['변동']}" for s in top_sectors]) if top_sectors else "업종 정보 없음"
+    news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in market_news]) if market_news else "조회된 관련 뉴스 없음"
+    foreign_text = ", ".join(foreign_top) if foreign_top else "데이터 없음"
+    institution_text = ", ".join(institution_top) if institution_top else "데이터 없음"
 
-        if market_news:
-            news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in market_news])
-        else:
-            news_text = "조회된 관련 뉴스 없음"
+    prompt = f"""
+    당신은 금융 전략가이자 투자 비서입니다. 아래 [시장 지수], [업종 데이터], [수급 동향], [오늘의 실제 시장 뉴스], [뉴스 감성 집계]를 종합하여 투자 전략을 브리핑해주세요.
 
-        prompt = f"""
-        당신은 금융 전략가이자 투자 비서입니다. 아래 [시장 지수], [업종 데이터], [오늘의 실제 시장 뉴스]를 종합하여 투자 전략을 브리핑해주세요.
+    [시장 지수]
+    - KOSPI: {kospi_data.get('index', 'N/A')} ({kospi_data.get('change', 'N/A')})
+    - KOSDAQ: {kosdaq_data.get('index', 'N/A')} ({kosdaq_data.get('change', 'N/A')})
 
-        [시장 지수]
-        - KOSPI: {kospi_data.get('index', 'N/A')} ({kospi_data.get('change', 'N/A')})
-        - KOSDAQ: {kosdaq_data.get('index', 'N/A')} ({kosdaq_data.get('change', 'N/A')})
+    [최근 1달 자금 유입 TOP 5 업종/테마]
+    {sectors_text}
 
-        [최근 1달 자금 유입 TOP 5 업종/테마]
-        {sectors_text}
+    [오늘 코스피 외국인 순매수 상위 종목]
+    {foreign_text}
 
-        [오늘의 실제 시장 뉴스 헤드라인]
-        {news_text}
+    [오늘 코스피 기관 순매수 상위 종목]
+    {institution_text}
 
-        위 데이터를 바탕으로 시장의 흐름을 냉철하게 분석하고, 투자자가 참고할 수 있는 짤막하고 명쾌한 'AI 투자 전략 보고서'를 3~4문장 단위로 단락을 나누어 작성해주세요.
+    [오늘의 실제 시장 뉴스 헤드라인]
+    {news_text}
 
-        반드시 지켜야 할 사항:
-        1. 위에 제공된 뉴스에 실제로 언급된 내용만 근거로 사용하세요. 뉴스에 없는 사실을 지어내지 마세요.
-        2. 뉴스가 지수 등락과 직접적인 관련이 없거나 부족하다면, 추측하지 말고 "관련 뉴스 근거는 뚜렷하지 않으며, 지수 데이터상으로는 ~한 흐름입니다"처럼 데이터와 뉴스를 구분해서 솔직하게 설명하세요.
-        3. 응답은 반드시 한국어로만 작성하세요. 다른 언어 단어를 섞지 마세요.
-        4. 글자 크기가 너무 크지 않도록 마크다운 구조(강조 등)를 활용하여 정중하고 명확한 어조로 요약해 주세요.
-        """
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-        )
-        return response.choices[0].message.content, market_news
-    except Exception as e:
-        return f"⚠️ AI 시장 분석 중 오류가 발생했습니다: {e}", market_news
+    [위 뉴스 전체의 감성 집계]
+    {_format_sentiment_text(sentiment_counts)}
+
+    위 데이터를 바탕으로 시장의 흐름을 냉철하게 분석하고, 투자자가 참고할 수 있는 짤막하고 명쾌한 'AI 투자 전략 보고서'를 3~4문장 단위로 단락을 나누어 작성해주세요.
+
+    반드시 지켜야 할 사항:
+    1. 위에 제공된 뉴스/수급 데이터에 실제로 나타난 내용만 근거로 사용하세요. 없는 사실을 지어내지 마세요.
+    2. 뉴스가 지수 등락과 직접적인 관련이 없거나 부족하다면, 추측하지 말고 "관련 뉴스 근거는 뚜렷하지 않으며, 지수 데이터상으로는 ~한 흐름입니다"처럼 데이터와 뉴스를 구분해서 솔직하게 설명하세요.
+    3. 응답은 반드시 한국어로만 작성하세요. 다른 언어 단어를 섞지 마세요.
+    4. 글자 크기가 너무 크지 않도록 마크다운 구조(강조 등)를 활용하여 정중하고 명확한 어조로 요약해 주세요.
+    """
+    ok, content = call_groq_chat([{"role": "user", "content": prompt}], temperature=0.3)
+    if ok:
+        return content, market_news, meta
+    return f"⚠️ AI 시장 분석 중 오류가 발생했습니다: {content}", market_news, meta
 
 
 def classify_news_sentiment_ai(news_list):
@@ -1006,7 +1049,6 @@ def classify_news_sentiment_ai(news_list):
     if not news_list or not GENAI_AVAILABLE:
         return None
     try:
-        client = Groq(api_key=st.secrets["GROQ_API_KEY"])
         titles_text = "\n".join([f"{i+1}. {n['title']}" for i, n in enumerate(news_list)])
         prompt = f"""
         당신은 주식 뉴스 감성 분석 전문가입니다. 아래 번호가 매겨진 뉴스 제목들을 각각 읽고,
@@ -1020,12 +1062,10 @@ def classify_news_sentiment_ai(news_list):
         다른 설명 없이, 아래 JSON 배열 형식으로만 정확히 {len(news_list)}개 항목을 응답하세요:
         [{{"번호": 1, "판정": "긍정"}}, {{"번호": 2, "판정": "중립"}}]
         """
-        response = client.chat.completions.create(
-            model="openai/gpt-oss-120b",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-        )
-        raw = response.choices[0].message.content.strip()
+        ok, content = call_groq_chat([{"role": "user", "content": prompt}], temperature=0)
+        if not ok:
+            return None
+        raw = content.strip()
         raw = re.sub(r'^```(json)?\s*|\s*```$', '', raw, flags=re.MULTILINE).strip()
         parsed = json.loads(raw)
 
@@ -1235,9 +1275,12 @@ if menu == "종합 대시보드":
         st.warning("반도체 데이터를 불러오지 못했습니다.")
 
     if GENAI_AVAILABLE:
+        if st.button("🔄 지금 다시 분석", key="refresh_reason_analysis"):
+            get_price_move_reason_analysis.clear()
         with st.spinner("AI가 코스피·반도체 등락 원인을 분석하고 있습니다..."):
-            reason_analysis, kospi_news_used, semi_news_used = get_price_move_reason_analysis(kospi_data, semi_data)
+            reason_analysis, kospi_news_used, semi_news_used, reason_meta = get_price_move_reason_analysis(kospi_data, semi_data)
         st.info(f"**🔍 오늘 코스피·반도체 등락 원인 분석 (AI 추정)**\n\n{reason_analysis}")
+        st.caption(f"⏱ 이 분석은 {reason_meta['ts']} 기준 데이터로 생성됨 (최대 1시간 캐시) · 뉴스 톤: {_format_sentiment_text(reason_meta['sentiment'])}")
         news_col1, news_col2 = st.columns(2)
         with news_col1:
             render_news_links(kospi_news_used, "📰 코스피 관련 참고 기사")
@@ -1264,10 +1307,17 @@ if menu == "종합 대시보드":
     st.markdown("---")
     if GENAI_AVAILABLE:
         st.markdown("### 🤖 AI 투자 비서의 데일리 시장 분석 & 전략")
-        st.caption("※ 지수/업종 데이터뿐 아니라, 실제 시장 뉴스 헤드라인을 근거로 작성합니다 (뉴스에 없는 내용은 추측하지 않도록 지시되어 있습니다).")
+        st.caption("※ 지수/업종 데이터뿐 아니라, 실제 시장 뉴스 헤드라인과 외국인/기관 순매수 동향을 근거로 작성합니다 (뉴스에 없는 내용은 추측하지 않도록 지시되어 있습니다).")
+        if st.button("🔄 지금 다시 분석", key="refresh_market_briefing"):
+            get_market_ai_briefing.clear()
         with st.spinner("AI가 오늘의 시장 상황과 실제 뉴스를 종합 분석하고 있습니다..."):
-            market_briefing, market_news_used = get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors)
+            market_briefing, market_news_used, briefing_meta = get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors)
             st.info(market_briefing)
+            st.caption(f"⏱ 이 분석은 {briefing_meta['ts']} 기준 데이터로 생성됨 (최대 1시간 캐시) · 뉴스 톤: {_format_sentiment_text(briefing_meta['sentiment'])}")
+            st.caption(
+                f"📊 외국인 순매수 상위: {', '.join(briefing_meta['foreign_top']) if briefing_meta['foreign_top'] else '데이터 없음'}  \n"
+                f"📊 기관 순매수 상위: {', '.join(briefing_meta['institution_top']) if briefing_meta['institution_top'] else '데이터 없음'}"
+            )
             render_news_links(market_news_used, "📰 참고한 시장 뉴스")
     else:
         st.info("💡 Groq 패키지가 설치되지 않아 AI 분석 기능을 사용할 수 없습니다.")
@@ -1919,7 +1969,13 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                             col3.metric("경영/밸류 (30)", f"{mgmt_score + val_score}점")
                             col4.metric("기술/트렌드 (30)", f"{tech_score + trend_score}점")
                             st.caption("※ 뉴스/수급 점수는 AI가 각 뉴스 제목의 문맥을 읽고 판정한 감성(긍정/중립/부정)을 기반으로 계산됩니다. (AI 판정 실패 시 키워드 매칭 방식으로 자동 대체)")
-                            
+
+                            if GENAI_AVAILABLE:
+                                st.markdown("#### 🤖 AI 심층 투자 분석 리포트")
+                                with st.spinner("AI가 재무·기술·뉴스를 종합한 심층 리포트를 작성하고 있습니다..."):
+                                    ai_report = get_individual_stock_ai_analysis(fundamentals, tech, news)
+                                st.info(ai_report)
+
                             st.markdown("#### 🔍 상세 지표 분석")
                             t1, t2, t3 = st.tabs(["재무 및 밸류에이션", "기술적 지표 및 트렌드", "관련 최신 뉴스"])
                             with t1:
