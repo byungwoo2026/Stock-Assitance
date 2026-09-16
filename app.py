@@ -416,6 +416,121 @@ def fetch_top_analyst_recommendations():
     except Exception:
         return [], datetime.now().strftime('%H:%M')
 
+def compute_technical_indicators(df_fdr):
+    """일봉 OHLCV(fdr.DataReader 원본 — 날짜 DatetimeIndex, High/Low/Close/Volume 포함)에
+    이동평균/RSI/MACD/ATR/볼린저밴드/스토캐스틱/주간추세를 전체 구간에 걸쳐 벡터화 계산해 추가.
+    analyze_stock_technical(오늘 스냅샷)과 backtest_technical_signal(과거 전 구간)이 같은 함수를 공유해
+    "오늘 화면에 보이는 지표"와 "백테스트가 재현하는 지표"가 어긋나지 않도록 함."""
+    df = pd.DataFrame({
+        'high': df_fdr['High'],
+        'low': df_fdr['Low'],
+        'close': df_fdr['Close'],
+        'volume': df_fdr['Volume'],
+    })
+
+    df['SMA20'] = df['close'].rolling(window=20).mean()
+    df['SMA60'] = df['close'].rolling(window=60).mean()
+
+    delta = df['close'].diff()
+    up = delta.clip(lower=0)
+    down = -delta.clip(upper=0)
+    ema_up = up.ewm(com=13, adjust=False).mean()
+    ema_down = down.ewm(com=13, adjust=False).mean()
+    rs = ema_up / ema_down
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    exp1 = df['close'].ewm(span=12, adjust=False).mean()
+    exp2 = df['close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp1 - exp2
+    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+
+    # ATR(14) — 손절/목표가 산정에 쓰는 변동성 지표. True Range의 Wilder 평활 이동평균.
+    prev_close = df['close'].shift(1)
+    true_range = pd.concat([
+        df['high'] - df['low'],
+        (df['high'] - prev_close).abs(),
+        (df['low'] - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    df['ATR'] = true_range.ewm(com=13, adjust=False).mean()
+
+    # 볼린저밴드(20일, ±2표준편차) — %B: 0=하단밴드, 1=상단밴드 (구간 밖으로도 벗어날 수 있음)
+    bb_std = df['close'].rolling(window=20).std()
+    df['BB_UPPER'] = df['SMA20'] + 2 * bb_std
+    df['BB_LOWER'] = df['SMA20'] - 2 * bb_std
+    bb_range = (df['BB_UPPER'] - df['BB_LOWER']).replace(0, pd.NA)
+    df['BB_PCT_B'] = (df['close'] - df['BB_LOWER']) / bb_range
+
+    # 스토캐스틱(%K 14일, %D 3일 이동평균)
+    lowest_low = df['low'].rolling(window=14).min()
+    highest_high = df['high'].rolling(window=14).max()
+    stoch_range = (highest_high - lowest_low).replace(0, pd.NA)
+    df['STOCH_K'] = (df['close'] - lowest_low) / stoch_range * 100
+    df['STOCH_D'] = df['STOCH_K'].rolling(window=3).mean()
+
+    # 주간 추세: 주봉 5주/20주 이동평균 관계. resample('W')의 라벨은 그 주의 "마지막" 날짜이므로,
+    # 아직 끝나지 않은 이번 주 라벨은 일별 날짜보다 항상 미래에 위치 → reindex+ffill 시 자동으로
+    # "가장 최근에 확정된 지난 주" 값만 참조되어 미래 데이터 참조(lookahead) 없이 안전하게 정렬됨.
+    weekly_close = df['close'].resample('W').last()
+    weekly_sma5 = weekly_close.rolling(5).mean()
+    weekly_sma20 = weekly_close.rolling(20).mean()
+    weekly_trend = pd.Series('혼조', index=weekly_close.index)
+    weekly_trend[(weekly_close > weekly_sma5) & (weekly_sma5 > weekly_sma20)] = '상승'
+    weekly_trend[weekly_sma5 < weekly_sma20] = '하락'
+    weekly_trend[weekly_sma20.isna()] = None
+    df['WEEKLY_TREND'] = weekly_trend.reindex(df.index, method='ffill')
+
+    return df
+
+def compute_technical_score_at_row(row):
+    """지표 한 행(SMA20/SMA60/MACD/Signal/RSI/BB_PCT_B/STOCH_K/WEEKLY_TREND/close)으로부터
+    기술적 타점 점수(100점: 정배열25+MACD20+RSI20+볼린저밴드10+스토캐스틱10+주간추세15)를 계산.
+    run_logical_screener(오늘)와 backtest_technical_signal(과거 전 구간)이 채점 로직을 공유해
+    "백테스트가 실제로 이 스크리너의 로직을 재현하고 있다"는 것을 보장."""
+    price, sma20, sma60 = row['close'], row['SMA20'], row['SMA60']
+    macd, sig, rsi = row['MACD'], row['Signal'], row['RSI']
+    bb_pct_b, stoch_k, weekly_trend = row.get('BB_PCT_B'), row.get('STOCH_K'), row.get('WEEKLY_TREND')
+
+    score = 0
+    trend_str = "역배열/혼조"
+    if price > sma20 and sma20 > sma60:
+        score += 25
+        trend_str = "완벽 정배열 (초강세)"
+    elif sma20 > sma60:
+        score += 15
+        trend_str = "20/60 정배열 (눌림목)"
+    elif price > sma20:
+        score += 8
+        trend_str = "20일선 회복 (반등중)"
+
+    macd_str = "매도 구간"
+    if macd > sig:
+        score += 20
+        macd_str = "매수 우위 (상승세)"
+    elif macd > 0:
+        score += 7
+        macd_str = "조정 중 (0선 위)"
+
+    if pd.notna(rsi):
+        if rsi <= 40: score += 20
+        elif rsi <= 55: score += 13
+        elif rsi <= 70: score += 6
+        else: score -= 7
+
+    if pd.notna(bb_pct_b):
+        if bb_pct_b <= 0.2: score += 10       # 하단밴드 근접(과매도) — 매수 관심
+        elif bb_pct_b <= 0.8: score += 5
+
+    if pd.notna(stoch_k):
+        if stoch_k <= 20: score += 10          # 과매도 구간 — 매수 관심
+        elif stoch_k <= 80: score += 5
+
+    if weekly_trend == '상승':
+        score += 15
+    elif weekly_trend == '혼조':
+        score += 7
+
+    return score, trend_str, macd_str
+
 @st.cache_data(ttl=3600)
 def run_logical_screener():
     """
@@ -441,87 +556,33 @@ def run_logical_screener():
         return [], datetime.now().strftime('%H:%M')
 
     scored_stocks = []
-    
-    # 100 영업일 분량의 데이터를 충분히 확보하기 위해 약 150일 전 날짜부터 조회
-    start_date = (datetime.now() - timedelta(days=150)).strftime('%Y-%m-%d')
-    
+
+    # 주간추세(20주 이동평균)까지 계산하려면 100영업일보다 더 긴 과거 데이터가 필요해 약 500일 전부터 조회
+    start_date = (datetime.now() - timedelta(days=500)).strftime('%Y-%m-%d')
+
     for s in stocks:
         try:
             df_fdr = fdr.DataReader(s['code'], start_date)
             if df_fdr.empty or len(df_fdr) < 60:
                 continue
-            
-            df_fdr = df_fdr.tail(100) # 최근 100개 데이터 사용
-            df = pd.DataFrame({'close': df_fdr['Close']}).reset_index(drop=True)
-            
-            # 이동평균선
-            df['SMA20'] = df['close'].rolling(window=20).mean()
-            df['SMA60'] = df['close'].rolling(window=60).mean()
-            
-            # RSI(14)
-            delta = df['close'].diff()
-            up = delta.clip(lower=0)
-            down = -delta.clip(upper=0)
-            ema_up = up.ewm(com=13, adjust=False).mean()
-            ema_down = down.ewm(com=13, adjust=False).mean()
-            rs = ema_up / ema_down
-            df['RSI'] = 100 - (100 / (1 + rs))
-            
-            # MACD(12, 26, 9)
-            exp1 = df['close'].ewm(span=12, adjust=False).mean()
-            exp2 = df['close'].ewm(span=26, adjust=False).mean()
-            df['MACD'] = exp1 - exp2
-            df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-            
+
+            df = compute_technical_indicators(df_fdr)
             last = df.iloc[-1]
-            price = last['close']
-            sma20 = last['SMA20']
-            sma60 = last['SMA60']
-            macd = last['MACD']
-            sig = last['Signal']
-            rsi = last['RSI']
-            
-            # 종합 타점 점수 산정 (최대 100점)
-            score = 0
-            
-            # 1. 배열 상태 점수 (최대 40점)
-            trend_str = "역배열/혼조"
-            if price > sma20 and sma20 > sma60:
-                score += 40
-                trend_str = "완벽 정배열 (초강세)"
-            elif sma20 > sma60:
-                score += 25
-                trend_str = "20/60 정배열 (눌림목)"
-            elif price > sma20:
-                score += 15
-                trend_str = "20일선 회복 (반등중)"
-                
-            # 2. MACD 상태 (최대 30점)
-            macd_str = "매도 구간"
-            if macd > sig:
-                score += 30
-                macd_str = "매수 우위 (상승세)"
-            elif macd > 0:
-                score += 10
-                macd_str = "조정 중 (0선 위)"
-                
-            # 3. RSI 상태 (최대 30점)
-            if rsi <= 40:
-                score += 30 # 강력한 과매도(눌림목) 타점
-            elif 40 < rsi <= 55:
-                score += 20 # 안정적인 상승 여력
-            elif 55 < rsi <= 70:
-                score += 10 # 강세 유지
-            else:
-                score -= 10 # 70 이상 과열권 감점
-                
+            if pd.isna(last['SMA60']) or pd.isna(last['RSI']) or pd.isna(last['MACD']):
+                continue
+
+            score, trend_str, macd_str = compute_technical_score_at_row(last)
+
             scored_stocks.append({
                 "종목명": s['name'],
                 "타점 점수": int(score),
                 "배열 상태": trend_str,
                 "MACD 신호": macd_str,
-                "RSI 지수": round(rsi, 2),
-                "현재가": f"{int(price):,}",
+                "RSI 지수": round(last['RSI'], 2),
+                "볼린저밴드": f"{last['BB_PCT_B']:.2f}" if pd.notna(last['BB_PCT_B']) else "-",
+                "스토캐스틱(%K)": f"{last['STOCH_K']:.1f}" if pd.notna(last['STOCH_K']) else "-",
+                "주간추세": last['WEEKLY_TREND'] if pd.notna(last['WEEKLY_TREND']) else "-",
+                "현재가": f"{int(last['close']):,}",
                 "주요 수급": "시장 주도주(Top 100)"
             })
         except Exception:
@@ -530,6 +591,80 @@ def run_logical_screener():
     # 점수 높은 순으로 정렬 후 상위 20개 추출
     scored_stocks = sorted(scored_stocks, key=lambda x: x['타점 점수'], reverse=True)
     return scored_stocks[:20], datetime.now().strftime('%H:%M')
+
+@st.cache_data(ttl=3600)
+def backtest_technical_signal(code, threshold=70, holding_days=20, lookback_years=3):
+    """한 종목의 과거 가격 이력 전체에 run_logical_screener와 동일한 채점 로직
+    (compute_technical_indicators + compute_technical_score_at_row)을 매일 적용해,
+    타점 점수가 threshold를 처음 넘어선 날("신호 발생일")마다 이후 holding_days 거래일 뒤 수익률을 계산.
+    미래 데이터를 참조하지 않도록(lookahead 방지) rolling/ewm 등 과거 시점까지만 보는 연산만 사용하고,
+    각 신호의 보유기간 종료일이 데이터 범위를 벗어나면(가장 최근 신호들) 집계에서 제외한다.
+
+    반환: (요약 dict 또는 None, 개별 신호 DataFrame, 계산 시각)"""
+    ts = datetime.now().strftime('%H:%M')
+    start_date = (datetime.now() - timedelta(days=int(lookback_years * 365) + 200)).strftime('%Y-%m-%d')
+    try:
+        df_fdr = fdr.DataReader(code, start_date)
+        if df_fdr.empty or len(df_fdr) < 120:
+            return None, pd.DataFrame(), ts
+        df = compute_technical_indicators(df_fdr)
+    except Exception:
+        return None, pd.DataFrame(), ts
+
+    scores = []
+    for i in range(len(df)):
+        row = df.iloc[i]
+        if pd.isna(row['SMA60']) or pd.isna(row['RSI']) or pd.isna(row['MACD']):
+            scores.append(None)
+            continue
+        s, _, _ = compute_technical_score_at_row(row)
+        scores.append(s)
+    df = df.assign(SCORE=scores)
+
+    signals = []
+    prev_above = False
+    for i in range(len(df)):
+        s = df['SCORE'].iloc[i]
+        if s is None:
+            prev_above = False
+            continue
+        is_above = s >= threshold
+        # "신호 발생일" = 문턱값을 새로 넘어선 첫날만 카운트 (연속 며칠간 고득점 유지되는 경우 중복 집계 방지)
+        if is_above and not prev_above and (i + holding_days) < len(df):
+            entry_price = float(df['close'].iloc[i])
+            exit_price = float(df['close'].iloc[i + holding_days])
+            if entry_price > 0:
+                signals.append({
+                    "신호일": df.index[i].strftime('%Y-%m-%d'),
+                    "타점점수": round(float(s), 1),
+                    "진입가": entry_price,
+                    "청산가": exit_price,
+                    "수익률(%)": round((exit_price - entry_price) / entry_price * 100, 2),
+                })
+        prev_above = is_above
+
+    if not signals:
+        return {"signal_count": 0}, pd.DataFrame(), ts
+
+    df_signals = pd.DataFrame(signals)
+    win_rate = float((df_signals["수익률(%)"] > 0).mean() * 100)
+    avg_return = float(df_signals["수익률(%)"].mean())
+
+    # 벤치마크: "아무 날짜에나 사서 holding_days만큼 들고 있었으면" 평균 수익률 — 신호가 실제로 무작위보다 나은지 비교용
+    closes = df['close'].values
+    baseline_returns = [
+        (closes[i + holding_days] - closes[i]) / closes[i] * 100
+        for i in range(len(closes) - holding_days) if closes[i] > 0
+    ]
+    baseline_avg = float(sum(baseline_returns) / len(baseline_returns)) if baseline_returns else None
+
+    summary = {
+        "signal_count": len(df_signals),
+        "win_rate": win_rate,
+        "avg_return": avg_return,
+        "baseline_avg": baseline_avg,
+    }
+    return summary, df_signals, ts
 
 @st.cache_data(ttl=60)
 def fetch_stock_name_and_fundamentals(code):
@@ -635,47 +770,14 @@ def fetch_stock_name_and_fundamentals(code):
         return None
 
 def analyze_stock_technical(code):
-    start_date = (datetime.now() - timedelta(days=150)).strftime('%Y-%m-%d')
+    # 주간추세(20주 이동평균)까지 계산하려면 100영업일보다 더 긴 과거 데이터가 필요해 약 500일 전부터 조회
+    start_date = (datetime.now() - timedelta(days=500)).strftime('%Y-%m-%d')
     try:
         df_fdr = fdr.DataReader(code, start_date)
         if df_fdr.empty or len(df_fdr) < 60:
             return None
-        
-        df_fdr = df_fdr.tail(100) # 최근 100개 데이터 사용
 
-# --- [수정] 거래량 데이터도 함께 수집 ---
-        df = pd.DataFrame({
-            'high': df_fdr['High'],
-            'low': df_fdr['Low'],
-            'close': df_fdr['Close'],
-            'volume': df_fdr['Volume']
-        }).reset_index(drop=True)
-
-        df['SMA20'] = df['close'].rolling(window=20).mean()
-        df['SMA60'] = df['close'].rolling(window=60).mean()
-
-        delta = df['close'].diff()
-        up = delta.clip(lower=0)
-        down = -delta.clip(upper=0)
-        ema_up = up.ewm(com=13, adjust=False).mean()
-        ema_down = down.ewm(com=13, adjust=False).mean()
-        rs = ema_up / ema_down
-        df['RSI'] = 100 - (100 / (1 + rs))
-
-        exp1 = df['close'].ewm(span=12, adjust=False).mean()
-        exp2 = df['close'].ewm(span=26, adjust=False).mean()
-        df['MACD'] = exp1 - exp2
-        df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-        # ATR(14) — 손절/목표가 산정에 쓰는 변동성 지표. True Range의 Wilder 평활 이동평균.
-        prev_close = df['close'].shift(1)
-        true_range = pd.concat([
-            df['high'] - df['low'],
-            (df['high'] - prev_close).abs(),
-            (df['low'] - prev_close).abs(),
-        ], axis=1).max(axis=1)
-        df['ATR'] = true_range.ewm(com=13, adjust=False).mean()
-
+        df = compute_technical_indicators(df_fdr)
         last = df.iloc[-1]
 
         start_price = df.iloc[-22]['close'] if len(df) >= 22 else df.iloc[0]['close']
@@ -694,6 +796,12 @@ def analyze_stock_technical(code):
             "signal": last['Signal'],
             "rsi": last['RSI'],
             "atr": last['ATR'],
+            "bb_upper": last['BB_UPPER'],
+            "bb_lower": last['BB_LOWER'],
+            "bb_pct_b": last['BB_PCT_B'],
+            "stoch_k": last['STOCH_K'],
+            "stoch_d": last['STOCH_D'],
+            "weekly_trend": last['WEEKLY_TREND'] if pd.notna(last['WEEKLY_TREND']) else None,
             "one_month_return": one_month_return,
             "volume_ratio": volume_ratio # 반환값 추가
         }
@@ -1092,6 +1200,9 @@ def get_individual_stock_ai_analysis(fundamentals, tech, news_list):
     - RSI (14): {tech['rsi']:.2f} (30 이하는 과매도, 70 이상은 과열)
     - MACD 상태: {'매수 우위 (MACD > Signal)' if tech['macd'] > tech['signal'] else '매도 우위 (MACD <= Signal)'}
     - 20일 이동평균선 위치: {'20일선 위 (상승추세)' if tech['price'] > tech['sma20'] else '20일선 아래 (조정/하락세)'}
+    - 볼린저밴드 %B: {f"{tech['bb_pct_b']:.2f} (0=하단밴드, 1=상단밴드)" if tech.get('bb_pct_b') is not None and pd.notna(tech['bb_pct_b']) else "데이터 없음"}
+    - 스토캐스틱 %K/%D: {f"{tech['stoch_k']:.1f} / {tech['stoch_d']:.1f} (20 이하 과매도, 80 이상 과열)" if tech.get('stoch_k') is not None and pd.notna(tech['stoch_k']) else "데이터 없음"}
+    - 주간 추세(주봉 5주/20주 이평): {tech.get('weekly_trend') or "데이터 없음"}
 
     [관련 최신 뉴스 및 시장 평가]
     {news_text}
@@ -1775,30 +1886,96 @@ elif menu == "주요 기업 헤드라인 뉴스":
 
 elif menu == "외인 수급 & 기술적 조건 스크리너":
     st.subheader("🔍 주도주 기술적 타점 랭킹 스크리너")
-    
-    st.info("""
-    💡 **추천 기법 반영 (Scoring & Ranking System)**: 
-    엄격한 필터링(AND 조건)으로 인해 시장이 과열되거나 침체되었을 때 종목이 하나도 나오지 않는 현상을 방지합니다. 
-    대신, **'가장 트렌드와 일치하는 수급 주도주(거래량 상위 100개)'**를 대상으로 사용자가 요구한 지표(RSI 40이하, MACD 매수, 20/60 정배열)의 충족 여부에 따라 **기술적 타점 점수(100점 만점)**를 매깁니다. 
-    점수가 가장 높은 **상위 20개 종목을 각 지표 상태와 함께 리스트업**하여, 투자자가 데이터를 직접 보고 최적의 매수/매도 시점을 검증 및 판단할 수 있도록 고도화했습니다.
-    """)
-    
-    st.markdown("---")
-    
-    search_btn = st.button("🚀 실시간 타점 랭킹 분석 시작")
-    
-    if search_btn:
-        with st.spinner("시장 주도주 100개의 데이터를 수집하고 기술적 타점 점수를 계산 중입니다. (약 10~20초 소요)..."):
-            screener_results, screener_ts = run_logical_screener()
 
-        if screener_results:
-            st.success(f"현재 시장에서 가장 기술적 타점이 우수한 상위 {len(screener_results)}개 종목입니다!")
-            df_screen = pd.DataFrame(screener_results)
-            df_screen.index = range(1, len(df_screen) + 1)
-            st.dataframe(df_screen, width='stretch')
-            render_data_ts_caption(screener_ts, cache_minutes=60)
-        else:
-            st.warning("데이터를 수집하는 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+    scr_tab1, scr_tab2 = st.tabs(["🚀 실시간 타점 랭킹", "📊 스크리너 신호 백테스트"])
+
+    with scr_tab1:
+        st.info("""
+        💡 **추천 기법 반영 (Scoring & Ranking System)**:
+        엄격한 필터링(AND 조건)으로 인해 시장이 과열되거나 침체되었을 때 종목이 하나도 나오지 않는 현상을 방지합니다.
+        대신, **'가장 트렌드와 일치하는 수급 주도주(거래량 상위 100개)'**를 대상으로 이동평균 배열/MACD/RSI/볼린저밴드/스토캐스틱/주간추세 6개 지표를 종합한 **기술적 타점 점수(100점 만점)**를 매깁니다.
+        점수가 가장 높은 **상위 20개 종목을 각 지표 상태와 함께 리스트업**하여, 투자자가 데이터를 직접 보고 최적의 매수/매도 시점을 검증 및 판단할 수 있도록 고도화했습니다.
+        """)
+
+        st.markdown("---")
+
+        search_btn = st.button("🚀 실시간 타점 랭킹 분석 시작")
+
+        if search_btn:
+            with st.spinner("시장 주도주 100개의 데이터를 수집하고 기술적 타점 점수를 계산 중입니다. (약 10~20초 소요)..."):
+                screener_results, screener_ts = run_logical_screener()
+
+            if screener_results:
+                st.success(f"현재 시장에서 가장 기술적 타점이 우수한 상위 {len(screener_results)}개 종목입니다!")
+                df_screen = pd.DataFrame(screener_results)
+                df_screen.index = range(1, len(df_screen) + 1)
+                st.dataframe(df_screen, width='stretch')
+                render_data_ts_caption(screener_ts, cache_minutes=60)
+            else:
+                st.warning("데이터를 수집하는 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
+
+    with scr_tab2:
+        st.info("""
+        💡 **백테스트 방식**: 선택한 종목의 과거 가격 이력 전체에 왼쪽 탭과 동일한 채점 로직(정배열·MACD·RSI·볼린저밴드·스토캐스틱·주간추세, 100점 만점)을 매일 적용해,
+        타점 점수가 기준점을 **새로 넘어선 첫날**마다 이후 지정한 거래일 수만큼 보유했을 때의 수익률을 계산합니다.
+        "이 스크리너의 신호를 과거에 그대로 따라갔다면 실제로 통했는지"를 검증하는 용도입니다.
+        """)
+        st.markdown("---")
+
+        bt_col1, bt_col2 = st.columns(2)
+        with bt_col1:
+            bt_input = st.text_input("종목명 또는 6자리 종목코드", key="backtest_stock_input", placeholder="예: 삼성전자 또는 005930")
+        with bt_col2:
+            bt_years = st.slider("백테스트 기간(년)", min_value=1, max_value=5, value=3, key="bt_years")
+
+        bt_col3, bt_col4 = st.columns(2)
+        with bt_col3:
+            bt_threshold = st.slider("신호 기준 타점 점수", min_value=40, max_value=90, value=70, step=5, key="bt_threshold")
+        with bt_col4:
+            bt_holding = st.slider("보유 기간(거래일)", min_value=5, max_value=60, value=20, step=5, key="bt_holding")
+
+        bt_btn = st.button("📊 백테스트 실행")
+
+        if bt_btn:
+            bt_input_clean = (bt_input or "").strip()
+            bt_code, bt_name = None, bt_input_clean
+            if bt_input_clean.isdigit() and len(bt_input_clean) == 6:
+                bt_code = bt_input_clean
+            elif bt_input_clean:
+                bt_code = get_stock_code_map().get(bt_input_clean)
+
+            if not bt_code:
+                st.warning("올바른 종목명 또는 6자리 종목코드를 입력해주세요.")
+            else:
+                with st.spinner(f"'{bt_name}'의 최근 {bt_years}년 데이터로 백테스트 중입니다..."):
+                    summary, df_signals, bt_ts = backtest_technical_signal(
+                        bt_code, threshold=bt_threshold, holding_days=bt_holding, lookback_years=bt_years
+                    )
+
+                if summary is None:
+                    st.warning("가격 데이터가 부족하거나 조회에 실패해 백테스트를 수행할 수 없습니다. 종목코드를 확인하거나 잠시 후 다시 시도해주세요.")
+                elif summary["signal_count"] == 0:
+                    st.info(f"최근 {bt_years}년간 타점 점수가 {bt_threshold}점을 넘은 신호가 없었습니다. 기준 점수를 낮춰보세요.")
+                    render_data_ts_caption(bt_ts, cache_minutes=60)
+                else:
+                    st.success(f"'{bt_name}' 백테스트 결과 (최근 {bt_years}년, 신호 기준 {bt_threshold}점 이상, 보유 {bt_holding}거래일)")
+                    c1, c2, c3, c4 = st.columns(4)
+                    c1.metric("신호 발생 횟수", f"{summary['signal_count']}건")
+                    c2.metric("상승 승률", f"{summary['win_rate']:.1f}%")
+                    c3.metric("평균 수익률", f"{summary['avg_return']:+.2f}%")
+                    if summary['baseline_avg'] is not None:
+                        diff = summary['avg_return'] - summary['baseline_avg']
+                        c4.metric(
+                            "동일기간 무작위 대비", f"{diff:+.2f}%p",
+                            help=f"아무 날짜에나 사서 {bt_holding}거래일 보유했을 때 평균 수익률({summary['baseline_avg']:+.2f}%) 대비 차이"
+                        )
+                    render_data_ts_caption(bt_ts, cache_minutes=60)
+                    st.markdown("#### 개별 신호 내역")
+                    display_signals = df_signals.copy()
+                    display_signals['진입가'] = display_signals['진입가'].apply(lambda x: f"{x:,.0f}원")
+                    display_signals['청산가'] = display_signals['청산가'].apply(lambda x: f"{x:,.0f}원")
+                    st.dataframe(display_signals, hide_index=True, use_container_width=True)
+                    st.caption("※ 과거 데이터 기반 시뮬레이션 결과이며 미래 수익을 보장하지 않습니다. 신호는 '타점 점수가 기준점을 새로 넘어선 첫날'만 집계해 연속 고득점 구간의 중복 계산을 방지했습니다.")
 
 elif menu == "최우수 애널리스트 추천 종목":
     st.subheader("🏆 2026 최우수 애널리스트 & 주요 증권사 추천 종목")
@@ -2105,26 +2282,36 @@ def calculate_stock_score(fundamentals, tech, news_list):
     elif tech['one_month_return'] < -10: trend_score = 0
 
     # 기술적 지표 (20점) — "기술적 조건" 스크리너라는 이름값에 비해 배점이 지나치게 작았던 문제 개선.
-    # 이동평균 배열(8) + MACD(6) + RSI(6) — run_logical_screener의 배열40:MACD30:RSI30 비율과 동일한 취지 유지
+    # 이동평균 배열(6)+MACD(5)+RSI(5)+볼린저밴드(2)+스토캐스틱(2) — run_logical_screener와 같은 비율 취지, 신규 지표 2종을 위해 기존 8:6:6을 6:5:5로 재분배
     tech_score = 0
     if tech['price'] > tech['sma20'] and tech['sma20'] > tech['sma60']:
-        tech_score += 8   # 완벽 정배열
+        tech_score += 6   # 완벽 정배열
     elif tech['sma20'] > tech['sma60']:
-        tech_score += 5   # 20/60 정배열(눌림목)
+        tech_score += 4   # 20/60 정배열(눌림목)
     elif tech['price'] > tech['sma20']:
-        tech_score += 3   # 20일선 회복(반등중)
+        tech_score += 2   # 20일선 회복(반등중)
 
     if tech['macd'] > tech['signal']:
-        tech_score += 6   # 매수 우위
+        tech_score += 5   # 매수 우위
     elif tech['macd'] > 0:
         tech_score += 2   # 조정 중(0선 위)
 
     if tech['rsi'] <= 40:
-        tech_score += 6   # 과매도(눌림목) 매수 타점
+        tech_score += 5   # 과매도(눌림목) 매수 타점
     elif tech['rsi'] <= 55:
-        tech_score += 4
+        tech_score += 3
     elif tech['rsi'] <= 70:
-        tech_score += 2   # 70 초과 과열권은 가점 없음
+        tech_score += 1   # 70 초과 과열권은 가점 없음
+
+    bb_pct_b = tech.get('bb_pct_b')
+    if bb_pct_b is not None and pd.notna(bb_pct_b):
+        if bb_pct_b <= 0.2: tech_score += 2      # 볼린저밴드 하단 근접(과매도)
+        elif bb_pct_b <= 0.8: tech_score += 1
+
+    stoch_k = tech.get('stoch_k')
+    if stoch_k is not None and pd.notna(stoch_k):
+        if stoch_k <= 20: tech_score += 2        # 스토캐스틱 과매도 구간
+        elif stoch_k <= 80: tech_score += 1
 
     # 경영지표 (20점)
     mgmt_score = 0
@@ -2206,6 +2393,9 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                                     "PBR": f"{fundamentals['pbr']}배",
                                     "RSI": f"{tech['rsi']:.2f}",
                                     "MACD": macd_signal,
+                                    "볼린저밴드(%B)": f"{tech['bb_pct_b']:.2f}" if pd.notna(tech.get('bb_pct_b')) else "-",
+                                    "스토캐스틱(%K)": f"{tech['stoch_k']:.1f}" if pd.notna(tech.get('stoch_k')) else "-",
+                                    "주간추세": tech.get('weekly_trend') or "-",
                                     "1개월수익률": f"{tech['one_month_return']:.2f}%"
                                 })
                     progress_bar.progress((idx + 1) / len(stock_codes))
@@ -2372,6 +2562,14 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                                 st.write(f"- **RSI (14)**: {tech['rsi']:.2f}")
                                 st.write(f"- **MACD 신호**: {'매수 우위' if tech['macd'] > tech['signal'] else '매도 우위'}")
                                 st.write(f"- **이동평균선**: {'20일선 위 (상승추세)' if tech['price'] > tech['sma20'] else '20일선 아래 (조정/하락)'}")
+                                if tech.get('bb_pct_b') is not None and pd.notna(tech['bb_pct_b']):
+                                    bb_state = "하단 근접(과매도)" if tech['bb_pct_b'] <= 0.2 else ("상단 근접(과열)" if tech['bb_pct_b'] >= 0.8 else "중립")
+                                    st.write(f"- **볼린저밴드 %B**: {tech['bb_pct_b']:.2f} ({bb_state}, 하단 {int(tech['bb_lower']):,}원 / 상단 {int(tech['bb_upper']):,}원)")
+                                if tech.get('stoch_k') is not None and pd.notna(tech['stoch_k']):
+                                    stoch_state = "과매도" if tech['stoch_k'] <= 20 else ("과매수" if tech['stoch_k'] >= 80 else "중립")
+                                    st.write(f"- **스토캐스틱 %K/%D**: {tech['stoch_k']:.1f} / {tech['stoch_d']:.1f} ({stoch_state})")
+                                if tech.get('weekly_trend'):
+                                    st.write(f"- **주간 추세(주봉 5주/20주 이평)**: {tech['weekly_trend']}")
                             with t3:
                                 if news:
                                     for i, n in enumerate(news, 1):
