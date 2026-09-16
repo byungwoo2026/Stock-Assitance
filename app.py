@@ -700,6 +700,23 @@ def analyze_stock_technical(code):
     except Exception:
         return None
 
+@st.cache_data(ttl=1800)  # 30분 캐싱 (퀀트/가치재평가주 유니버스 스캔 시 수백 종목 단위로 호출되므로 캐시 재사용 이점이 큼)
+def fetch_price_momentum(code):
+    """퀀트 스캔용 경량 모멘텀 지표: 최근 1개월(22거래일) 가격 수익률만 계산.
+    analyze_stock_technical과 달리 SMA/RSI/MACD/ATR은 계산하지 않아 대량 종목 스캔에 적합."""
+    try:
+        start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+        hist = fdr.DataReader(code, start_date)
+        if len(hist) < 2:
+            return None
+        closes = hist['Close']
+        start_price = closes.iloc[-22] if len(closes) >= 22 else closes.iloc[0]
+        if start_price == 0:
+            return None
+        return float((closes.iloc[-1] - start_price) / start_price * 100)
+    except Exception:
+        return None
+
 def compute_risk_levels(price, atr):
     """ATR(변동성) 기반 손절가/목표가 참고치 산출.
     손절 = 현재가 - 2×ATR, 목표가 = 현재가 + 3×ATR (위험 대비 보상 약 1:1.5).
@@ -799,26 +816,73 @@ def get_stock_code_map():
 
 @st.cache_data(ttl=21600)  # 6시간 캐싱 (시가총액/업종은 하루 중 자주 바뀌지 않음)
 def fetch_market_universe():
-    """KRX 전종목의 실제 시가총액(KRX-MARCAP)과 실제 업종분류(KRX-DESC)를 가져와 병합"""
+    """KRX 전종목의 시가총액과 업종분류를 가져와 병합.
+    NOTE(2026-09-16): fdr.StockListing('KRX'/'KRX-MARCAP')의 시세 병합이 깨져 Marcap이 전종목 NaN으로
+    반환되는 것을 실측으로 확인(Close도 '-' 문자열, Stocks(발행주식수)만 정상) → 이미 이 프로젝트 전반에서
+    안정적으로 쓰고 있는 네이버 모바일 API의 시가총액 랭킹(stocks/marketValue) 엔드포인트로 교체.
+    업종은 KRX-DESC의 'Sector' 컬럼이 실제로는 코스닥 소속부(벤처기업부 등)만 채워져 있고 코스피는 전부
+    NaN이라(실제 업종분류는 'Industry' 컬럼에 있음) 함께 수정."""
+    session = get_naver_session()
+    rows = []
     try:
-        df_marcap = fdr.StockListing('KRX')[['Code', 'Name', 'Market', 'Marcap']]
-        df_marcap['시가총액(억원)'] = df_marcap['Marcap'] / 1e8
-
-        df_desc = fdr.StockListing('KRX-DESC')[['Code', 'Sector']]
-
-        df = pd.merge(df_marcap, df_desc, on='Code', how='left')
-        df['Sector'] = df['Sector'].fillna('업종정보없음')
-        return df
+        for market in ["KOSPI", "KOSDAQ"]:
+            page = 1
+            while True:
+                res = session.get(
+                    "https://m.stock.naver.com/api/stocks/marketValue/" + market,
+                    params={"page": page, "pageSize": 100}, timeout=10
+                )
+                if res.status_code != 200:
+                    break
+                data = res.json()
+                stocks = data.get("stocks") or []
+                if not stocks:
+                    break
+                for s in stocks:
+                    marcap_raw = s.get("marketValueRaw")
+                    if not marcap_raw:
+                        continue
+                    rows.append({
+                        "Code": s.get("itemCode"),
+                        "Name": s.get("stockName"),
+                        "Market": market,
+                        "시가총액(억원)": float(marcap_raw) / 1e8,
+                    })
+                if page * 100 >= data.get("totalCount", 0):
+                    break
+                page += 1
     except Exception:
+        pass
+
+    if not rows:
         return pd.DataFrame()
+    df = pd.DataFrame(rows)
+
+    try:
+        df_desc = fdr.StockListing('KRX-DESC')[['Code', 'Industry']].rename(columns={'Industry': 'Sector'})
+        df = pd.merge(df, df_desc, on='Code', how='left')
+    except Exception:
+        df['Sector'] = None
+    df['Sector'] = df['Sector'].fillna('업종정보없음')
+    return df
 
 
 def scan_fundamentals(codes, max_workers=15):
-    """주어진 종목코드 리스트에 대해 개별 페이지 펀더멘털(PER/PBR/ROE/영업이익률/매출성장률)을 병렬 수집"""
+    """주어진 종목코드 리스트에 대해 개별 페이지 펀더멘털(PER/PBR/ROE/영업이익률/매출성장률)과
+    모멘텀(1개월 수익률)을 같은 스레드풀에서 함께 병렬 수집 (두 API를 순차 2-pass로 나누면 왕복시간이 배가되므로 종목당 1워커에서 함께 처리)"""
     from concurrent.futures import ThreadPoolExecutor
+
+    def fetch_one(code):
+        f = fetch_stock_name_and_fundamentals(code)
+        if not f:
+            return None
+        f = dict(f)
+        f['momentum'] = fetch_price_momentum(code)
+        return f
+
     results = {}
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(fetch_stock_name_and_fundamentals, code): code for code in codes}
+        futures = {executor.submit(fetch_one, code): code for code in codes}
         for future in futures:
             code = futures[future]
             try:
@@ -830,9 +894,33 @@ def scan_fundamentals(codes, max_workers=15):
     return results
 
 
+def _percentile_score(series, higher_is_better=True):
+    """시리즈를 스캔 유니버스 내 상대 순위 기준 0~100 백분위 점수로 변환 (결측치는 중립값 50).
+    개별종목 화면(calculate_stock_score)의 고정 임계값 방식과 달리, 여기서는 시가총액/업종 조건으로 좁힌
+    스캔 대상 "안에서의 상대 순위"를 쓴다 — ROE 10% 이상처럼 고정 커트라인은 시장 상황에 따라
+    항상 적절한 기준이 되지 않기 때문."""
+    pct = pd.Series(50.0, index=series.index)
+    valid = series.notna()
+    if valid.sum() > 1:
+        pct.loc[valid] = series[valid].rank(pct=True, ascending=higher_is_better) * 100
+    return pct
+
+def add_quant_composite_score(df):
+    """PER/PBR(가치) + ROE/영업이익률(품질) + 매출성장률(성장) + 모멘텀 4개 팩터를 각각 25점 만점으로
+    가중합산한 종합점수(0~100) 컬럼을 추가."""
+    df = df.copy()
+    df['가치점수'] = (_percentile_score(df['PER'].where(df['PER'] > 0), higher_is_better=False)
+                    + _percentile_score(df['PBR'].where(df['PBR'] > 0), higher_is_better=False)) / 2
+    df['품질점수'] = (_percentile_score(df['ROE']) + _percentile_score(df['영업이익률'])) / 2
+    df['성장점수'] = _percentile_score(df['매출성장률'])
+    df['모멘텀점수'] = _percentile_score(df['모멘텀'])
+    df['종합점수'] = (df['가치점수'] + df['품질점수'] + df['성장점수'] + df['모멘텀점수']) / 4
+    return df
+
 @st.cache_data(ttl=1800)
 def build_quant_filter_candidates(market_cap_min=0, included_sector="", max_scan=150):
-    """실제 시가총액/업종 데이터로 먼저 후보를 좁힌 뒤, 그 안에서만 개별 페이지를 스캔하여 펀더멘털을 수집합니다."""
+    """실제 시가총액/업종 데이터로 먼저 후보를 좁힌 뒤, 그 안에서만 개별 페이지를 스캔하여 펀더멘털·모멘텀을 수집하고
+    멀티팩터 종합점수까지 계산합니다. 가치재평가주·퀀트 투자 리스트 두 메뉴가 공유하는 단일 스캔 파이프라인."""
     universe = fetch_market_universe()
     if universe.empty:
         return pd.DataFrame()
@@ -860,39 +948,87 @@ def build_quant_filter_candidates(market_cap_min=0, included_sector="", max_scan
             "PBR": f["pbr"],
             "ROE": f["roe"],
             "영업이익률": f["op_margin"],
-            "시가총액": row['시가총액(억원)'],
+            "영업이익률평균": f["op_margin_avg"],          # 확인 가능한 연도 전체 평균 (가치재평가주 "고수익성" 탭용)
+            "영업이익률_확인연도수": f["op_margin_years"],
             "매출성장률": f["revenue_growth"],  # 확인 가능한 연도들의 평균 YoY 성장률(%), 데이터 없으면 None
+            "매출성장률_확인연도수": f["revenue_growth_years"],
+            "모멘텀": f["momentum"],            # 최근 1개월 가격 수익률(%), 데이터 없으면 None
+            "시가총액": row['시가총액(억원)'],
             "업종": row['Sector'],
         })
-    return pd.DataFrame(rows)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return add_quant_composite_score(df)
 
 @st.cache_data(ttl=1800)
-def scan_value_candidates(scan_size):
-    """가치재평가주 메뉴용: 시가총액 상위 scan_size개 종목의 PBR/영업이익률/매출성장률을 실시간 스캔"""
-    universe = fetch_market_universe()
-    if universe.empty:
-        return pd.DataFrame()
+def compute_price_correlation(codes, names):
+    """스크리닝 상위 종목들의 최근 60거래일 일간수익률 상관계수 행렬을 계산 (포트폴리오 분산 참고용).
+    ETF 간 실제 보유종목 중복도 분석과 달리, 개별 종목은 구성종목 데이터 없이 가격만으로 직접 계산 가능."""
+    from concurrent.futures import ThreadPoolExecutor
+    start_date = (datetime.now() - timedelta(days=100)).strftime('%Y-%m-%d')
 
-    top_universe = universe.sort_values('시가총액(억원)', ascending=False).head(scan_size)
-    fundamentals_map = scan_fundamentals(top_universe['Code'].tolist())
+    def fetch_close(code):
+        try:
+            hist = fdr.DataReader(code, start_date)
+            return hist['Close'].tail(60).pct_change().reset_index(drop=True)
+        except Exception:
+            return None
 
-    rows = []
-    for _, row in top_universe.iterrows():
-        f = fundamentals_map.get(row['Code'])
-        if not f:
-            continue
-        rows.append({
-            "종목코드": row['Code'],
-            "종목명": f["name"],
-            "PBR": f["pbr"],
-            "영업이익률평균": f["op_margin_avg"],
-            "영업이익률_확인연도수": f["op_margin_years"],
-            "매출성장률평균": f["revenue_growth"],
-            "매출성장률_확인연도수": f["revenue_growth_years"],
-            "시가총액": row['시가총액(억원)'],
-            "업종": row['Sector'],
-        })
-    return pd.DataFrame(rows)
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        series_list = list(executor.map(fetch_close, codes))
+
+    data = {name: s for name, s in zip(names, series_list) if s is not None and len(s) > 10}
+    if len(data) < 2:
+        return None
+    return pd.DataFrame(data).corr()
+
+def _correlation_cell_color(val):
+    """상관계수 값을 빨강(고상관, 분산효과 낮음)~흰색(무상관)~초록(음의 상관, 분산효과 높음)으로 색칠.
+    pandas Styler.background_gradient는 matplotlib 의존성이 필요해, 이 프로젝트엔 없는 무거운 패키지를 새로 추가하지 않도록 직접 계산."""
+    if pd.isna(val):
+        return ''
+    intensity = min(abs(val), 1.0)
+    if val >= 0:
+        r, g, b = 255, int(255 - 180 * intensity), int(255 - 180 * intensity)
+    else:
+        r, g, b = int(255 - 180 * intensity), int(255 - 100 * intensity), int(255 - 180 * intensity)
+    return f'background-color: rgb({r},{g},{b})'
+
+def find_high_correlation_pairs(corr_df, threshold=0.7):
+    """상관계수 행렬에서 threshold 이상인 종목 쌍을 상관계수 내림차순으로 추출"""
+    pairs = []
+    cols = corr_df.columns
+    for i in range(len(cols)):
+        for j in range(i + 1, len(cols)):
+            v = corr_df.iloc[i, j]
+            if pd.notna(v) and v >= threshold:
+                pairs.append((cols[i], cols[j], v))
+    return sorted(pairs, key=lambda x: -x[2])
+
+def render_portfolio_correlation(df_top, key_prefix):
+    """스크리닝 결과 상위 종목들의 가격 상관관계 분석 섹션을 렌더링 (가치재평가주/퀀트 투자 리스트 공통 사용)"""
+    st.markdown("#### 🔗 상위 종목 간 가격 상관관계 (최근 60거래일)")
+    st.caption("서로 다른 종목이라도 가격이 함께 움직이면(상관계수 높음) 담아도 분산 효과가 떨어집니다. 실제 보유종목 데이터가 아닌 가격 흐름 기반 근사치입니다.")
+    top_for_corr = df_top.head(15)
+    if len(top_for_corr) < 2:
+        st.info("상관관계를 계산하려면 최소 2종목이 필요합니다.")
+        return
+    with st.spinner("상위 종목 가격 상관관계 계산 중..."):
+        corr_df = compute_price_correlation(tuple(top_for_corr['종목코드']), tuple(top_for_corr['종목명']))
+    if corr_df is None:
+        st.info("상관관계를 계산하기에 가격 데이터가 부족합니다.")
+        return
+    st.dataframe(
+        corr_df.style.map(_correlation_cell_color).format("{:.2f}"),
+        use_container_width=True, key=f"{key_prefix}_corr_df"
+    )
+    high_pairs = find_high_correlation_pairs(corr_df, threshold=0.7)
+    if high_pairs:
+        pair_text = ", ".join([f"{a}·{b}({v:.2f})" for a, b, v in high_pairs[:5]])
+        st.warning(f"⚠️ 상관관계 높은(0.7 이상) 종목 쌍: {pair_text} — 함께 담으면 분산 효과가 제한적일 수 있습니다.")
+    else:
+        st.success("✅ 상위 종목 간 뚜렷한 고상관 쌍은 발견되지 않았습니다.")
 
 def get_ai_summary(news_list):
     news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list])
@@ -1655,8 +1791,8 @@ elif menu == "가치재평가주":
     st.subheader("💎 가치재평가주 (Value Re-evaluation) 스크리닝")
 
     st.info("""
-    💡 **스크리닝 방식**: 시가총액 상위 N개 종목을 대상으로 각 종목의 실제 PBR·영업이익률·매출액 데이터를 실시간으로 조회하여,
-    조건(저 PBR / 고수익성 / 고성장)에 부합하는 상위 20종목을 그때그때 계산합니다. (고정된 예시 리스트가 아닙니다)
+    💡 **스크리닝 방식**: 시가총액 상위 N개 종목을 대상으로 각 종목의 실제 PBR·영업이익률·매출액·모멘텀 데이터를 실시간으로 조회하여,
+    조건(저 PBR / 고수익성 / 고성장 / 종합점수)에 부합하는 상위 종목을 그때그때 계산합니다. (고정된 예시 리스트가 아닙니다)
 
     ⚠️ 단, 스캔 대상을 "시가총액 상위 N개"로 한정하기 때문에, 고성장/고수익성 테마에 흔한 중소형주가 스캔 범위 밖에 있을 수 있습니다.
     더 폭넓게 보고 싶다면 아래 스캔 수를 늘려주세요 (다만 조회 시간이 늘어납니다).
@@ -1664,19 +1800,22 @@ elif menu == "가치재평가주":
     st.markdown("---")
 
     scan_size = st.slider("스캔 대상 시가총액 상위 종목 수", min_value=50, max_value=500, value=300, step=50)
-    st.caption("※ 종목마다 개별 페이지를 실시간 조회하므로, 스캔 수를 늘리면 정확도(대상 폭)는 넓어지지만 조회 시간도 늘어납니다 (300종목 기준 약 30초~1분 소요).")
+    st.caption("※ 종목마다 개별 페이지+가격 데이터를 실시간 조회하므로, 스캔 수를 늘리면 정확도(대상 폭)는 넓어지지만 조회 시간도 늘어납니다 (300종목 기준 약 1~2분 소요).")
     run_value_scan = st.button("💎 실시간 스캔 시작")
 
     if run_value_scan:
-        with st.spinner(f"시가총액 상위 {scan_size}개 종목의 PBR/영업이익률/매출액 데이터를 실시간 조회 중입니다..."):
-            st.session_state['value_scan_df'] = scan_value_candidates(scan_size)
+        with st.spinner(f"시가총액 상위 {scan_size}개 종목의 PBR/영업이익률/매출액/모멘텀 데이터를 실시간 조회 중입니다..."):
+            st.session_state['value_scan_df'] = build_quant_filter_candidates(market_cap_min=0, included_sector="", max_scan=scan_size)
             st.session_state['value_scan_size'] = scan_size
 
     if st.session_state.get('value_scan_df') is not None and not st.session_state['value_scan_df'].empty:
         df_scan = st.session_state['value_scan_df']
         scanned_n = st.session_state.get('value_scan_size', scan_size)
 
-        tab1, tab2, tab3 = st.tabs(["📉 1. 저 PBR 종목 (상위 20선)", "💰 2. 고수익성 종목 (영업이익률 평균 상위)", "🚀 3. 고성장 종목 (매출성장률 평균 상위)"])
+        tab1, tab2, tab3, tab4 = st.tabs([
+            "📉 1. 저 PBR 종목 (상위 20선)", "💰 2. 고수익성 종목 (영업이익률 평균 상위)",
+            "🚀 3. 고성장 종목 (매출성장률 평균 상위)", "🏆 4. 종합점수 상위 (멀티팩터)"
+        ])
 
         with tab1:
             st.markdown("#### 기업가치 대비 저평가된 저 PBR 상위 20종목")
@@ -1700,14 +1839,28 @@ elif menu == "가치재평가주":
 
         with tab3:
             st.markdown("#### 확인 가능한 연도 기준, 평균 매출성장률(YoY)이 가장 높은 상위 20종목")
-            high_growth = df_scan.dropna(subset=['매출성장률평균']).sort_values('매출성장률평균', ascending=False).head(20)
+            high_growth = df_scan.dropna(subset=['매출성장률']).sort_values('매출성장률', ascending=False).head(20)
             if high_growth.empty:
                 st.warning("조건에 맞는 종목을 찾지 못했습니다.")
             else:
-                display = high_growth[['종목명', '종목코드', '매출성장률평균', '매출성장률_확인연도수', '시가총액', '업종']].copy()
-                display['매출성장률평균'] = display['매출성장률평균'].apply(lambda x: f"{x:+.2f}%")
+                display = high_growth[['종목명', '종목코드', '매출성장률', '매출성장률_확인연도수', '시가총액', '업종']].copy()
+                display['매출성장률'] = display['매출성장률'].apply(lambda x: f"{x:+.2f}%")
                 st.dataframe(display, hide_index=True, use_container_width=True)
                 st.caption("※ '매출성장률_확인연도수'는 평균 계산에 사용된 연도별 YoY 성장률 개수입니다(기업마다 상이할 수 있음).")
+
+        with tab4:
+            st.markdown("#### 가치·품질·성장·모멘텀 4개 팩터를 종합한 점수 상위 20종목")
+            st.caption("※ 각 팩터는 이번 스캔 대상(시가총액 상위 " + str(scanned_n) + "개) 안에서의 상대 순위(백분위)로 환산해 25점씩 동일 가중 합산한 점수입니다. 절대 기준이 아니므로 스캔 범위가 바뀌면 점수도 달라질 수 있습니다.")
+            top_score = df_scan.sort_values('종합점수', ascending=False).head(20)
+            if top_score.empty:
+                st.warning("조건에 맞는 종목을 찾지 못했습니다.")
+            else:
+                display = top_score[['종목명', '종목코드', '종합점수', '가치점수', '품질점수', '성장점수', '모멘텀점수', '시가총액', '업종']].copy()
+                for col in ['종합점수', '가치점수', '품질점수', '성장점수', '모멘텀점수']:
+                    display[col] = display[col].round(1)
+                st.dataframe(display, hide_index=True, use_container_width=True)
+                st.markdown("---")
+                render_portfolio_correlation(top_score, key_prefix="value_score")
     else:
         st.info("위 '실시간 스캔 시작' 버튼을 눌러 조회를 시작하세요.")
 
@@ -1717,7 +1870,7 @@ elif menu == "퀀트 투자 리스트":
     st.info("예시 조건: PER ≤ 15, PBR ≤ 1.5, ROE ≥ 10, 영업이익률 ≥ 5")
 
     with st.expander("📌 필터 조건 설정", expanded=True):
-        col1, col2, col3, col4, col5 = st.columns(5)
+        col1, col2, col3, col4, col5, col6 = st.columns(6)
         with col1:
             per_limit = st.number_input("PER 상한선", min_value=0.0, value=15.0, step=0.5)
         with col2:
@@ -1728,22 +1881,24 @@ elif menu == "퀀트 투자 리스트":
             op_margin_min = st.number_input("영업이익률 하한선 (%)", min_value=0.0, value=5.0, step=0.5)
         with col5:
             revenue_growth_min = st.number_input("매출성장률 하한선 (%)", min_value=-100.0, value=10.0, step=1.0)
-
-        col6, col7, col8 = st.columns(3)
         with col6:
-            market_cap_min = st.number_input("시가총액 최소값(억원)", min_value=0, value=1000, step=100)
+            momentum_min = st.number_input("모멘텀(1개월수익률) 하한선 (%)", min_value=-100.0, value=-100.0, step=1.0)
+
+        col7, col8, col9 = st.columns(3)
         with col7:
-            included_sector = st.text_input("업종 키워드(예: 반도체, 바이오)", value="")
+            market_cap_min = st.number_input("시가총액 최소값(억원)", min_value=0, value=1000, step=100)
         with col8:
+            included_sector = st.text_input("업종 키워드(예: 반도체, 바이오)", value="")
+        with col9:
             top_n = st.slider("표시 종목 수", min_value=5, max_value=50, value=20, step=5)
 
         max_scan = st.slider(
             "스캔 대상 최대 종목 수 (시가총액/업종 조건 통과 종목 중 시가총액 상위 N개만 상세 조회)",
             min_value=30, max_value=400, value=150, step=10
         )
-        st.caption("※ 종목마다 개별 페이지를 실시간 조회하므로, 스캔 수를 늘리면 정확도(대상 폭)는 넓어지지만 조회 시간도 늘어납니다.")
+        st.caption("※ 종목마다 개별 페이지+가격 데이터를 실시간 조회하므로, 스캔 수를 늘리면 정확도(대상 폭)는 넓어지지만 조회 시간도 늘어납니다.")
 
-        sort_column = st.selectbox("정렬 기준", ["ROE", "영업이익률", "PER", "PBR", "매출성장률"])
+        sort_column = st.selectbox("정렬 기준", ["종합점수", "ROE", "영업이익률", "PER", "PBR", "매출성장률", "모멘텀"])
 
     run_scan = st.button("🔍 조건에 맞는 종목 스캔 시작")
 
@@ -1769,8 +1924,9 @@ elif menu == "퀀트 투자 리스트":
             )
             filtered = df_candidates.loc[mask].copy()
 
-            # 매출성장률: 확인 가능한 연도 데이터가 없는 종목(None)은 조건 판단에서 제외하지 않고 통과시킴
+            # 매출성장률/모멘텀: 데이터가 없는 종목(None)은 조건 판단에서 제외하지 않고 통과시킴
             filtered = filtered.loc[filtered["매출성장률"].isna() | (filtered["매출성장률"] >= revenue_growth_min)]
+            filtered = filtered.loc[filtered["모멘텀"].isna() | (filtered["모멘텀"] >= momentum_min)]
 
             if filtered.empty:
                 st.warning("입력한 조건에 맞는 종목이 없습니다. 기준을 완화해 보세요.")
@@ -1778,9 +1934,14 @@ elif menu == "퀀트 투자 리스트":
                 filtered = filtered.sort_values(by=sort_column, ascending=False)
                 filtered = filtered.head(top_n)
                 st.success(f"조건에 맞는 종목 리스트 (시가총액 상위 {max_scan}개 종목 중 스캔)")
-                st.dataframe(filtered[["종목명", "종목코드", "PER", "PBR", "ROE", "영업이익률", "매출성장률", "시가총액", "업종"]], hide_index=True, use_container_width=True)
-                st.caption(f"적용 조건: PER ≤ {per_limit}, PBR ≤ {pbr_limit}, ROE ≥ {roe_min}%, 영업이익률 ≥ {op_margin_min}%, 매출성장률 ≥ {revenue_growth_min}%(데이터 없는 종목은 통과), 시가총액 ≥ {market_cap_min}억, 업종 키워드: {included_sector or '전체'}")
-                st.caption("※ 매출성장률은 네이버 금융에 공시된 연간 매출액 중 확인 가능한 연도들의 평균 YoY 성장률입니다 (기업별로 확인 가능한 연도 수가 다를 수 있습니다).")
+                display = filtered[["종목명", "종목코드", "종합점수", "PER", "PBR", "ROE", "영업이익률", "매출성장률", "모멘텀", "시가총액", "업종"]].copy()
+                display["종합점수"] = display["종합점수"].round(1)
+                st.dataframe(display, hide_index=True, use_container_width=True)
+                st.caption(f"적용 조건: PER ≤ {per_limit}, PBR ≤ {pbr_limit}, ROE ≥ {roe_min}%, 영업이익률 ≥ {op_margin_min}%, 매출성장률 ≥ {revenue_growth_min}%, 모멘텀 ≥ {momentum_min}%(매출성장률·모멘텀은 데이터 없는 종목은 통과), 시가총액 ≥ {market_cap_min}억, 업종 키워드: {included_sector or '전체'}")
+                st.caption("※ 매출성장률은 네이버 금융에 공시된 연간 매출액 중 확인 가능한 연도들의 평균 YoY 성장률, 모멘텀은 최근 1개월 가격 수익률입니다. 종합점수는 이번 스캔 대상 안에서의 가치·품질·성장·모멘텀 상대 순위를 25점씩 가중합산한 값(0~100)입니다.")
+
+                st.markdown("---")
+                render_portfolio_correlation(filtered, key_prefix="quant_list")
 
 def calculate_stock_score(fundamentals, tech, news_list):
     """개선된 점수 체계화 모델 (뉴스/수급 40 + 밸류에이션 10 + 트렌드 10 + 기술적지표 20 + 경영지표 20 = 100점)
