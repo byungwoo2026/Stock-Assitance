@@ -1159,6 +1159,56 @@ def fetch_etf_market_data():
     except Exception:
         return pd.DataFrame()
 
+def _annualized_volatility(closes):
+    """최근 최대 20거래일 일간수익률의 표준편차를 연율화(연 252거래일 가정)한 변동성(%)."""
+    if len(closes) < 6:
+        return None
+    returns = closes.pct_change().dropna().tail(20)
+    if len(returns) < 5:
+        return None
+    return float(returns.std() * (252 ** 0.5) * 100)
+
+@st.cache_data(ttl=21600)  # 총보수/분배율은 하루 안에 거의 바뀌지 않아 6시간 캐싱
+def fetch_etf_key_indicators(code):
+    """ETF 총보수(연, %)와 분배율(TTM, %)을 네이버 모바일 API(동일업종 PER 조회와 같은 integration 엔드포인트)에서 조회."""
+    session = get_naver_session()
+    try:
+        res = session.get(f"https://m.stock.naver.com/api/stock/{code}/integration", timeout=5)
+        if res.status_code != 200:
+            return {"total_fee": None, "dividend_yield": None}
+        indicator = res.json().get('etfKeyIndicator') or {}
+        return {
+            "total_fee": indicator.get('totalFee'),
+            "dividend_yield": indicator.get('dividendYieldTtm'),
+        }
+    except Exception:
+        return {"total_fee": None, "dividend_yield": None}
+
+def _fetch_etf_row_metrics(symbol, name, price_display, start_date, need_weekly_return=True):
+    """개별 ETF 1건의 1주일 수익률·변동성(가격 히스토리)과 총보수·분배율(키 지표 API)을 함께 조회."""
+    result = {"종목명": name, "종목코드": symbol, "현재가": price_display, "_weekly_return": None, "_volatility": None}
+    try:
+        hist = fdr.DataReader(symbol, start_date)
+        if len(hist) > 2:
+            closes = hist['Close']
+            if need_weekly_return:
+                week_ago = closes.iloc[-6] if len(closes) >= 6 else closes.iloc[0]
+                result["_weekly_return"] = (closes.iloc[-1] - week_ago) / week_ago * 100
+            result["_volatility"] = _annualized_volatility(closes)
+    except Exception:
+        pass
+    indicators = fetch_etf_key_indicators(symbol)
+    result["_total_fee"] = indicators.get("total_fee")
+    result["_dividend_yield"] = indicators.get("dividend_yield")
+    return result
+
+def _format_etf_metric_columns(df):
+    """_volatility/_total_fee/_dividend_yield 내부 컬럼을 화면 표시용 문자열 컬럼으로 변환."""
+    df['변동성(20일 연율화)'] = df['_volatility'].apply(lambda x: f"{x:.1f}%" if x is not None else "-")
+    df['총보수'] = df['_total_fee'].apply(lambda x: f"{x:.2f}%" if x is not None else "-")
+    df['분배율'] = df['_dividend_yield'].apply(lambda x: f"{x:.2f}%" if x is not None else "-")
+    return df
+
 @st.cache_data(ttl=1800)
 def fetch_etf_weekly_returns(df_etf):
     from concurrent.futures import ThreadPoolExecutor
@@ -1170,38 +1220,27 @@ def fetch_etf_weekly_returns(df_etf):
 
     # 거래대금 상위 50개만 필터링하여 수익률 연산 (부하 분산)
     df_top = df_filtered.sort_values(by='Amount', ascending=False).head(50)
-    start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
-    
-    def fetch_return(row):
-        symbol = row['Symbol']
-        name = row['Name']
-        try:
-            hist = fdr.DataReader(symbol, start_date)
-            if len(hist) > 2:
-                ret = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100
-                return {
-                    "종목코드": symbol,
-                    "종목명": name,
-                    "현재가": f"{int(row['Price']):,}원",
-                    "1주일 수익률": ret
-                }
-        except Exception:
-            pass
-        return None
+    # 45일치를 가져와 1주일 수익률 기준점(약 5거래일 전)과 20거래일 변동성 계산에 함께 사용
+    start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+
+    def fetch_row(row):
+        m = _fetch_etf_row_metrics(row['Symbol'], row['Name'], f"{int(row['Price']):,}원", start_date)
+        return m if m["_weekly_return"] is not None else None
 
     rows = [row for _, row in df_top.iterrows()]
     with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(fetch_return, rows))
-        
+        results = list(executor.map(fetch_row, rows))
+
     results = [r for r in results if r is not None]
     df_res = pd.DataFrame(results)
     if not df_res.empty:
-        df_res = df_res.sort_values(by='1주일 수익률', ascending=False).head(10)
-        df_res['1주일 수익률'] = df_res['1주일 수익률'].apply(lambda x: f"+{x:.2f}%" if x > 0 else f"{x:.2f}%")
+        df_res = df_res.sort_values(by='_weekly_return', ascending=False).head(10)
+        df_res['1주일 수익률'] = df_res['_weekly_return'].apply(lambda x: f"+{x:.2f}%" if x > 0 else f"{x:.2f}%")
+        df_res = _format_etf_metric_columns(df_res)
     return df_res
 
-# ETF 카테고리 분류 우선순위: 레버리지/인버스 > 채권/현금성 > 배당 > 국내 섹터 > 테마 > 해외지수 > 국내 지수 > 기타
-ETF_CATEGORY_ORDER = ["국내 섹터", "테마", "배당", "해외지수", "레버리지/인버스"]
+# ETF 카테고리 분류 우선순위: 레버리지/인버스 > 채권/현금성 > 배당 > 원자재 > 국내 섹터 > 테마 > 해외지수 > 국내 지수 > 기타
+ETF_CATEGORY_ORDER = ["국내 섹터", "테마", "배당", "원자재", "해외지수", "레버리지/인버스"]
 
 def classify_etf(name: str) -> str:
     """ETF 종목명을 이름 키워드 기반으로 투자 카테고리로 분류"""
@@ -1210,37 +1249,44 @@ def classify_etf(name: str) -> str:
         return '레버리지/인버스'
 
     # 2순위: 채권/현금성 (투자 테마 성격이 아니므로 카테고리 탭에서는 제외)
-    if any(kw in name for kw in ['채권', '국채', '회사채', 'CD금리', 'CD1년',
+    # '국채'만으로는 "국고채"/"국공채"가 매칭되지 않아(부분 문자열 불일치) 실측 데이터 기준 국채류 ETF 다수가 누락되던 것을 수정
+    if any(kw in name for kw in ['채권', '국채', '국고채', '국공채', '회사채', 'CD금리', 'CD1년',
                                    'KOFR', 'SOFR', '머니마켓', 'TDF', 'TRF',
                                    '통안채', '금리액티브', '금리플러스']):
         return '채권/현금성'
 
-    # 3순위: 배당 (커버드콜 상품은 대부분 배당형 인컴 상품이라 함께 분류)
-    if any(kw in name for kw in ['배당', '커버드콜']):
+    # 3순위: 배당 (커버드콜·인컴형 상품은 대부분 배당형 인컴 상품이라 함께 분류)
+    if any(kw in name for kw in ['배당', '커버드콜', '인컴']):
         return '배당'
 
-    # 4순위: 국내 섹터
+    # 4순위: 원자재 (금/은/원유/구리 등 실물·선물 추종 상품 — 실측 데이터에서 "기타"로 새던 것을 별도 분리)
+    commodity_kw = ['골드', '금선물', '금액티브', '은선물', '은액티브', 'WTI', '원유',
+                    '구리실물', '천연가스', '팔라듐', '농산물', '원자재']
+    if any(kw in name for kw in commodity_kw):
+        return '원자재'
+
+    # 5순위: 국내 섹터
     sector_kw = ['반도체', '2차전지', '바이오', '자동차', '조선', '은행',
                  '증권', '보험', '철강', '건설', 'IT', '헬스케어', '게임',
                  '화장품', '에너지화학', '운송', '기계', '리츠', '금융',
-                 '소재', '소부장']
+                 '소재', '소부장', '그룹', '지주회사', '우선주']
     if any(kw in name for kw in sector_kw):
         return '국내 섹터'
 
-    # 5순위: 테마
-    theme_kw = ['AI', '로봇', '휴머노이드', '우주', '방산', '원자력', 'SMR',
+    # 6순위: 테마
+    theme_kw = ['AI', '로봇', '로보틱스', '휴머노이드', '우주', '방산', '원자력', 'SMR',
                 '신재생', '수소', '양자컴퓨팅', '전력', '메타버스', '자율주행',
-                '드론', '데이터센터', 'K-']
+                '드론', '데이터센터', 'K-', '밸류업', 'ESG']
     if any(kw in name for kw in theme_kw):
         return '테마'
 
-    # 6순위: 해외지수
+    # 7순위: 해외지수
     overseas_kw = ['미국', 'S&P', '나스닥', '차이나', '일본', '인도', '유럽',
-                   '베트남', '다우존스', '니케이', '항셍', 'CSI300', '중국']
+                   '베트남', '다우존스', '니케이', '항셍', 'CSI300', '중국', '버크셔']
     if any(kw in name for kw in overseas_kw):
         return '해외지수'
 
-    # 7순위: 국내 지수 (기본 지수 추종 상품)
+    # 8순위: 국내 지수 (기본 지수 추종 상품)
     if any(kw in name for kw in ['200', '코스피', '코스닥', 'KRX']):
         return '국내 지수'
 
@@ -1257,35 +1303,64 @@ def fetch_etf_category_returns(df_etf, category, top_n=10, pool_size=40):
 
     # 해당 카테고리 내 거래대금 상위 종목만 수익률 연산 (API 호출 부하 분산)
     df_top = df_cat.sort_values(by='Amount', ascending=False).head(pool_size)
-    start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+    # 45일치를 가져와 1주일 수익률 기준점(약 5거래일 전)과 20거래일 변동성 계산에 함께 사용
+    start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
 
-    def fetch_return(row):
-        symbol = row['Symbol']
-        name = row['Name']
-        try:
-            hist = fdr.DataReader(symbol, start_date)
-            if len(hist) > 2:
-                ret = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100
-                return {
-                    "종목코드": symbol,
-                    "종목명": name,
-                    "현재가": f"{int(row['Price']):,}원",
-                    "1주일 수익률": ret
-                }
-        except Exception:
-            pass
-        return None
+    def fetch_row(row):
+        m = _fetch_etf_row_metrics(row['Symbol'], row['Name'], f"{int(row['Price']):,}원", start_date)
+        return m if m["_weekly_return"] is not None else None
 
     rows = [row for _, row in df_top.iterrows()]
     with ThreadPoolExecutor(max_workers=10) as executor:
-        results = list(executor.map(fetch_return, rows))
+        results = list(executor.map(fetch_row, rows))
 
     results = [r for r in results if r is not None]
     df_res = pd.DataFrame(results)
     if not df_res.empty:
-        df_res = df_res.sort_values(by='1주일 수익률', ascending=False).head(top_n)
-        df_res['1주일 수익률'] = df_res['1주일 수익률'].apply(lambda x: f"+{x:.2f}%" if x > 0 else f"{x:.2f}%")
+        df_res = df_res.sort_values(by='_weekly_return', ascending=False).head(top_n)
+        df_res['1주일 수익률'] = df_res['_weekly_return'].apply(lambda x: f"+{x:.2f}%" if x > 0 else f"{x:.2f}%")
+        df_res = _format_etf_metric_columns(df_res)
     return df_res
+
+@st.cache_data(ttl=1800)
+def fetch_etf_inflow_top10(df_etf):
+    """거래대금 상위 10개 ETF에 변동성/총보수/분배율 지표를 추가"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    df_top = df_etf.sort_values(by='Amount', ascending=False).head(10)
+    start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+
+    def fetch_row(row):
+        m = _fetch_etf_row_metrics(row['Symbol'], row['Name'], f"{int(row['Price']):,}원", start_date, need_weekly_return=False)
+        m["거래대금"] = f"{row['Amount']/100:.1f}억 원" if row['Amount'] < 10000 else f"{row['Amount']/10000:.2f}조 원"
+        return m
+
+    rows = [row for _, row in df_top.iterrows()]
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(fetch_row, rows))
+
+    df_res = pd.DataFrame(results)
+    return _format_etf_metric_columns(df_res)
+
+@st.cache_data(ttl=1800)
+def fetch_etf_new_listing_top10(df_etf):
+    """종목코드가 큰 순서(추정 신규상장) 10개 ETF에 변동성/총보수/분배율 지표를 추가"""
+    from concurrent.futures import ThreadPoolExecutor
+
+    df_top = df_etf.sort_values(by='Symbol', ascending=False).head(10)
+    start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+
+    def fetch_row(row):
+        m = _fetch_etf_row_metrics(row['Symbol'], row['Name'], f"{int(row['Price']):,}원", start_date, need_weekly_return=False)
+        m["시가총액"] = f"{float(row['MarCap']):,.0f}억 원" if float(row['MarCap']) < 10000 else f"{float(row['MarCap'])/10000:.2f}조 원"
+        return m
+
+    rows = [row for _, row in df_top.iterrows()]
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(fetch_row, rows))
+
+    df_res = pd.DataFrame(results)
+    return _format_etf_metric_columns(df_res)
 
 def render_index_metric(label, data):
     """한국 증시 관례에 맞춰 상승=빨강, 하락=파랑으로 지수를 표시 (st.metric은 초록/빨강만 지원해 커스텀 HTML 사용)"""
@@ -1941,43 +2016,44 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
             
             with col1:
                 st.markdown("#### 💰 자금유입 (거래대금) 상위 10선")
-                df_inflow = df_etf.sort_values(by='Amount', ascending=False).head(10).copy()
-                df_inflow_display = pd.DataFrame({
-                    "종목명": df_inflow['Name'],
-                    "종목코드": df_inflow['Symbol'],
-                    "현재가": df_inflow['Price'].apply(lambda x: f"{int(x):,}원"),
-                    "거래대금": df_inflow['Amount'].apply(lambda x: f"{x/100:.1f}억 원" if x < 10000 else f"{x/10000:.2f}조 원")
-                })
-                st.dataframe(df_inflow_display, hide_index=True, use_container_width=True)
-                
+                with st.spinner("총보수/분배율/변동성 지표 조회 중..."):
+                    df_inflow_display = fetch_etf_inflow_top10(df_etf)
+                st.dataframe(
+                    df_inflow_display[['종목명', '종목코드', '현재가', '거래대금', '변동성(20일 연율화)', '총보수', '분배율']],
+                    hide_index=True, use_container_width=True
+                )
+
             with col2:
                 st.markdown("#### 📈 1주일 수익률 상위 10선")
                 st.caption("※ 레버리지/인버스 상품은 제외한 순위입니다.")
                 with st.spinner("주간 수익률 분석 중..."):
                     df_weekly = fetch_etf_weekly_returns(df_etf)
                 if not df_weekly.empty:
-                    st.dataframe(df_weekly[['종목명', '종목코드', '현재가', '1주일 수익률']], hide_index=True, use_container_width=True)
+                    st.dataframe(
+                        df_weekly[['종목명', '종목코드', '현재가', '1주일 수익률', '변동성(20일 연율화)', '총보수', '분배율']],
+                        hide_index=True, use_container_width=True
+                    )
                 else:
                     st.warning("수익률 데이터를 연산할 수 없습니다.")
-                    
+
             with col3:
                 st.markdown("#### 🆕 신규 상장 추정 ETF 10선")
                 st.caption("※ 실제 상장일 데이터가 아닌, 종목코드가 큰 순서(대체로 최근 상장분에 부여)로 추정한 목록입니다.")
-                df_new = df_etf.sort_values(by='Symbol', ascending=False).head(10).copy()
-                df_new_display = pd.DataFrame({
-                    "종목명": df_new['Name'],
-                    "종목코드": df_new['Symbol'],
-                    "현재가": df_new['Price'].apply(lambda x: f"{int(x):,}원"),
-                    "시가총액": df_new['MarCap'].apply(lambda x: f"{float(x):,.0f}억 원" if float(x) < 10000 else f"{float(x)/10000:.2f}조 원")
-                })
-                st.dataframe(df_new_display, hide_index=True, use_container_width=True)
+                with st.spinner("총보수/분배율/변동성 지표 조회 중..."):
+                    df_new_display = fetch_etf_new_listing_top10(df_etf)
+                st.dataframe(
+                    df_new_display[['종목명', '종목코드', '현재가', '시가총액', '변동성(20일 연율화)', '총보수', '분배율']],
+                    hide_index=True, use_container_width=True
+                )
+
+            st.caption("※ 변동성은 최근 20거래일 일간수익률 표준편차를 연율화(연 252거래일 가정)한 근사치이며, 총보수/분배율은 네이버 금융 제공 수치(분배율은 최근 12개월 기준)로 데이터가 없는 종목은 \"-\"로 표시됩니다.")
 
             st.markdown("---")
             st.markdown("### 🗂️ 카테고리별 ETF 트렌드")
-            st.write("종목명 키워드를 기반으로 국내 섹터 / 테마 / 배당 / 해외지수 / 레버리지·인버스로 분류하여, 각 카테고리 내 거래대금 상위 종목들의 1주일 수익률 순위를 보여줍니다.")
+            st.write("종목명 키워드를 기반으로 국내 섹터 / 테마 / 배당 / 원자재 / 해외지수 / 레버리지·인버스로 분류하여, 각 카테고리 내 거래대금 상위 종목들의 1주일 수익률 순위를 보여줍니다.")
 
-            cat_tabs = st.tabs(["🏭 국내 섹터", "🚀 테마", "💵 배당", "🌍 해외지수", "⚡ 레버리지/인버스"])
-            cat_names = ["국내 섹터", "테마", "배당", "해외지수", "레버리지/인버스"]
+            cat_tabs = st.tabs(["🏭 국내 섹터", "🚀 테마", "💵 배당", "🪙 원자재", "🌍 해외지수", "⚡ 레버리지/인버스"])
+            cat_names = ["국내 섹터", "테마", "배당", "원자재", "해외지수", "레버리지/인버스"]
 
             for cat_tab, cat_name in zip(cat_tabs, cat_names):
                 with cat_tab:
@@ -1987,7 +2063,7 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                         df_cat_res = fetch_etf_category_returns(df_etf, cat_name)
                     if not df_cat_res.empty:
                         st.dataframe(
-                            df_cat_res[['종목명', '종목코드', '현재가', '1주일 수익률']],
+                            df_cat_res[['종목명', '종목코드', '현재가', '1주일 수익률', '변동성(20일 연율화)', '총보수', '분배율']],
                             hide_index=True, use_container_width=True
                         )
                     else:
