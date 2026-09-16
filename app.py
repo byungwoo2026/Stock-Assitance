@@ -642,16 +642,18 @@ def analyze_stock_technical(code):
             return None
         
         df_fdr = df_fdr.tail(100) # 최근 100개 데이터 사용
-                
+
 # --- [수정] 거래량 데이터도 함께 수집 ---
         df = pd.DataFrame({
+            'high': df_fdr['High'],
+            'low': df_fdr['Low'],
             'close': df_fdr['Close'],
             'volume': df_fdr['Volume']
         }).reset_index(drop=True)
 
         df['SMA20'] = df['close'].rolling(window=20).mean()
         df['SMA60'] = df['close'].rolling(window=60).mean()
-        
+
         delta = df['close'].diff()
         up = delta.clip(lower=0)
         down = -delta.clip(upper=0)
@@ -659,17 +661,26 @@ def analyze_stock_technical(code):
         ema_down = down.ewm(com=13, adjust=False).mean()
         rs = ema_up / ema_down
         df['RSI'] = 100 - (100 / (1 + rs))
-        
+
         exp1 = df['close'].ewm(span=12, adjust=False).mean()
         exp2 = df['close'].ewm(span=26, adjust=False).mean()
         df['MACD'] = exp1 - exp2
         df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-        
+
+        # ATR(14) — 손절/목표가 산정에 쓰는 변동성 지표. True Range의 Wilder 평활 이동평균.
+        prev_close = df['close'].shift(1)
+        true_range = pd.concat([
+            df['high'] - df['low'],
+            (df['high'] - prev_close).abs(),
+            (df['low'] - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        df['ATR'] = true_range.ewm(com=13, adjust=False).mean()
+
         last = df.iloc[-1]
-        
+
         start_price = df.iloc[-22]['close'] if len(df) >= 22 else df.iloc[0]['close']
         one_month_return = (last['close'] - start_price) / start_price * 100
-        
+
 # --- [수정] 5일 평균 거래량 대비 당일 증가율 계산 ---
         avg_volume_5d = df['volume'].iloc[-6:-1].mean() if len(df) >= 6 else 1.0
         if avg_volume_5d == 0: avg_volume_5d = 1.0
@@ -682,11 +693,68 @@ def analyze_stock_technical(code):
             "macd": last['MACD'],
             "signal": last['Signal'],
             "rsi": last['RSI'],
+            "atr": last['ATR'],
             "one_month_return": one_month_return,
             "volume_ratio": volume_ratio # 반환값 추가
         }
     except Exception:
         return None
+
+def compute_risk_levels(price, atr):
+    """ATR(변동성) 기반 손절가/목표가 참고치 산출.
+    손절 = 현재가 - 2×ATR, 목표가 = 현재가 + 3×ATR (위험 대비 보상 약 1:1.5).
+    실제 지지/저항선을 반영한 값이 아니라 변동성만으로 근사한 참고치이므로,
+    화면에는 반드시 "참고용" 문구와 함께 노출할 것."""
+    if not atr or atr <= 0:
+        return None
+    stop_loss = price - 2 * atr
+    target_price = price + 3 * atr
+    return {"stop_loss": stop_loss, "target_price": target_price}
+
+@st.cache_data(ttl=300)  # 5분 캐싱 (동일업종 피어 종목들의 PER 조회는 다소 무거워 개별종목 캐시(60초)보다 여유있게)
+def fetch_sector_average_per(code):
+    """동일업종 PER 근사 산출.
+    m.stock.naver.com 신규 API는 '동일업종 PER'을 직접 제공하지 않아,
+    integration API의 동일업종 비교 종목(industryCompareInfo) 목록의 PER을 직접 조회해 대표값으로 대체.
+    (개별종목분석에서 최대 10종목까지만 호출되므로 종목당 몇 건의 추가 조회는 부담이 크지 않음 —
+    퀀트/가치재평가주처럼 수백 종목을 스캔하는 곳에서는 호출하지 않을 것)
+
+    적자에 가까운 종목 1곳만 있어도 PER이 수백~수천 배로 튀어 평균을 왜곡하는 경우가 흔해
+    (실측 예: 반도체 피어 6곳 중 1곳이 PER 1279배), 단순 평균 대신 이상치에 강한 중앙값(median)을 사용하고
+    상식적으로 비교 의미가 없는 극단치(PER 200배 초과)는 아예 제외한다.
+    """
+    session = get_naver_session()
+    try:
+        res = session.get(f"https://m.stock.naver.com/api/stock/{code}/integration", timeout=5)
+        if res.status_code != 200:
+            return 0.0
+        peers = res.json().get('industryCompareInfo') or []
+        peer_codes = [p['itemCode'] for p in peers if p.get('itemCode')]
+
+        pers = []
+        for peer_code in peer_codes:
+            try:
+                peer_res = session.get(f"https://m.stock.naver.com/api/stock/{peer_code}/integration", timeout=5)
+                if peer_res.status_code != 200:
+                    continue
+                total_infos = {item.get('code'): item.get('value') for item in (peer_res.json().get('totalInfos') or [])}
+                per_raw = total_infos.get('per')
+                if not per_raw:
+                    continue
+                per_val = float(str(per_raw).replace(',', '').replace('배', '').strip())
+                if 0 < per_val <= 200:  # 200배 초과는 적자 근접 등으로 왜곡된 값일 가능성이 커 제외
+                    pers.append(per_val)
+            except Exception:
+                continue
+
+        if not pers:
+            return 0.0
+        pers.sort()
+        mid = len(pers) // 2
+        median_per = pers[mid] if len(pers) % 2 == 1 else (pers[mid - 1] + pers[mid]) / 2
+        return median_per
+    except Exception:
+        return 0.0
 
 @st.cache_data(ttl=86400)
 def get_stock_code_map():
@@ -1640,7 +1708,9 @@ elif menu == "퀀트 투자 리스트":
                 st.caption("※ 매출성장률은 네이버 금융에 공시된 연간 매출액 중 확인 가능한 연도들의 평균 YoY 성장률입니다 (기업별로 확인 가능한 연도 수가 다를 수 있습니다).")
 
 def calculate_stock_score(fundamentals, tech, news_list):
-    """개선된 점수 체계화 모델 (뉴스/수급 40점 + 상대 PER 10점 반영)"""
+    """개선된 점수 체계화 모델 (뉴스/수급 40 + 밸류에이션 10 + 트렌드 10 + 기술적지표 20 + 경영지표 20 = 100점)
+    반환: (총점, 뉴스/수급 점수, 밸류에이션 점수, 트렌드 점수, 기술적지표 점수, 경영지표 점수)
+    — 화면에서 이 세부 점수를 다시 계산하지 않고 그대로 재사용할 것 (중복 계산 시 총점과 어긋날 위험)"""
     
     # --------------------------------------------------
     # 1. 뉴스 및 수급 점수 체계화 (40점 만점)
@@ -1733,31 +1803,48 @@ def calculate_stock_score(fundamentals, tech, news_list):
     elif 1.5 <= fundamentals['pbr'] < 3: val_score += 2
     
     # --------------------------------------------------
-    # 3. 나머지 점수 체계 유지 (경영 20점 + 기술/트렌드 30점 = 총 50점)
+    # 3. 나머지 점수 체계 (경영 20점 + 기술/트렌드 30점 = 총 50점)
     # --------------------------------------------------
-    # 시장 트렌드 (20점)
-    trend_score = 10
-    if tech['one_month_return'] > 5: trend_score = 20
-    elif tech['one_month_return'] > 0: trend_score = 15
+    # 시장 트렌드 (10점) — 기술적 지표 비중을 늘리는 대신 절반으로 축소 (기술/트렌드 합계 30점은 유지)
+    trend_score = 5
+    if tech['one_month_return'] > 5: trend_score = 10
+    elif tech['one_month_return'] > 0: trend_score = 7
     elif tech['one_month_return'] < -10: trend_score = 0
-    
-    # 기술적 지표 (10점)
-    tech_score = 5
-    if tech['price'] > tech['sma20'] and tech['macd'] > tech['signal']: tech_score = 10
-    elif tech['rsi'] <= 40: tech_score = 8 
-    
+
+    # 기술적 지표 (20점) — "기술적 조건" 스크리너라는 이름값에 비해 배점이 지나치게 작았던 문제 개선.
+    # 이동평균 배열(8) + MACD(6) + RSI(6) — run_logical_screener의 배열40:MACD30:RSI30 비율과 동일한 취지 유지
+    tech_score = 0
+    if tech['price'] > tech['sma20'] and tech['sma20'] > tech['sma60']:
+        tech_score += 8   # 완벽 정배열
+    elif tech['sma20'] > tech['sma60']:
+        tech_score += 5   # 20/60 정배열(눌림목)
+    elif tech['price'] > tech['sma20']:
+        tech_score += 3   # 20일선 회복(반등중)
+
+    if tech['macd'] > tech['signal']:
+        tech_score += 6   # 매수 우위
+    elif tech['macd'] > 0:
+        tech_score += 2   # 조정 중(0선 위)
+
+    if tech['rsi'] <= 40:
+        tech_score += 6   # 과매도(눌림목) 매수 타점
+    elif tech['rsi'] <= 55:
+        tech_score += 4
+    elif tech['rsi'] <= 70:
+        tech_score += 2   # 70 초과 과열권은 가점 없음
+
     # 경영지표 (20점)
     mgmt_score = 0
     if fundamentals['op_margin'] >= 10: mgmt_score += 12
     elif fundamentals['op_margin'] >= 5: mgmt_score += 8
     else: mgmt_score += 4
-    
+
     if fundamentals['roe'] >= 10: mgmt_score += 8
     elif fundamentals['roe'] >= 5: mgmt_score += 5
     else: mgmt_score += 2
-    
+
     total_score = news_suqub_total + val_score + trend_score + tech_score + mgmt_score
-    return int(total_score), news_suqub_total, val_score
+    return int(total_score), news_suqub_total, val_score, trend_score, tech_score, mgmt_score
 
 if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완벽히 일치시켰습니다.
     st.subheader("🤖 개별종목분석")
@@ -1808,15 +1895,19 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                     with st.spinner(f"분석 중... ({idx+1}/{len(stock_codes)})"):
                         fundamentals = fetch_stock_name_and_fundamentals(code)
                         if fundamentals:
+                            fundamentals['sector_per'] = fetch_sector_average_per(code)
                             tech = analyze_stock_technical(code)
                             if tech:
                                 news = fetch_headlines_rss(fundamentals['name'])
-                                total_score, _, _ = calculate_stock_score(fundamentals, tech, news)
+                                total_score, _, _, _, _, _ = calculate_stock_score(fundamentals, tech, news)
                                 macd_signal = '매수' if tech['macd'] > tech['signal'] else '매도'
+                                risk_levels = compute_risk_levels(tech['price'], tech.get('atr'))
                                 analysis_results.append({
                                     "종목명": fundamentals['name'],
                                     "총점": total_score,
                                     "현재주가": f"{int(tech['price']):,}원",
+                                    "참고 손절가": f"{int(risk_levels['stop_loss']):,}원" if risk_levels else "-",
+                                    "참고 목표가": f"{int(risk_levels['target_price']):,}원" if risk_levels else "-",
                                     "영업이익률": f"{fundamentals['op_margin']}%",
                                     "ROE": f"{fundamentals['roe']}%",
                                     "PBR": f"{fundamentals['pbr']}배",
@@ -1825,12 +1916,13 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                                     "1개월수익률": f"{tech['one_month_return']:.2f}%"
                                 })
                     progress_bar.progress((idx + 1) / len(stock_codes))
-                
+
                 if analysis_results:
                     st.markdown("---")
                     st.markdown("### 📊 분석 결과")
                     df_results = pd.DataFrame(analysis_results)
                     st.dataframe(df_results, use_container_width=True)
+                    st.caption("※ 참고 손절가/목표가는 ATR(변동성) 기반 근사치입니다 (현재가 ± 2~3×ATR14). 실제 지지/저항선을 반영한 값이 아니므로 투자 판단의 참고 자료로만 활용하세요.")
 
     # ==========================================
     # Tab 2: ETF List
@@ -1924,30 +2016,19 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
             else:
                 with st.spinner("해당 종목의 펀더멘털, 차트, 수급 및 뉴스 데이터를 분석 중입니다..."):
                     fundamentals = fetch_stock_name_and_fundamentals(stock_code)
-                    
+
                     if not fundamentals:
                         st.error("종목 정보를 불러올 수 없습니다. 입력값을 확인해주세요.")
                     else:
+                        fundamentals['sector_per'] = fetch_sector_average_per(stock_code)
                         tech = analyze_stock_technical(stock_code)
                         news = fetch_headlines_rss(fundamentals['name'])
-                        
+
                         if tech is None:
                             st.error("기술적 분석을 위한 충분한 차트 데이터가 없습니다.")
                         else:
-                            total_score, news_score, val_score = calculate_stock_score(fundamentals, tech, news)
-                            
-                            trend_score = 20 if tech['one_month_return'] > 5 else (15 if tech['one_month_return'] > 0 else (0 if tech['one_month_return'] < -10 else 10))
-                            tech_score = 10 if (tech['price'] > tech['sma20'] and tech['macd'] > tech['signal']) else (8 if tech['rsi'] <= 40 else 5)
-                            
-                            mgmt_score = 0
-                            if fundamentals['op_margin'] >= 10: mgmt_score += 12
-                            elif fundamentals['op_margin'] >= 5: mgmt_score += 8
-                            else: mgmt_score += 4
-                            
-                            if fundamentals['roe'] >= 10: mgmt_score += 8
-                            elif fundamentals['roe'] >= 5: mgmt_score += 5
-                            else: mgmt_score += 2
-                            
+                            total_score, news_score, val_score, trend_score, tech_score, mgmt_score = calculate_stock_score(fundamentals, tech, news)
+
                             opinion = "매도"
                             color = "red"
                             if total_score >= 80:
@@ -1959,16 +2040,23 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                             elif total_score >= 40:
                                 opinion = "관망"
                                 color = "orange"
-                                
+
                             st.markdown("---")
                             st.markdown(f"### 📊 [{fundamentals['name']}] AI 매수 분석 결과: **:{color}[{opinion}]** (총점: {total_score}점)")
-                            
+
                             col1, col2, col3, col4 = st.columns(4)
                             col1.metric("종합 점수", f"{total_score}점")
                             col2.metric("뉴스/수급 (40)", f"{news_score}점")
                             col3.metric("경영/밸류 (30)", f"{mgmt_score + val_score}점")
                             col4.metric("기술/트렌드 (30)", f"{tech_score + trend_score}점")
                             st.caption("※ 뉴스/수급 점수는 AI가 각 뉴스 제목의 문맥을 읽고 판정한 감성(긍정/중립/부정)을 기반으로 계산됩니다. (AI 판정 실패 시 키워드 매칭 방식으로 자동 대체)")
+
+                            risk_levels = compute_risk_levels(tech['price'], tech.get('atr'))
+                            if risk_levels:
+                                r1, r2 = st.columns(2)
+                                r1.metric("📉 참고 손절가", f"{int(risk_levels['stop_loss']):,}원")
+                                r2.metric("🎯 참고 목표가", f"{int(risk_levels['target_price']):,}원")
+                                st.caption("※ ATR(변동성) 기반 근사치입니다 (현재가 − 2×ATR14 / + 3×ATR14). 실제 지지/저항선을 반영한 값이 아니므로 참고 자료로만 활용하세요.")
 
                             if GENAI_AVAILABLE:
                                 st.markdown("#### 🤖 AI 심층 투자 분석 리포트")
