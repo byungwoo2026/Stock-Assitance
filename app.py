@@ -245,7 +245,7 @@ def fetch_1month_sector_trends():
             
     # 등락률 기준으로 내림차순 정렬
     results = sorted(results, key=lambda x: x['최근1달수익률(%)'], reverse=True)
-    return results[:5]
+    return results[:5], datetime.now().strftime('%H:%M')
 
 @st.cache_data(ttl=3600)
 def fetch_top_market_cap(market_type="KOSPI", top_n=20):
@@ -256,10 +256,10 @@ def fetch_top_market_cap(market_type="KOSPI", top_n=20):
     try:
         res = get_naver_session().get(url, timeout=5)
         data = res.json()
-        return [s['stockName'] for s in data.get('stocks', [])]
+        return [s['stockName'] for s in data.get('stocks', [])], datetime.now().strftime('%H:%M')
     except Exception as e:
         st.error(f"시가총액 데이터 수집 오류: {e}")
-        return []
+        return [], datetime.now().strftime('%H:%M')
 
 @st.cache_data(ttl=3600)
 def fetch_upper_limit_stocks():
@@ -300,7 +300,7 @@ def fetch_upper_limit_stocks():
                 if (s.get('compareToPreviousPrice') or {}).get('code') == '1':
                     results[market].append(s['stockName'])
 
-    return results
+    return results, datetime.now().strftime('%H:%M')
 
 @st.cache_data(ttl=3600)
 def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10):
@@ -330,7 +330,7 @@ def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10)
                         stocks.append(name)
                     if len(stocks) >= top_n:
                         break
-            return stocks
+            return stocks, datetime.now().strftime('%H:%M')
 
         # 표 구조가 예상과 다르면(방어적 처리), 페이지 전체에서 종목 링크만 모아 상위 top_n개 사용
         stocks = []
@@ -342,9 +342,9 @@ def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10)
                     stocks.append(name)
                 if len(stocks) >= top_n:
                     break
-        return stocks
+        return stocks, datetime.now().strftime('%H:%M')
     except Exception:
-        return []
+        return [], datetime.now().strftime('%H:%M')
 
 # 최우수 애널리스트 추천 종목 필터 기준 (코드에 고정된 값 — 매경 순위가 바뀌면 아래 두 값을 함께 수동 갱신해야 함)
 ANALYST_RANKING_BASIS = "매일경제 베스트 애널리스트 종합평가(리서치센터 부문) 최상위 5개사 기준"
@@ -412,9 +412,9 @@ def fetch_top_analyst_recommendations():
                 if i < len(broker_results[bc]):
                     results.append(broker_results[bc][i])
 
-        return results
+        return results, datetime.now().strftime('%H:%M')
     except Exception:
-        return []
+        return [], datetime.now().strftime('%H:%M')
 
 @st.cache_data(ttl=3600)
 def run_logical_screener():
@@ -438,7 +438,7 @@ def run_logical_screener():
         pool.sort(key=lambda s: int(s.get('accumulatedTradingValueRaw') or 0), reverse=True)
         stocks = [{'code': s['itemCode'], 'name': s['stockName']} for s in pool[:100]]
     except Exception:
-        return []
+        return [], datetime.now().strftime('%H:%M')
 
     scored_stocks = []
     
@@ -529,7 +529,7 @@ def run_logical_screener():
             
     # 점수 높은 순으로 정렬 후 상위 20개 추출
     scored_stocks = sorted(scored_stocks, key=lambda x: x['타점 점수'], reverse=True)
-    return scored_stocks[:20]
+    return scored_stocks[:20], datetime.now().strftime('%H:%M')
 
 @st.cache_data(ttl=60)
 def fetch_stock_name_and_fundamentals(code):
@@ -920,16 +920,25 @@ def add_quant_composite_score(df):
 @st.cache_data(ttl=1800)
 def build_quant_filter_candidates(market_cap_min=0, included_sector="", max_scan=150):
     """실제 시가총액/업종 데이터로 먼저 후보를 좁힌 뒤, 그 안에서만 개별 페이지를 스캔하여 펀더멘털·모멘텀을 수집하고
-    멀티팩터 종합점수까지 계산합니다. 가치재평가주·퀀트 투자 리스트 두 메뉴가 공유하는 단일 스캔 파이프라인."""
+    멀티팩터 종합점수까지 계산합니다. 가치재평가주·퀀트 투자 리스트 두 메뉴가 공유하는 단일 스캔 파이프라인.
+
+    반환: (결과 DataFrame, 계산 시각, 상태코드). 상태코드는 빈 결과의 원인을 구분해 화면에 정확한 안내를
+    띄우기 위함 — "ok"=정상, "universe_failed"=시가총액 데이터 수집 자체가 실패(네트워크 문제, 재시도 유도),
+    "no_candidates"=시가총액/업종 조건을 통과하는 종목이 아예 없음(조건 완화 유도),
+    "fundamentals_failed"=후보는 있었지만 펀더멘털 조회가 전부 실패(일시적 API 문제, 재시도 유도)."""
+    ts = datetime.now().strftime('%H:%M')
     universe = fetch_market_universe()
     if universe.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), ts, "universe_failed"
 
     candidates = universe.copy()
     if market_cap_min and market_cap_min > 0:
         candidates = candidates[candidates['시가총액(억원)'] >= market_cap_min]
     if included_sector:
         candidates = candidates[candidates['Sector'].astype(str).str.contains(included_sector, case=False, na=False)]
+
+    if candidates.empty:
+        return pd.DataFrame(), ts, "no_candidates"
 
     # 스캔 부하를 제한하기 위해 (필터 통과 종목 중) 시가총액 상위 max_scan개까지만 실제 조회
     candidates = candidates.sort_values('시가총액(억원)', ascending=False).head(max_scan)
@@ -958,8 +967,19 @@ def build_quant_filter_candidates(market_cap_min=0, included_sector="", max_scan
         })
     df = pd.DataFrame(rows)
     if df.empty:
-        return df
-    return add_quant_composite_score(df)
+        return df, ts, "fundamentals_failed"
+    return add_quant_composite_score(df), ts, "ok"
+
+QUANT_SCAN_STATUS_MESSAGES = {
+    "universe_failed": ("error", "시가총액 데이터를 불러오지 못했습니다. 네트워크 문제일 수 있으니 잠시 후 다시 시도해주세요."),
+    "no_candidates": ("warning", "설정한 시가총액/업종 조건에 맞는 종목이 없습니다. 조건을 완화해보세요."),
+    "fundamentals_failed": ("warning", "종목 데이터 조회에 실패했습니다. 일시적인 문제일 수 있으니 잠시 후 다시 시도해주세요."),
+}
+
+def render_quant_scan_status(status):
+    """build_quant_filter_candidates의 빈 결과 상태코드에 맞는 안내 메시지 표시 (원인별로 사용자의 다음 행동이 다르므로 구분)"""
+    kind, msg = QUANT_SCAN_STATUS_MESSAGES.get(status, ("warning", "조건에 맞는 종목을 찾지 못했거나 데이터를 불러오지 못했습니다."))
+    getattr(st, kind)(msg)
 
 @st.cache_data(ttl=1800)
 def compute_price_correlation(codes, names):
@@ -1080,6 +1100,12 @@ def get_individual_stock_ai_analysis(fundamentals, tech, news_list):
         return content
     return f"⚠️ AI 분석 리포트 생성 중 오류가 발생했습니다: {content}"
 
+def render_data_ts_caption(ts, cache_minutes=None):
+    """캐시된 데이터의 실제 계산 시각 캡션. 캐시 히트 시에도 처음 계산된 시각이 그대로 표시되어,
+    화면이 "방금 조회한 데이터"처럼 보이지만 실제로는 최대 cache_minutes분 전 데이터일 수 있음을 안내."""
+    cache_note = f" (최대 {cache_minutes}분 캐시)" if cache_minutes else ""
+    st.caption(f"⏱ {ts} 기준 데이터{cache_note}")
+
 @st.cache_data(ttl=600)  # 10분 캐싱 (등락 확인 목적이라 지수 캐싱(5분)보단 조금 여유있게)
 def fetch_semiconductor_snapshot():
     """반도체 대표 종목(업종 ETF + 삼성전자 + SK하이닉스)의 당일 등락 정보를 수집"""
@@ -1100,7 +1126,7 @@ def fetch_semiconductor_snapshot():
                 results[name] = {"price": last_close, "change": change_pct}
         except Exception:
             continue
-    return results
+    return results, datetime.now().strftime('%H:%M')
 
 def fetch_multi_angle_news(queries, per_query=4, max_total=8, period="7d"):
     """여러 키워드로 나눠 뉴스를 조회한 뒤 제목 기준 중복을 제거해 하나의 리스트로 합침
@@ -1198,8 +1224,8 @@ def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
     market_news = fetch_headlines_rss("코스피 코스닥 증시", period="1d")
     sentiment_counts = summarize_news_sentiment(market_news)
     # 시황 브리핑에 실제 수급 방향(외국인/기관 순매수)을 정량 근거로 반영
-    foreign_top = fetch_net_buying_top("foreign", "KOSPI", 5)
-    institution_top = fetch_net_buying_top("institution", "KOSPI", 5)
+    foreign_top, _ = fetch_net_buying_top("foreign", "KOSPI", 5)
+    institution_top, _ = fetch_net_buying_top("institution", "KOSPI", 5)
     meta = {"ts": ts, "sentiment": sentiment_counts, "foreign_top": foreign_top, "institution_top": institution_top}
 
     sectors_text = "\n".join([f"- {s['업종/테마']}: {s['변동']}" for s in top_sectors]) if top_sectors else "업종 정보 없음"
@@ -1291,9 +1317,9 @@ def classify_news_sentiment_ai(news_list):
 @st.cache_data(ttl=1800)
 def fetch_etf_market_data():
     try:
-        return fdr.StockListing('ETF/KR')
+        return fdr.StockListing('ETF/KR'), datetime.now().strftime('%H:%M')
     except Exception:
-        return pd.DataFrame()
+        return pd.DataFrame(), datetime.now().strftime('%H:%M')
 
 def _annualized_volatility(closes):
     """최근 최대 20거래일 일간수익률의 표준편차를 연율화(연 252거래일 가정)한 변동성(%)."""
@@ -1544,12 +1570,13 @@ if menu == "종합 대시보드":
     # 반도체 대표 종목 당일 등락 스냅샷
     st.markdown("#### 🔧 반도체 대표 종목 당일 등락")
     with st.spinner("반도체 대표 종목 시세를 수집 중입니다..."):
-        semi_data = fetch_semiconductor_snapshot()
+        semi_data, semi_ts = fetch_semiconductor_snapshot()
     if semi_data:
         semi_cols = st.columns(len(semi_data))
         for s_col, (name, d) in zip(semi_cols, semi_data.items()):
             with s_col:
                 st.metric(label=name, value=f"{d['price']:,.0f}원", delta=f"{d['change']:+.2f}%")
+        render_data_ts_caption(semi_ts, cache_minutes=10)
     else:
         st.warning("반도체 데이터를 불러오지 못했습니다.")
 
@@ -1573,10 +1600,11 @@ if menu == "종합 대시보드":
     col1, col2 = st.columns(2)
     with col1:
         st.info("🔥 최근 1달 자금 유입 TOP 5 업종")
-        top_sectors = fetch_1month_sector_trends()
+        top_sectors, sectors_ts = fetch_1month_sector_trends()
         if top_sectors:
             for idx, sector in enumerate(top_sectors, 1):
                 st.write(f"{idx}. {sector['업종/테마']} ({sector['변동']})")
+            render_data_ts_caption(sectors_ts, cache_minutes=60)
         else:
             st.warning("데이터를 불러오지 못했습니다.")
     with col2:
@@ -1610,12 +1638,13 @@ elif menu == "시장 자금 & 업종 분석":
     with tab1:
         st.write("각 산업 섹터를 대표하는 주요 ETF들의 최근 22영업일(약 1개월) 추세를 바탕으로 단기 노이즈를 배제한 진짜 자금 유입 업종을 분석합니다.")
         with st.spinner("최근 1달간의 업종별 트렌드를 분석 중입니다..."):
-            top_sectors = fetch_1month_sector_trends()
-            
+            top_sectors, sectors_ts = fetch_1month_sector_trends()
+
             if top_sectors:
                 df_sectors = pd.DataFrame(top_sectors)
                 df_sectors.index = range(1, len(df_sectors) + 1)
                 st.dataframe(df_sectors[['업종/테마', '변동']], width='stretch')
+                render_data_ts_caption(sectors_ts, cache_minutes=60)
             else:
                 st.error("업종 데이터를 불러오는 데 실패했습니다.")
             
@@ -1635,9 +1664,9 @@ elif menu == "시장 자금 & 업종 분석":
                 kpi_type = "foreign" if kospi_investor == "외국인" else "institution"
                 kdq_type = "foreign" if kosdaq_investor == "외국인" else "institution"
                 
-                kpi_stocks = fetch_net_buying_top(kpi_type, "KOSPI", 10)
-                kdq_stocks = fetch_net_buying_top(kdq_type, "KOSDAQ", 10)
-                
+                kpi_stocks, kpi_ts = fetch_net_buying_top(kpi_type, "KOSPI", 10)
+                kdq_stocks, kdq_ts = fetch_net_buying_top(kdq_type, "KOSDAQ", 10)
+
                 st.markdown("---")
                 c1, c2 = st.columns(2)
                 with c1:
@@ -1648,7 +1677,9 @@ elif menu == "시장 자금 & 업종 분석":
                         link = news[0]['link'] if news else "#"
                         st.markdown(f"**{idx}. {stock}**\n- 🔍 **매수 사유 분석**: [{reason}]({link})")
                         st.write("")
-                        
+                    if kpi_stocks:
+                        render_data_ts_caption(kpi_ts, cache_minutes=60)
+
                 with c2:
                     st.success(f"코스닥 {kosdaq_investor} 집중 매수 상위 10선")
                     for idx, stock in enumerate(kdq_stocks, 1):
@@ -1657,6 +1688,8 @@ elif menu == "시장 자금 & 업종 분석":
                         link = news[0]['link'] if news else "#"
                         st.markdown(f"**{idx}. {stock}**\n- 🔍 **매수 사유 분석**: [{reason}]({link})")
                         st.write("")
+                    if kdq_stocks:
+                        render_data_ts_caption(kdq_ts, cache_minutes=60)
 
 elif menu == "주요 기업 헤드라인 뉴스":
     st.subheader("📰 시총 상위 기업 및 상한가 종목 헤드라인")
@@ -1670,11 +1703,12 @@ elif menu == "주요 기업 헤드라인 뉴스":
         
         with st.spinner("시가총액 상위 기업 목록을 불러오는 중..."):
             if "코스피" in market_choice:
-                companies = fetch_top_market_cap("KOSPI", 20)
+                companies, companies_ts = fetch_top_market_cap("KOSPI", 20)
             else:
-                companies = fetch_top_market_cap("KOSDAQ", 10)
-                
+                companies, companies_ts = fetch_top_market_cap("KOSDAQ", 10)
+
         if companies:
+            render_data_ts_caption(companies_ts, cache_minutes=60)
             selected_company = st.selectbox("🎯 실시간 뉴스 브리핑을 보고 싶은 기업을 선택하세요:", companies)
             search_button = st.button(f"{selected_company} 뉴스 검색")
 
@@ -1709,8 +1743,9 @@ elif menu == "주요 기업 헤드라인 뉴스":
         
         if st.button("상한가 종목 및 이슈 분석 시작"):
             with st.spinner("상한가 종목 데이터와 관련 이슈를 분석 중입니다..."):
-                upper_stocks = fetch_upper_limit_stocks()
-                
+                upper_stocks, upper_ts = fetch_upper_limit_stocks()
+                render_data_ts_caption(upper_ts, cache_minutes=60)
+
                 st.markdown("#### 🔵 코스피 상한가 종목")
                 if upper_stocks["KOSPI"]:
                     for stock in upper_stocks["KOSPI"]:
@@ -1720,7 +1755,7 @@ elif menu == "주요 기업 헤드라인 뉴스":
                         st.markdown(f"- **{stock}** : [{issue_title}]({issue_link})")
                 else:
                     st.info("코스피 상한가 종목이 없습니다.")
-                    
+
                 st.markdown("#### 🔴 코스닥 상한가 종목")
                 if upper_stocks["KOSDAQ"]:
                     for stock in upper_stocks["KOSDAQ"]:
@@ -1747,13 +1782,14 @@ elif menu == "외인 수급 & 기술적 조건 스크리너":
     
     if search_btn:
         with st.spinner("시장 주도주 100개의 데이터를 수집하고 기술적 타점 점수를 계산 중입니다. (약 10~20초 소요)..."):
-            screener_results = run_logical_screener()
-            
+            screener_results, screener_ts = run_logical_screener()
+
         if screener_results:
             st.success(f"현재 시장에서 가장 기술적 타점이 우수한 상위 {len(screener_results)}개 종목입니다!")
             df_screen = pd.DataFrame(screener_results)
             df_screen.index = range(1, len(df_screen) + 1)
             st.dataframe(df_screen, width='stretch')
+            render_data_ts_caption(screener_ts, cache_minutes=60)
         else:
             st.warning("데이터를 수집하는 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요.")
 
@@ -1771,12 +1807,13 @@ elif menu == "최우수 애널리스트 추천 종목":
     st.markdown("---")
     
     with st.spinner("최우수 리서치센터의 최근 추천 리포트를 수집 중입니다... (증권사에 따라 최대 60페이지까지 조회하여 다소 시간이 걸릴 수 있습니다)"):
-        recom_list = fetch_top_analyst_recommendations()
-        
+        recom_list, recom_ts = fetch_top_analyst_recommendations()
+
     if recom_list:
         st.success("매경 베스트 리서치센터 최상위 증권사들이 발간한 핵심 추천 종목입니다.")
         st.caption("※ 특정 증권사가 결과를 독점하지 않도록, 5개 증권사별 최근 리포트를 최대 4건씩 균형 있게 표시합니다.")
         st.caption("※ 증권사에 따라 네이버 금융에 리포트가 게시되는 빈도가 달라, 일부 증권사는 이번 조회에서 적게 나오거나 안 나올 수 있습니다.")
+        render_data_ts_caption(recom_ts, cache_minutes=60)
         df_recom = pd.DataFrame(recom_list)
         df_recom.index = range(1, len(df_recom) + 1)
         
@@ -1805,12 +1842,16 @@ elif menu == "가치재평가주":
 
     if run_value_scan:
         with st.spinner(f"시가총액 상위 {scan_size}개 종목의 PBR/영업이익률/매출액/모멘텀 데이터를 실시간 조회 중입니다..."):
-            st.session_state['value_scan_df'] = build_quant_filter_candidates(market_cap_min=0, included_sector="", max_scan=scan_size)
+            df_result, scan_ts, scan_status = build_quant_filter_candidates(market_cap_min=0, included_sector="", max_scan=scan_size)
+            st.session_state['value_scan_df'] = df_result
+            st.session_state['value_scan_ts'] = scan_ts
+            st.session_state['value_scan_status'] = scan_status
             st.session_state['value_scan_size'] = scan_size
 
     if st.session_state.get('value_scan_df') is not None and not st.session_state['value_scan_df'].empty:
         df_scan = st.session_state['value_scan_df']
         scanned_n = st.session_state.get('value_scan_size', scan_size)
+        render_data_ts_caption(st.session_state.get('value_scan_ts'), cache_minutes=30)
 
         tab1, tab2, tab3, tab4 = st.tabs([
             "📉 1. 저 PBR 종목 (상위 20선)", "💰 2. 고수익성 종목 (영업이익률 평균 상위)",
@@ -1861,6 +1902,8 @@ elif menu == "가치재평가주":
                 st.dataframe(display, hide_index=True, use_container_width=True)
                 st.markdown("---")
                 render_portfolio_correlation(top_score, key_prefix="value_score")
+    elif st.session_state.get('value_scan_df') is not None:
+        render_quant_scan_status(st.session_state.get('value_scan_status'))
     else:
         st.info("위 '실시간 스캔 시작' 버튼을 눌러 조회를 시작하세요.")
 
@@ -1904,15 +1947,16 @@ elif menu == "퀀트 투자 리스트":
 
     if run_scan:
         with st.spinner(f"시가총액/업종 조건으로 후보를 추린 뒤 상위 {max_scan}개 종목의 펀더멘털을 실시간 조회 중입니다..."):
-            df_candidates = build_quant_filter_candidates(
+            df_candidates, scan_ts, scan_status = build_quant_filter_candidates(
                 market_cap_min=market_cap_min,
                 included_sector=included_sector,
                 max_scan=max_scan,
             )
 
         if df_candidates.empty:
-            st.warning("조건에 맞는 종목을 찾지 못했거나 데이터를 불러오지 못했습니다. 조건을 완화하거나 잠시 후 다시 시도해주세요.")
+            render_quant_scan_status(scan_status)
         else:
+            render_data_ts_caption(scan_ts, cache_minutes=30)
             df_candidates = df_candidates.dropna(subset=["PER", "PBR", "ROE", "영업이익률"]).copy()
             mask = (
                 (df_candidates["PER"] > 0) &
@@ -2168,11 +2212,12 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
         st.write("시장 내 거래량, 수익률, 신규 상장 트렌드를 분석하여 상위 10선 리스트를 제공합니다.")
         
         with st.spinner("ETF 시장 트렌드 데이터를 수집 중입니다..."):
-            df_etf = fetch_etf_market_data()
-            
+            df_etf, etf_ts = fetch_etf_market_data()
+
         if df_etf.empty:
             st.error("ETF 데이터를 불러올 수 없습니다. 잠시 후 다시 시도해주세요.")
         else:
+            render_data_ts_caption(etf_ts, cache_minutes=30)
             col1, col2, col3 = st.columns(3)
             
             with col1:
