@@ -917,6 +917,13 @@ def add_quant_composite_score(df):
     df['종합점수'] = (df['가치점수'] + df['품질점수'] + df['성장점수'] + df['모멘텀점수']) / 4
     return df
 
+def _format_market_cap(x):
+    """시가총액(억원 단위 숫자)을 억원/조원 단위 문자열로 변환 (소수점 1자리로 통일)"""
+    if pd.isna(x):
+        return "-"
+    x = float(x)
+    return f"{x:,.1f}억 원" if x < 10000 else f"{x/10000:.1f}조 원"
+
 @st.cache_data(ttl=1800)
 def build_quant_filter_candidates(market_cap_min=0, included_sector="", max_scan=150):
     """실제 시가총액/업종 데이터로 먼저 후보를 좁힌 뒤, 그 안에서만 개별 페이지를 스캔하여 펀더멘털·모멘텀을 수집하고
@@ -1864,7 +1871,9 @@ elif menu == "가치재평가주":
             if low_pbr.empty:
                 st.warning("조건에 맞는 종목을 찾지 못했습니다.")
             else:
-                st.dataframe(low_pbr[['종목명', '종목코드', 'PBR', '시가총액', '업종']], hide_index=True, use_container_width=True)
+                display = low_pbr[['종목명', '종목코드', 'PBR', '시가총액', '업종']].copy()
+                display['시가총액'] = display['시가총액'].apply(_format_market_cap)
+                st.dataframe(display, hide_index=True, use_container_width=True)
                 st.caption(f"※ 시가총액 상위 {scanned_n}개 종목 중 PBR이 0보다 크면서 가장 낮은 순")
 
         with tab2:
@@ -1875,6 +1884,7 @@ elif menu == "가치재평가주":
             else:
                 display = high_margin[['종목명', '종목코드', '영업이익률평균', '영업이익률_확인연도수', '시가총액', '업종']].copy()
                 display['영업이익률평균'] = display['영업이익률평균'].apply(lambda x: f"{x:.2f}%")
+                display['시가총액'] = display['시가총액'].apply(_format_market_cap)
                 st.dataframe(display, hide_index=True, use_container_width=True)
                 st.caption("※ '영업이익률_확인연도수'는 네이버 금융에 공시된 연간 실적 중 실제로 확인 가능했던 연도 수입니다(기업마다 상이할 수 있음).")
 
@@ -1886,6 +1896,7 @@ elif menu == "가치재평가주":
             else:
                 display = high_growth[['종목명', '종목코드', '매출성장률', '매출성장률_확인연도수', '시가총액', '업종']].copy()
                 display['매출성장률'] = display['매출성장률'].apply(lambda x: f"{x:+.2f}%")
+                display['시가총액'] = display['시가총액'].apply(_format_market_cap)
                 st.dataframe(display, hide_index=True, use_container_width=True)
                 st.caption("※ '매출성장률_확인연도수'는 평균 계산에 사용된 연도별 YoY 성장률 개수입니다(기업마다 상이할 수 있음).")
 
@@ -1899,6 +1910,7 @@ elif menu == "가치재평가주":
                 display = top_score[['종목명', '종목코드', '종합점수', '가치점수', '품질점수', '성장점수', '모멘텀점수', '시가총액', '업종']].copy()
                 for col in ['종합점수', '가치점수', '품질점수', '성장점수', '모멘텀점수']:
                     display[col] = display[col].round(1)
+                display['시가총액'] = display['시가총액'].apply(_format_market_cap)
                 st.dataframe(display, hide_index=True, use_container_width=True)
                 st.markdown("---")
                 render_portfolio_correlation(top_score, key_prefix="value_score")
@@ -1980,6 +1992,7 @@ elif menu == "퀀트 투자 리스트":
                 st.success(f"조건에 맞는 종목 리스트 (시가총액 상위 {max_scan}개 종목 중 스캔)")
                 display = filtered[["종목명", "종목코드", "종합점수", "PER", "PBR", "ROE", "영업이익률", "매출성장률", "모멘텀", "시가총액", "업종"]].copy()
                 display["종합점수"] = display["종합점수"].round(1)
+                display["시가총액"] = display["시가총액"].apply(_format_market_cap)
                 st.dataframe(display, hide_index=True, use_container_width=True)
                 st.caption(f"적용 조건: PER ≤ {per_limit}, PBR ≤ {pbr_limit}, ROE ≥ {roe_min}%, 영업이익률 ≥ {op_margin_min}%, 매출성장률 ≥ {revenue_growth_min}%, 모멘텀 ≥ {momentum_min}%(매출성장률·모멘텀은 데이터 없는 종목은 통과), 시가총액 ≥ {market_cap_min}억, 업종 키워드: {included_sector or '전체'}")
                 st.caption("※ 매출성장률은 네이버 금융에 공시된 연간 매출액 중 확인 가능한 연도들의 평균 YoY 성장률, 모멘텀은 최근 1개월 가격 수익률입니다. 종합점수는 이번 스캔 대상 안에서의 가치·품질·성장·모멘텀 상대 순위를 25점씩 가중합산한 값(0~100)입니다.")
