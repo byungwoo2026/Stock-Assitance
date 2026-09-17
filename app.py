@@ -537,6 +537,57 @@ def compute_technical_score_at_row(row):
 
     return score, trend_str, macd_str
 
+def rsi_signal_label(rsi):
+    """RSI 값을 매수/매도 판단 참고용 문구로 변환. compute_technical_score_at_row의 배점 구간과 동일 기준(≤40/≤55/≤70)."""
+    if rsi <= 40: return "과매도·매수 관심"
+    elif rsi <= 55: return "중립·매수 우호"
+    elif rsi <= 70: return "중립·과열 주의"
+    else: return "과매수·차익실현 고려"
+
+def bb_signal_label(bb_pct_b):
+    """볼린저밴드 %B 값을 매수/매도 판단 참고용 문구로 변환 (0=하단밴드, 1=상단밴드)."""
+    if bb_pct_b <= 0.2: return "하단권·매수 관심"
+    elif bb_pct_b <= 0.8: return "중립"
+    else: return "상단권·과열 주의"
+
+def stoch_signal_label(stoch_k):
+    """스토캐스틱 %K 값을 매수/매도 판단 참고용 문구로 변환."""
+    if stoch_k <= 20: return "과매도·매수 관심"
+    elif stoch_k <= 80: return "중립"
+    else: return "과매수·과열 주의"
+
+def _parse_investor_qty(value):
+    """네이버 API의 '+1,660,246' 형태 순매수 수량 문자열을 정수로 변환."""
+    try:
+        return int(str(value).replace(',', ''))
+    except (TypeError, ValueError):
+        return 0
+
+def compute_investor_streak_label(deal_trend_infos):
+    """일별 외국인/기관 순매수 수량(0번째=최근일)으로부터 연속 매수/매도 상태를 사람이 읽는 문구로 변환.
+    네이버 integration API가 최근 5거래일치만 제공해 표시 가능한 연속일수는 최대 5일로 제한됨."""
+    if not deal_trend_infos:
+        return "수급 데이터 없음"
+
+    def streak_text(label, key):
+        values = [_parse_investor_qty(d.get(key)) for d in deal_trend_infos]
+        if not values or values[0] == 0:
+            return None
+        buying = values[0] > 0
+        streak = 0
+        for v in values:
+            if v == 0 or (v > 0) != buying:
+                break
+            streak += 1
+        direction = "매수" if buying else "매도"
+        return f"{label} {streak}일 연속 {direction}" if streak >= 2 else f"{label} 당일 {direction}"
+
+    parts = [t for t in (
+        streak_text("외국인", "foreignerPureBuyQuant"),
+        streak_text("기관", "organPureBuyQuant"),
+    ) if t]
+    return " · ".join(parts) if parts else "뚜렷한 수급 신호 없음"
+
 @st.cache_data(ttl=3600)
 def run_logical_screener():
     """
@@ -580,23 +631,41 @@ def run_logical_screener():
             score, trend_str, macd_str = compute_technical_score_at_row(last)
 
             scored_stocks.append({
+                "_code": s['code'],
                 "종목명": s['name'],
                 "타점 점수": int(score),
                 "배열 상태": trend_str,
                 "MACD 신호": macd_str,
-                "RSI 지수": round(last['RSI'], 2),
-                "볼린저밴드": f"{last['BB_PCT_B']:.2f}" if pd.notna(last['BB_PCT_B']) else "-",
-                "스토캐스틱(%K)": f"{last['STOCH_K']:.1f}" if pd.notna(last['STOCH_K']) else "-",
+                "RSI 지수": f"{last['RSI']:.1f} ({rsi_signal_label(last['RSI'])})" if pd.notna(last['RSI']) else "-",
+                "볼린저밴드(%B)": f"{last['BB_PCT_B']:.2f} ({bb_signal_label(last['BB_PCT_B'])})" if pd.notna(last['BB_PCT_B']) else "-",
+                "스토캐스틱(%K)": f"{last['STOCH_K']:.1f} ({stoch_signal_label(last['STOCH_K'])})" if pd.notna(last['STOCH_K']) else "-",
                 "주간추세": last['WEEKLY_TREND'] if pd.notna(last['WEEKLY_TREND']) else "-",
                 "현재가": f"{int(last['close']):,}",
-                "주요 수급": "시장 주도주(Top 100)"
             })
         except Exception:
             continue
-            
+
     # 점수 높은 순으로 정렬 후 상위 20개 추출
-    scored_stocks = sorted(scored_stocks, key=lambda x: x['타점 점수'], reverse=True)
-    return scored_stocks[:20], now_kst().strftime('%H:%M')
+    scored_stocks = sorted(scored_stocks, key=lambda x: x['타점 점수'], reverse=True)[:20]
+
+    # 최종 20개만 대상으로 외국인/기관 연속 순매수·순매도 여부를 조회 (100개 전체 조회 시 응답 지연이 커져 상위권만 확인)
+    from concurrent.futures import ThreadPoolExecutor
+
+    def _fetch_deal_trend(code):
+        try:
+            res = get_naver_session().get(f"https://m.stock.naver.com/api/stock/{code}/integration", timeout=5)
+            return res.json().get('dealTrendInfos') or []
+        except Exception:
+            return []
+
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        deal_trends = list(executor.map(_fetch_deal_trend, [s['_code'] for s in scored_stocks]))
+
+    for s, deal_trend in zip(scored_stocks, deal_trends):
+        s['주요 수급'] = compute_investor_streak_label(deal_trend)
+        del s['_code']
+
+    return scored_stocks, now_kst().strftime('%H:%M')
 
 @st.cache_data(ttl=3600)
 def backtest_technical_signal(code, threshold=70, holding_days=20, lookback_years=3):
@@ -1903,12 +1972,25 @@ elif menu == "외인 수급 & 기술적 조건 스크리너":
         점수가 가장 높은 **상위 20개 종목을 각 지표 상태와 함께 리스트업**하여, 투자자가 데이터를 직접 보고 최적의 매수/매도 시점을 검증 및 판단할 수 있도록 고도화했습니다.
         """)
 
+        with st.expander("📖 지표 해석 가이드 (RSI·볼린저밴드·스토캐스틱·주요 수급 보는 법)"):
+            st.markdown("""
+| 지표 | 정의 | 매수 관심 구간 | 중립 구간 | 매도/주의 구간 |
+|---|---|---|---|---|
+| **RSI (14)** | 최근 상승폭 대비 하락폭 비율(0~100). 낮을수록 많이 팔려 저평가된 상태 | 40 이하 (과매도) | 40~70 | 70 초과 (과매수, 차익실현 고려) |
+| **볼린저밴드 %B** | 현재가가 20일 이동평균 밴드(±2표준편차) 내 어디쯤인지(0=하단, 1=상단) | 0.2 이하 (하단권) | 0.2~0.8 | 0.8 초과 (상단권, 과열 주의) |
+| **스토캐스틱 %K** | 최근 14일 고가·저가 범위 대비 현재가 위치(0~100) | 20 이하 (과매도) | 20~80 | 80 초과 (과매수) |
+
+- 표에 표시되는 값 뒤 괄호가 위 기준에 따른 신호이며, 세 지표 모두 "매수 관심"에 가까울수록 눌림목/저점 매수 관점에서, "과열/주의"에 가까울수록 단기 차익실현 관점에서 참고하시면 됩니다.
+- 다만 개별 지표 하나만으로 매매를 판단하지 말고, **타점 점수(6개 지표 종합)·MACD 신호·배열 상태**를 함께 확인하세요. 예: RSI가 과매도라도 정배열이 무너진 하락 추세면 "떨어지는 칼날"일 수 있습니다.
+- **주요 수급**: 외국인·기관의 최근 순매수/순매도 방향이 며칠째 이어지고 있는지 표시합니다 (예: "외국인 5일 연속 매수"). 네이버 API 특성상 최근 5거래일까지만 확인 가능해, 5일 연속으로 표시되어도 실제로는 더 오래 지속됐을 수 있습니다.
+            """)
+
         st.markdown("---")
 
         search_btn = st.button("🚀 실시간 타점 랭킹 분석 시작")
 
         if search_btn:
-            with st.spinner("시장 주도주 100개의 데이터를 수집하고 기술적 타점 점수를 계산 중입니다. (약 10~20초 소요)..."):
+            with st.spinner("시장 주도주 100개의 데이터를 수집하고 기술적 타점 점수·수급 동향을 계산 중입니다. (약 10~20초 소요)..."):
                 screener_results, screener_ts = run_logical_screener()
 
             if screener_results:
