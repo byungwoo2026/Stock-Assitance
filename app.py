@@ -4,7 +4,7 @@ import FinanceDataReader as fdr
 import requests
 from bs4 import BeautifulSoup
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 import xml.etree.ElementTree as ET
 import json
@@ -15,6 +15,12 @@ try:
     GENAI_AVAILABLE = True
 except ImportError:
     GENAI_AVAILABLE = False
+
+KST = timezone(timedelta(hours=9))
+
+def now_kst():
+    """배포 서버(Streamlit Cloud 등)가 UTC로 동작해도 항상 한국 시간을 반환."""
+    return datetime.now(KST)
 
 # Groq가 특정 모델을 예고 없이 단종시킨 전례가 있어(예: llama-3.3-70b-versatile),
 # 최우선 모델이 실패하면 다음 모델로 자동 전환. 가끔 갱신이 필요할 수 있음(2026-09-16 기준 확인).
@@ -220,7 +226,7 @@ def fetch_1month_sector_trends():
     
     results = []
     # 영업일 기준 22일(약 1달)을 확보하기 위해 약 45일 전 데이터부터 조회
-    start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+    start_date = (now_kst() - timedelta(days=45)).strftime('%Y-%m-%d')
     
     for sector, symbol in sector_etfs.items():
         try:
@@ -245,7 +251,7 @@ def fetch_1month_sector_trends():
             
     # 등락률 기준으로 내림차순 정렬
     results = sorted(results, key=lambda x: x['최근1달수익률(%)'], reverse=True)
-    return results[:5], datetime.now().strftime('%H:%M')
+    return results[:5], now_kst().strftime('%H:%M')
 
 @st.cache_data(ttl=3600)
 def fetch_top_market_cap(market_type="KOSPI", top_n=20):
@@ -256,10 +262,10 @@ def fetch_top_market_cap(market_type="KOSPI", top_n=20):
     try:
         res = get_naver_session().get(url, timeout=5)
         data = res.json()
-        return [s['stockName'] for s in data.get('stocks', [])], datetime.now().strftime('%H:%M')
+        return [s['stockName'] for s in data.get('stocks', [])], now_kst().strftime('%H:%M')
     except Exception as e:
         st.error(f"시가총액 데이터 수집 오류: {e}")
-        return [], datetime.now().strftime('%H:%M')
+        return [], now_kst().strftime('%H:%M')
 
 @st.cache_data(ttl=3600)
 def fetch_upper_limit_stocks():
@@ -300,7 +306,7 @@ def fetch_upper_limit_stocks():
                 if (s.get('compareToPreviousPrice') or {}).get('code') == '1':
                     results[market].append(s['stockName'])
 
-    return results, datetime.now().strftime('%H:%M')
+    return results, now_kst().strftime('%H:%M')
 
 @st.cache_data(ttl=3600)
 def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10):
@@ -330,7 +336,7 @@ def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10)
                         stocks.append(name)
                     if len(stocks) >= top_n:
                         break
-            return stocks, datetime.now().strftime('%H:%M')
+            return stocks, now_kst().strftime('%H:%M')
 
         # 표 구조가 예상과 다르면(방어적 처리), 페이지 전체에서 종목 링크만 모아 상위 top_n개 사용
         stocks = []
@@ -342,9 +348,9 @@ def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10)
                     stocks.append(name)
                 if len(stocks) >= top_n:
                     break
-        return stocks, datetime.now().strftime('%H:%M')
+        return stocks, now_kst().strftime('%H:%M')
     except Exception:
-        return [], datetime.now().strftime('%H:%M')
+        return [], now_kst().strftime('%H:%M')
 
 # 최우수 애널리스트 추천 종목 필터 기준 (코드에 고정된 값 — 매경 순위가 바뀌면 아래 두 값을 함께 수동 갱신해야 함)
 ANALYST_RANKING_BASIS = "매일경제 베스트 애널리스트 종합평가(리서치센터 부문) 최상위 5개사 기준"
@@ -412,9 +418,9 @@ def fetch_top_analyst_recommendations():
                 if i < len(broker_results[bc]):
                     results.append(broker_results[bc][i])
 
-        return results, datetime.now().strftime('%H:%M')
+        return results, now_kst().strftime('%H:%M')
     except Exception:
-        return [], datetime.now().strftime('%H:%M')
+        return [], now_kst().strftime('%H:%M')
 
 def compute_technical_indicators(df_fdr):
     """일봉 OHLCV(fdr.DataReader 원본 — 날짜 DatetimeIndex, High/Low/Close/Volume 포함)에
@@ -553,12 +559,12 @@ def run_logical_screener():
         pool.sort(key=lambda s: int(s.get('accumulatedTradingValueRaw') or 0), reverse=True)
         stocks = [{'code': s['itemCode'], 'name': s['stockName']} for s in pool[:100]]
     except Exception:
-        return [], datetime.now().strftime('%H:%M')
+        return [], now_kst().strftime('%H:%M')
 
     scored_stocks = []
 
     # 주간추세(20주 이동평균)까지 계산하려면 100영업일보다 더 긴 과거 데이터가 필요해 약 500일 전부터 조회
-    start_date = (datetime.now() - timedelta(days=500)).strftime('%Y-%m-%d')
+    start_date = (now_kst() - timedelta(days=500)).strftime('%Y-%m-%d')
 
     for s in stocks:
         try:
@@ -590,7 +596,7 @@ def run_logical_screener():
             
     # 점수 높은 순으로 정렬 후 상위 20개 추출
     scored_stocks = sorted(scored_stocks, key=lambda x: x['타점 점수'], reverse=True)
-    return scored_stocks[:20], datetime.now().strftime('%H:%M')
+    return scored_stocks[:20], now_kst().strftime('%H:%M')
 
 @st.cache_data(ttl=3600)
 def backtest_technical_signal(code, threshold=70, holding_days=20, lookback_years=3):
@@ -601,8 +607,8 @@ def backtest_technical_signal(code, threshold=70, holding_days=20, lookback_year
     각 신호의 보유기간 종료일이 데이터 범위를 벗어나면(가장 최근 신호들) 집계에서 제외한다.
 
     반환: (요약 dict 또는 None, 개별 신호 DataFrame, 계산 시각)"""
-    ts = datetime.now().strftime('%H:%M')
-    start_date = (datetime.now() - timedelta(days=int(lookback_years * 365) + 200)).strftime('%Y-%m-%d')
+    ts = now_kst().strftime('%H:%M')
+    start_date = (now_kst() - timedelta(days=int(lookback_years * 365) + 200)).strftime('%Y-%m-%d')
     try:
         df_fdr = fdr.DataReader(code, start_date)
         if df_fdr.empty or len(df_fdr) < 120:
@@ -771,7 +777,7 @@ def fetch_stock_name_and_fundamentals(code):
 
 def analyze_stock_technical(code):
     # 주간추세(20주 이동평균)까지 계산하려면 100영업일보다 더 긴 과거 데이터가 필요해 약 500일 전부터 조회
-    start_date = (datetime.now() - timedelta(days=500)).strftime('%Y-%m-%d')
+    start_date = (now_kst() - timedelta(days=500)).strftime('%Y-%m-%d')
     try:
         df_fdr = fdr.DataReader(code, start_date)
         if df_fdr.empty or len(df_fdr) < 60:
@@ -813,7 +819,7 @@ def fetch_price_momentum(code):
     """퀀트 스캔용 경량 모멘텀 지표: 최근 1개월(22거래일) 가격 수익률만 계산.
     analyze_stock_technical과 달리 SMA/RSI/MACD/ATR은 계산하지 않아 대량 종목 스캔에 적합."""
     try:
-        start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+        start_date = (now_kst() - timedelta(days=45)).strftime('%Y-%m-%d')
         hist = fdr.DataReader(code, start_date)
         if len(hist) < 2:
             return None
@@ -1041,7 +1047,7 @@ def build_quant_filter_candidates(market_cap_min=0, included_sector="", max_scan
     띄우기 위함 — "ok"=정상, "universe_failed"=시가총액 데이터 수집 자체가 실패(네트워크 문제, 재시도 유도),
     "no_candidates"=시가총액/업종 조건을 통과하는 종목이 아예 없음(조건 완화 유도),
     "fundamentals_failed"=후보는 있었지만 펀더멘털 조회가 전부 실패(일시적 API 문제, 재시도 유도)."""
-    ts = datetime.now().strftime('%H:%M')
+    ts = now_kst().strftime('%H:%M')
     universe = fetch_market_universe()
     if universe.empty:
         return pd.DataFrame(), ts, "universe_failed"
@@ -1101,7 +1107,7 @@ def compute_price_correlation(codes, names):
     """스크리닝 상위 종목들의 최근 60거래일 일간수익률 상관계수 행렬을 계산 (포트폴리오 분산 참고용).
     ETF 간 실제 보유종목 중복도 분석과 달리, 개별 종목은 구성종목 데이터 없이 가격만으로 직접 계산 가능."""
     from concurrent.futures import ThreadPoolExecutor
-    start_date = (datetime.now() - timedelta(days=100)).strftime('%Y-%m-%d')
+    start_date = (now_kst() - timedelta(days=100)).strftime('%Y-%m-%d')
 
     def fetch_close(code):
         try:
@@ -1233,7 +1239,7 @@ def fetch_semiconductor_snapshot():
         "SK하이닉스": "000660",
     }
     results = {}
-    start_date = (datetime.now() - timedelta(days=10)).strftime('%Y-%m-%d')
+    start_date = (now_kst() - timedelta(days=10)).strftime('%Y-%m-%d')
     for name, code in targets.items():
         try:
             df = fdr.DataReader(code, start_date)
@@ -1244,7 +1250,7 @@ def fetch_semiconductor_snapshot():
                 results[name] = {"price": last_close, "change": change_pct}
         except Exception:
             continue
-    return results, datetime.now().strftime('%H:%M')
+    return results, now_kst().strftime('%H:%M')
 
 def fetch_multi_angle_news(queries, per_query=4, max_total=8, period="7d"):
     """여러 키워드로 나눠 뉴스를 조회한 뒤 제목 기준 중복을 제거해 하나의 리스트로 합침
@@ -1281,7 +1287,7 @@ def get_price_move_reason_analysis(kospi_data, semi_data):
     """코스피 지수와 반도체 대표 종목들이 오늘 왜 이렇게 움직였는지, 다각도로 조회한 실제 뉴스를 근거로 AI가 논리적으로 추정 분석
     반환값: (분석 텍스트, 코스피 관련 뉴스 리스트, 반도체 관련 뉴스 리스트, meta)
     meta = {"ts": "이 분석이 실제로 계산된 시각(HH:MM)", "sentiment": 뉴스 감성 집계 dict 또는 None}"""
-    ts = datetime.now().strftime('%H:%M')
+    ts = now_kst().strftime('%H:%M')
     # 단일 키워드로는 근거가 얕을 수 있어, 수급/업황/실적/이슈 등 여러 각도로 나눠 검색 후 통합
     # "오늘 왜 이렇게 움직였는지"가 목적이므로 최근 1일(period="1d") 뉴스로 한정해 며칠 전 뉴스가 섞이는 것을 방지
     kospi_news = fetch_multi_angle_news(
@@ -1337,7 +1343,7 @@ def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
     """반환값: (브리핑 텍스트, 근거로 사용한 시장 뉴스 리스트, meta)
     meta = {"ts": "이 분석이 실제로 계산된 시각(HH:MM)", "sentiment": 뉴스 감성 집계 dict 또는 None,
             "foreign_top": 외국인 순매수 상위 종목명 리스트, "institution_top": 기관 순매수 상위 종목명 리스트}"""
-    ts = datetime.now().strftime('%H:%M')
+    ts = now_kst().strftime('%H:%M')
     # 지수/업종 숫자만으로 추론하지 않도록, 오늘자 실제 시장 뉴스 헤드라인을 함께 조회해서 근거로 제공
     market_news = fetch_headlines_rss("코스피 코스닥 증시", period="1d")
     sentiment_counts = summarize_news_sentiment(market_news)
@@ -1435,9 +1441,9 @@ def classify_news_sentiment_ai(news_list):
 @st.cache_data(ttl=1800)
 def fetch_etf_market_data():
     try:
-        return fdr.StockListing('ETF/KR'), datetime.now().strftime('%H:%M')
+        return fdr.StockListing('ETF/KR'), now_kst().strftime('%H:%M')
     except Exception:
-        return pd.DataFrame(), datetime.now().strftime('%H:%M')
+        return pd.DataFrame(), now_kst().strftime('%H:%M')
 
 def _annualized_volatility(closes):
     """최근 최대 20거래일 일간수익률의 표준편차를 연율화(연 252거래일 가정)한 변동성(%)."""
@@ -1501,7 +1507,7 @@ def fetch_etf_weekly_returns(df_etf):
     # 거래대금 상위 50개만 필터링하여 수익률 연산 (부하 분산)
     df_top = df_filtered.sort_values(by='Amount', ascending=False).head(50)
     # 45일치를 가져와 1주일 수익률 기준점(약 5거래일 전)과 20거래일 변동성 계산에 함께 사용
-    start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+    start_date = (now_kst() - timedelta(days=45)).strftime('%Y-%m-%d')
 
     def fetch_row(row):
         m = _fetch_etf_row_metrics(row['Symbol'], row['Name'], f"{int(row['Price']):,}원", start_date)
@@ -1584,7 +1590,7 @@ def fetch_etf_category_returns(df_etf, category, top_n=10, pool_size=40):
     # 해당 카테고리 내 거래대금 상위 종목만 수익률 연산 (API 호출 부하 분산)
     df_top = df_cat.sort_values(by='Amount', ascending=False).head(pool_size)
     # 45일치를 가져와 1주일 수익률 기준점(약 5거래일 전)과 20거래일 변동성 계산에 함께 사용
-    start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+    start_date = (now_kst() - timedelta(days=45)).strftime('%Y-%m-%d')
 
     def fetch_row(row):
         m = _fetch_etf_row_metrics(row['Symbol'], row['Name'], f"{int(row['Price']):,}원", start_date)
@@ -1608,7 +1614,7 @@ def fetch_etf_inflow_top10(df_etf):
     from concurrent.futures import ThreadPoolExecutor
 
     df_top = df_etf.sort_values(by='Amount', ascending=False).head(10)
-    start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+    start_date = (now_kst() - timedelta(days=45)).strftime('%Y-%m-%d')
 
     def fetch_row(row):
         m = _fetch_etf_row_metrics(row['Symbol'], row['Name'], f"{int(row['Price']):,}원", start_date, need_weekly_return=False)
@@ -1628,7 +1634,7 @@ def fetch_etf_new_listing_top10(df_etf):
     from concurrent.futures import ThreadPoolExecutor
 
     df_top = df_etf.sort_values(by='Symbol', ascending=False).head(10)
-    start_date = (datetime.now() - timedelta(days=45)).strftime('%Y-%m-%d')
+    start_date = (now_kst() - timedelta(days=45)).strftime('%Y-%m-%d')
 
     def fetch_row(row):
         m = _fetch_etf_row_metrics(row['Symbol'], row['Name'], f"{int(row['Price']):,}원", start_date, need_weekly_return=False)
