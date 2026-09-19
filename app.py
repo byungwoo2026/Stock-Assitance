@@ -16,11 +16,13 @@ try:
 except ImportError:
     GENAI_AVAILABLE = False
 
-KST = timezone(timedelta(hours=9))
-
-def now_kst():
-    """배포 서버(Streamlit Cloud 등)가 UTC로 동작해도 항상 한국 시간을 반환."""
-    return datetime.now(KST)
+# 2026-09-20 — KST/now_kst/get_naver_session/기술지표·기술점수 계산 로직은 screener_core.py로
+# 이동(streamlit 비의존 순수 모듈). Stock_Agent(별도 저장소)가 이 모듈의 score_full_pool()
+# 결과를 교차저장소로 받아 쓰므로, 이 파일과 로직이 어긋나지 않도록 여기서도 그대로 import해 쓴다.
+from screener_core import (
+    KST, now_kst, get_naver_session,
+    compute_technical_indicators, compute_technical_score_at_row, score_full_pool,
+)
 
 # Groq가 특정 모델을 예고 없이 단종시킨 전례가 있어(예: llama-3.3-70b-versatile),
 # 최우선 모델이 실패하면 다음 모델로 자동 전환. 가끔 갱신이 필요할 수 있음(2026-09-16 기준 확인).
@@ -46,21 +48,6 @@ def call_groq_chat(messages, temperature=None, max_retries=2):
                 if attempt < max_retries - 1:
                     time.sleep(0.5 * (attempt + 1))
     return False, str(last_err)
-
-_thread_local = threading.local()
-
-def get_naver_session():
-    """스레드별로 재사용되는 requests.Session.
-    m.stock.naver.com은 매 요청마다 새 TLS 연결을 맺으면 요청당 약 1~6초가 걸리지만,
-    연결을 재사용(keep-alive)하면 이후 요청은 수십 ms로 줄어든다.
-    (같은 스레드 안에서 여러 페이지/종목을 순차 조회하는 함수들에서 반드시 이 세션을 사용할 것)
-    """
-    session = getattr(_thread_local, 'session', None)
-    if session is None:
-        session = requests.Session()
-        session.headers.update({"User-Agent": "Mozilla/5.0"})
-        _thread_local.session = session
-    return session
 
 st.set_page_config(page_title="나만의 투자 조수", layout="wide")
 
@@ -422,120 +409,6 @@ def fetch_top_analyst_recommendations():
     except Exception:
         return [], now_kst().strftime('%H:%M')
 
-def compute_technical_indicators(df_fdr):
-    """일봉 OHLCV(fdr.DataReader 원본 — 날짜 DatetimeIndex, High/Low/Close/Volume 포함)에
-    이동평균/RSI/MACD/ATR/볼린저밴드/스토캐스틱/주간추세를 전체 구간에 걸쳐 벡터화 계산해 추가.
-    analyze_stock_technical(오늘 스냅샷)과 backtest_technical_signal(과거 전 구간)이 같은 함수를 공유해
-    "오늘 화면에 보이는 지표"와 "백테스트가 재현하는 지표"가 어긋나지 않도록 함."""
-    df = pd.DataFrame({
-        'high': df_fdr['High'],
-        'low': df_fdr['Low'],
-        'close': df_fdr['Close'],
-        'volume': df_fdr['Volume'],
-    })
-
-    df['SMA20'] = df['close'].rolling(window=20).mean()
-    df['SMA60'] = df['close'].rolling(window=60).mean()
-
-    delta = df['close'].diff()
-    up = delta.clip(lower=0)
-    down = -delta.clip(upper=0)
-    ema_up = up.ewm(com=13, adjust=False).mean()
-    ema_down = down.ewm(com=13, adjust=False).mean()
-    rs = ema_up / ema_down
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    exp1 = df['close'].ewm(span=12, adjust=False).mean()
-    exp2 = df['close'].ewm(span=26, adjust=False).mean()
-    df['MACD'] = exp1 - exp2
-    df['Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
-
-    # ATR(14) — 손절/목표가 산정에 쓰는 변동성 지표. True Range의 Wilder 평활 이동평균.
-    prev_close = df['close'].shift(1)
-    true_range = pd.concat([
-        df['high'] - df['low'],
-        (df['high'] - prev_close).abs(),
-        (df['low'] - prev_close).abs(),
-    ], axis=1).max(axis=1)
-    df['ATR'] = true_range.ewm(com=13, adjust=False).mean()
-
-    # 볼린저밴드(20일, ±2표준편차) — %B: 0=하단밴드, 1=상단밴드 (구간 밖으로도 벗어날 수 있음)
-    bb_std = df['close'].rolling(window=20).std()
-    df['BB_UPPER'] = df['SMA20'] + 2 * bb_std
-    df['BB_LOWER'] = df['SMA20'] - 2 * bb_std
-    bb_range = (df['BB_UPPER'] - df['BB_LOWER']).replace(0, pd.NA)
-    df['BB_PCT_B'] = (df['close'] - df['BB_LOWER']) / bb_range
-
-    # 스토캐스틱(%K 14일, %D 3일 이동평균)
-    lowest_low = df['low'].rolling(window=14).min()
-    highest_high = df['high'].rolling(window=14).max()
-    stoch_range = (highest_high - lowest_low).replace(0, pd.NA)
-    df['STOCH_K'] = (df['close'] - lowest_low) / stoch_range * 100
-    df['STOCH_D'] = df['STOCH_K'].rolling(window=3).mean()
-
-    # 주간 추세: 주봉 5주/20주 이동평균 관계. resample('W')의 라벨은 그 주의 "마지막" 날짜이므로,
-    # 아직 끝나지 않은 이번 주 라벨은 일별 날짜보다 항상 미래에 위치 → reindex+ffill 시 자동으로
-    # "가장 최근에 확정된 지난 주" 값만 참조되어 미래 데이터 참조(lookahead) 없이 안전하게 정렬됨.
-    weekly_close = df['close'].resample('W').last()
-    weekly_sma5 = weekly_close.rolling(5).mean()
-    weekly_sma20 = weekly_close.rolling(20).mean()
-    weekly_trend = pd.Series('혼조', index=weekly_close.index)
-    weekly_trend[(weekly_close > weekly_sma5) & (weekly_sma5 > weekly_sma20)] = '상승'
-    weekly_trend[weekly_sma5 < weekly_sma20] = '하락'
-    weekly_trend[weekly_sma20.isna()] = None
-    df['WEEKLY_TREND'] = weekly_trend.reindex(df.index, method='ffill')
-
-    return df
-
-def compute_technical_score_at_row(row):
-    """지표 한 행(SMA20/SMA60/MACD/Signal/RSI/BB_PCT_B/STOCH_K/WEEKLY_TREND/close)으로부터
-    기술적 타점 점수(100점: 정배열25+MACD20+RSI20+볼린저밴드10+스토캐스틱10+주간추세15)를 계산.
-    run_logical_screener(오늘)와 backtest_technical_signal(과거 전 구간)이 채점 로직을 공유해
-    "백테스트가 실제로 이 스크리너의 로직을 재현하고 있다"는 것을 보장."""
-    price, sma20, sma60 = row['close'], row['SMA20'], row['SMA60']
-    macd, sig, rsi = row['MACD'], row['Signal'], row['RSI']
-    bb_pct_b, stoch_k, weekly_trend = row.get('BB_PCT_B'), row.get('STOCH_K'), row.get('WEEKLY_TREND')
-
-    score = 0
-    trend_str = "역배열/혼조"
-    if price > sma20 and sma20 > sma60:
-        score += 25
-        trend_str = "완벽 정배열 (초강세)"
-    elif sma20 > sma60:
-        score += 15
-        trend_str = "20/60 정배열 (눌림목)"
-    elif price > sma20:
-        score += 8
-        trend_str = "20일선 회복 (반등중)"
-
-    macd_str = "매도 구간"
-    if macd > sig:
-        score += 20
-        macd_str = "매수 우위 (상승세)"
-    elif macd > 0:
-        score += 7
-        macd_str = "조정 중 (0선 위)"
-
-    if pd.notna(rsi):
-        if rsi <= 40: score += 20
-        elif rsi <= 55: score += 13
-        elif rsi <= 70: score += 6
-        else: score -= 7
-
-    if pd.notna(bb_pct_b):
-        if bb_pct_b <= 0.2: score += 10       # 하단밴드 근접(과매도) — 매수 관심
-        elif bb_pct_b <= 0.8: score += 5
-
-    if pd.notna(stoch_k):
-        if stoch_k <= 20: score += 10          # 과매도 구간 — 매수 관심
-        elif stoch_k <= 80: score += 5
-
-    if weekly_trend == '상승':
-        score += 15
-    elif weekly_trend == '혼조':
-        score += 7
-
-    return score, trend_str, macd_str
 
 def rsi_signal_label(rsi):
     """RSI 값을 매수/매도 판단 참고용 문구로 변환. compute_technical_score_at_row의 배점 구간과 동일 기준(≤40/≤55/≤70)."""
@@ -593,57 +466,28 @@ def run_logical_screener():
     """
     개선된 논리적 스크리닝 기법 (점수 기반 랭킹 시스템):
     엄격한 AND 조건(0개 종목 검출 방지) 대신, 주도주(거래량 상위)를 대상으로 기술적 타점 점수(100점 만점)를 매겨 상위 20개를 항상 제시.
-    """
-    # NOTE(2026-09-16): finance.naver.com/sise/sise_quant.naver가 Next.js 개편으로
-    # 서버 렌더링 표를 더 이상 제공하지 않아, m.stock.naver.com 시가총액 API로 KOSPI/KOSDAQ
-    # 상위 종목 풀을 모은 뒤 거래대금 기준으로 재정렬해 '거래 활발한 주도주' 상위 100개를 추출.
-    session = get_naver_session()
-    try:
-        pool = []
-        for market in ("KOSPI", "KOSDAQ"):
-            res = session.get(
-                f"https://m.stock.naver.com/api/stocks/marketValue/{market}?page=1&pageSize=100",
-                timeout=5
-            )
-            pool.extend(res.json().get('stocks', []))
 
-        pool.sort(key=lambda s: int(s.get('accumulatedTradingValueRaw') or 0), reverse=True)
-        stocks = [{'code': s['itemCode'], 'name': s['stockName']} for s in pool[:100]]
-    except Exception:
+    2026-09-20 — 후보 수집·스코어링 자체는 screener_core.score_full_pool()로 이동(Stock_Agent가
+    같은 로직을 교차저장소로 공급받아 쓰므로, 두 곳의 점수 계산이 어긋나지 않도록 단일 소스로
+    통일). 여기서는 화면 표시용 top20 슬라이싱과 투자자수급(외국인/기관 연속매매) enrichment만
+    담당 — 기존 동작(반환 형식·정렬순서)은 완전히 동일하게 유지.
+    """
+    pool = score_full_pool(pool_size=100)
+    if not pool:
         return [], now_kst().strftime('%H:%M')
 
-    scored_stocks = []
-
-    # 주간추세(20주 이동평균)까지 계산하려면 100영업일보다 더 긴 과거 데이터가 필요해 약 500일 전부터 조회
-    start_date = (now_kst() - timedelta(days=500)).strftime('%Y-%m-%d')
-
-    for s in stocks:
-        try:
-            df_fdr = fdr.DataReader(s['code'], start_date)
-            if df_fdr.empty or len(df_fdr) < 60:
-                continue
-
-            df = compute_technical_indicators(df_fdr)
-            last = df.iloc[-1]
-            if pd.isna(last['SMA60']) or pd.isna(last['RSI']) or pd.isna(last['MACD']):
-                continue
-
-            score, trend_str, macd_str = compute_technical_score_at_row(last)
-
-            scored_stocks.append({
-                "_code": s['code'],
-                "종목명": s['name'],
-                "타점 점수": int(score),
-                "배열 상태": trend_str,
-                "MACD 신호": macd_str,
-                "RSI 지수": f"{last['RSI']:.1f} ({rsi_signal_label(last['RSI'])})" if pd.notna(last['RSI']) else "-",
-                "볼린저밴드(%B)": f"{last['BB_PCT_B']:.2f} ({bb_signal_label(last['BB_PCT_B'])})" if pd.notna(last['BB_PCT_B']) else "-",
-                "스토캐스틱(%K)": f"{last['STOCH_K']:.1f} ({stoch_signal_label(last['STOCH_K'])})" if pd.notna(last['STOCH_K']) else "-",
-                "주간추세": last['WEEKLY_TREND'] if pd.notna(last['WEEKLY_TREND']) else "-",
-                "현재가": f"{int(last['close']):,}",
-            })
-        except Exception:
-            continue
+    scored_stocks = [{
+        "_code": e["code"],
+        "종목명": e["name"],
+        "타점 점수": e["tech_score"],
+        "배열 상태": e["trend_str"],
+        "MACD 신호": e["macd_str"],
+        "RSI 지수": f"{e['rsi']:.1f} ({rsi_signal_label(e['rsi'])})" if e["rsi"] is not None else "-",
+        "볼린저밴드(%B)": f"{e['bb_pct_b']:.2f} ({bb_signal_label(e['bb_pct_b'])})" if e["bb_pct_b"] is not None else "-",
+        "스토캐스틱(%K)": f"{e['stoch_k']:.1f} ({stoch_signal_label(e['stoch_k'])})" if e["stoch_k"] is not None else "-",
+        "주간추세": e["weekly_trend"] if e["weekly_trend"] is not None else "-",
+        "현재가": f"{int(e['close']):,}",
+    } for e in pool]
 
     # 점수 높은 순으로 정렬 후 상위 20개 추출
     scored_stocks = sorted(scored_stocks, key=lambda x: x['타점 점수'], reverse=True)[:20]

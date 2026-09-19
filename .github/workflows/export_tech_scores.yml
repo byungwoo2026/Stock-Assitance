@@ -1,0 +1,48 @@
+name: 기술점수 전체풀 계산
+on:
+  schedule:
+    # 2026-09-20 신설 — 한국시간 오후 4:07 (UTC 07:07). 정각/30분 정각을 피하는 이유는
+    # Stock_Agent 저장소(schedule.yml)에서 이미 실측 확인된 GitHub Actions 큐 지연 완화
+    # 근거를 그대로 재사용(정각 트리거에 지연이 몰리는 경향이 커뮤니티에서 확인됨).
+    # 장마감(15:30 KST) 이후 여유를 두고, Stock_Agent 저녁모드(19:13 KST, STEP4에서 이
+    # 파일을 raw.githubusercontent.com으로 읽어감)보다 약 3시간 앞서 끝나도록 배치했다.
+    # 다만 GitHub Actions 스케줄은 "최선노력" 방식이라 지연 자체를 없앨 순 없음 — 그래서
+    # Stock_Agent 쪽은 이 파일이 없거나 오늘 날짜가 아니면 필터를 걸지 않고 정상 진행하도록
+    # (결측 허용) 설계돼 있다. 이 워크플로우가 어쩌다 늦거나 실패해도 Stock_Agent 저녁모드
+    # 자체가 막히지는 않는다.
+    - cron: '7 7 * * 1-5'
+  workflow_dispatch: {}
+permissions:
+  contents: write
+concurrency:
+  group: stock-assitance-export
+  cancel-in-progress: false
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 체크아웃
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Python 3.11 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: 패키지 설치
+        run: |
+          pip install -r requirements.txt
+      - name: 기술점수 전체풀 계산
+        run: |
+          python export_tech_scores.py
+      - name: 결과 자동 커밋 & 푸시
+        run: |
+          git config --global user.email "github-actions@github.com"
+          git config --global user.name "Stock Assitance Bot"
+          git add tech_score_export.json
+          if git diff --staged --quiet; then
+            echo "변경사항 없음 — 커밋 생략"
+          else
+            git commit -m "자동 업데이트: $(TZ='Asia/Seoul' date '+%Y-%m-%d %H:%M KST')"
+            git push origin main
+          fi
