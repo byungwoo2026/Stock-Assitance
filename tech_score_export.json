@@ -1,17 +1,17 @@
 {
-  "computed_at": "2026-09-22T21:35:34.682381+09:00",
-  "trading_date": "2026-09-22",
+  "computed_at": "2026-09-23T21:45:52.196655+09:00",
+  "trading_date": "2026-09-23",
   "universe_size": 97,
   "scores": [
     {
-      "code": "000660",
-      "name": "SK하이닉스",
-      "tech_score": 44
-    },
-    {
       "code": "005930",
       "name": "삼성전자",
-      "tech_score": 34
+      "tech_score": 51
+    },
+    {
+      "code": "000660",
+      "name": "SK하이닉스",
+      "tech_score": 39
     },
     {
       "code": "069500",
@@ -21,12 +21,7 @@
     {
       "code": "102110",
       "name": "TIGER 200",
-      "tech_score": 39
-    },
-    {
-      "code": "009150",
-      "name": "삼성전기",
-      "tech_score": 39
+      "tech_score": 34
     },
     {
       "code": "005935",
@@ -34,13 +29,28 @@
       "tech_score": 66
     },
     {
+      "code": "133690",
+      "name": "TIGER 미국나스닥100",
+      "tech_score": 34
+    },
+    {
+      "code": "402340",
+      "name": "SK스퀘어",
+      "tech_score": 34
+    },
+    {
+      "code": "009150",
+      "name": "삼성전기",
+      "tech_score": 34
+    },
+    {
       "code": "360750",
       "name": "TIGER 미국S&P500",
       "tech_score": 51
     },
     {
-      "code": "133690",
-      "name": "TIGER 미국나스닥100",
+      "code": "379810",
+      "name": "KODEX 미국나스닥100",
       "tech_score": 34
     },
     {
@@ -49,19 +59,19 @@
       "tech_score": 53
     },
     {
-      "code": "379810",
-      "name": "KODEX 미국나스닥100",
-      "tech_score": 34
-    },
-    {
-      "code": "402340",
-      "name": "SK스퀘어",
-      "tech_score": 39
-    },
-    {
       "code": "379800",
       "name": "KODEX 미국S&P500",
       "tech_score": 51
+    },
+    {
+      "code": "034020",
+      "name": "두산에너빌리티",
+      "tech_score": 45
+    },
+    {
+      "code": "240810",
+      "name": "원익IPS",
+      "tech_score": 56
     },
     {
       "code": "396500",
@@ -69,53 +79,8 @@
       "tech_score": 34
     },
     {
-      "code": "066570",
-      "name": "LG전자",
-      "tech_score": 43
-    },
-    {
-      "code": "001440",
-      "name": "대한전선",
-      "tech_score": 56
-    },
-    {
-      "code": "222800",
-      "name": "심텍",
-      "tech_score": 66
-    },
-    {
-      "code": "034020",
-      "name": "두산에너빌리티",
-      "tech_score": 55
-    },
-    {
-      "code": "003490",
-      "name": "대한항공",
-      "tech_score": 66
-    },
-    {
-      "code": "010170",
-      "name": "대한광통신",
-      "tech_score": 51
-    },
-    {
-      "code": "036930",
-      "name": "주성엔지니어링",
-      "tech_score": 76
-    },
-    {
-      "code": "240810",
-      "name": "원익IPS",
-      "tech_score": 51
-    },
-    {
-      "code": "067310",
-      "name": "하나마이크론",
-      "tech_score": 38
-    },
-    {
-      "code": "047040",
-      "name": "대우건설",
+      "code": "035420",
+      "name": "NAVER",
       "tech_score": 55
     },
     {
@@ -124,89 +89,29 @@
       "tech_score": 40
     },
     {
-      "code": "036540",
-      "name": "SFA반도체",
-      "tech_score": 38
-    },
-    {
-      "code": "043260",
-      "name": "성호전자",
-      "tech_score": 21
-    },
-    {
-      "code": "000500",
-      "name": "가온전선",
-      "tech_score": 53
-    },
-    {
-      "code": "000720",
-      "name": "현대건설",
-      "tech_score": 48
-    },
-    {
-      "code": "058470",
-      "name": "리노공업",
-      "tech_score": 34
-    },
-    {
-      "code": "000150",
-      "name": "두산",
-      "tech_score": 51
-    },
-    {
-      "code": "042700",
-      "name": "한미반도체",
-      "tech_score": 61
-    },
-    {
-      "code": "011070",
-      "name": "LG이노텍",
-      "tech_score": 43
-    },
-    {
-      "code": "105560",
-      "name": "KB금융",
-      "tech_score": 83
-    },
-    {
-      "code": "007660",
-      "name": "이수페타시스",
-      "tech_score": 48
-    },
-    {
-      "code": "232140",
-      "name": "와이씨",
-      "tech_score": 56
-    },
-    {
-      "code": "080220",
-      "name": "제주반도체",
-      "tech_score": 51
-    },
-    {
       "code": "006400",
       "name": "삼성SDI",
-      "tech_score": 65
+      "tech_score": 70
     },
     {
-      "code": "356860",
-      "name": "티엘비",
+      "code": "030530",
+      "name": "원익홀딩스",
       "tech_score": 51
     },
     {
-      "code": "012330",
-      "name": "현대모비스",
-      "tech_score": 40
+      "code": "036930",
+      "name": "주성엔지니어링",
+      "tech_score": 76
     },
     {
-      "code": "298040",
-      "name": "효성중공업",
-      "tech_score": 68
+      "code": "047040",
+      "name": "대우건설",
+      "tech_score": 45
     },
     {
-      "code": "035420",
-      "name": "NAVER",
-      "tech_score": 38
+      "code": "010170",
+      "name": "대한광통신",
+      "tech_score": 51
     },
     {
       "code": "096770",
@@ -214,24 +119,74 @@
       "tech_score": 63
     },
     {
+      "code": "000720",
+      "name": "현대건설",
+      "tech_score": 45
+    },
+    {
+      "code": "012450",
+      "name": "한화에어로스페이스",
+      "tech_score": 43
+    },
+    {
+      "code": "003490",
+      "name": "대한항공",
+      "tech_score": 66
+    },
+    {
+      "code": "000150",
+      "name": "두산",
+      "tech_score": 51
+    },
+    {
+      "code": "105560",
+      "name": "KB금융",
+      "tech_score": 60
+    },
+    {
+      "code": "066570",
+      "name": "LG전자",
+      "tech_score": 61
+    },
+    {
+      "code": "009830",
+      "name": "한화솔루션",
+      "tech_score": 23
+    },
+    {
+      "code": "028050",
+      "name": "삼성E&A",
+      "tech_score": 83
+    },
+    {
+      "code": "058470",
+      "name": "리노공업",
+      "tech_score": 39
+    },
+    {
+      "code": "007660",
+      "name": "이수페타시스",
+      "tech_score": 51
+    },
+    {
+      "code": "488770",
+      "name": "KODEX 머니마켓액티브",
+      "tech_score": 53
+    },
+    {
+      "code": "003670",
+      "name": "포스코퓨처엠",
+      "tech_score": 45
+    },
+    {
       "code": "028260",
       "name": "삼성물산",
       "tech_score": 38
     },
     {
-      "code": "012450",
-      "name": "한화에어로스페이스",
-      "tech_score": 45
-    },
-    {
-      "code": "488770",
-      "name": "KODEX 머니마켓액티브",
-      "tech_score": 40
-    },
-    {
-      "code": "010120",
-      "name": "LS ELECTRIC",
-      "tech_score": 61
+      "code": "055550",
+      "name": "신한지주",
+      "tech_score": 65
     },
     {
       "code": "000270",
@@ -239,49 +194,19 @@
       "tech_score": 40
     },
     {
-      "code": "373220",
-      "name": "LG에너지솔루션",
-      "tech_score": 50
-    },
-    {
-      "code": "108490",
-      "name": "로보티즈",
-      "tech_score": 63
-    },
-    {
-      "code": "028050",
-      "name": "삼성E&A",
-      "tech_score": 76
-    },
-    {
-      "code": "055550",
-      "name": "신한지주",
-      "tech_score": 70
-    },
-    {
-      "code": "032820",
-      "name": "우리기술",
+      "code": "042700",
+      "name": "한미반도체",
       "tech_score": 61
     },
     {
-      "code": "278470",
-      "name": "에이피알",
-      "tech_score": 50
+      "code": "222800",
+      "name": "심텍",
+      "tech_score": 66
     },
     {
-      "code": "403870",
-      "name": "HPSP",
-      "tech_score": 63
-    },
-    {
-      "code": "196170",
-      "name": "알테오젠",
+      "code": "086790",
+      "name": "하나금융지주",
       "tech_score": 62
-    },
-    {
-      "code": "017670",
-      "name": "SK텔레콤",
-      "tech_score": 43
     },
     {
       "code": "329180",
@@ -289,39 +214,79 @@
       "tech_score": 43
     },
     {
-      "code": "003230",
-      "name": "삼양식품",
+      "code": "319660",
+      "name": "피에스케이",
+      "tech_score": 34
+    },
+    {
+      "code": "298040",
+      "name": "효성중공업",
+      "tech_score": 68
+    },
+    {
+      "code": "373220",
+      "name": "LG에너지솔루션",
       "tech_score": 50
     },
     {
       "code": "034730",
       "name": "SK",
-      "tech_score": 51
-    },
-    {
-      "code": "003670",
-      "name": "포스코퓨처엠",
-      "tech_score": 55
-    },
-    {
-      "code": "086790",
-      "name": "하나금융지주",
-      "tech_score": 52
-    },
-    {
-      "code": "010950",
-      "name": "S-Oil",
-      "tech_score": 70
-    },
-    {
-      "code": "006800",
-      "name": "미래에셋증권",
-      "tech_score": 23
-    },
-    {
-      "code": "033780",
-      "name": "KT&G",
       "tech_score": 39
+    },
+    {
+      "code": "067310",
+      "name": "하나마이크론",
+      "tech_score": 38
+    },
+    {
+      "code": "403870",
+      "name": "HPSP",
+      "tech_score": 58
+    },
+    {
+      "code": "043260",
+      "name": "성호전자",
+      "tech_score": 38
+    },
+    {
+      "code": "272210",
+      "name": "한화시스템",
+      "tech_score": 68
+    },
+    {
+      "code": "042660",
+      "name": "한화오션",
+      "tech_score": 33
+    },
+    {
+      "code": "080220",
+      "name": "제주반도체",
+      "tech_score": 46
+    },
+    {
+      "code": "003230",
+      "name": "삼양식품",
+      "tech_score": 62
+    },
+    {
+      "code": "012330",
+      "name": "현대모비스",
+      "tech_score": 40
+    },
+    {
+      "code": "010120",
+      "name": "LS ELECTRIC",
+      "tech_score": 68
+    },
+    {
+      "code": "278470",
+      "name": "에이피알",
+      "tech_score": 45
+    },
+    {
+      "code": "128940",
+      "name": "한미약품",
+      "tech_score": 66
     },
     {
       "code": "032830",
@@ -329,29 +294,19 @@
       "tech_score": 23
     },
     {
-      "code": "068270",
-      "name": "셀트리온",
-      "tech_score": 37
+      "code": "089970",
+      "name": "브이엠",
+      "tech_score": 34
     },
     {
-      "code": "078930",
-      "name": "GS",
-      "tech_score": 62
+      "code": "036540",
+      "name": "SFA반도체",
+      "tech_score": 38
     },
     {
-      "code": "352820",
-      "name": "하이브",
-      "tech_score": 40
-    },
-    {
-      "code": "267260",
-      "name": "HD현대일렉트릭",
-      "tech_score": 23
-    },
-    {
-      "code": "035720",
-      "name": "카카오",
-      "tech_score": 23
+      "code": "108490",
+      "name": "로보티즈",
+      "tech_score": 63
     },
     {
       "code": "005490",
@@ -359,44 +314,74 @@
       "tech_score": 48
     },
     {
+      "code": "011070",
+      "name": "LG이노텍",
+      "tech_score": 43
+    },
+    {
+      "code": "010950",
+      "name": "S-Oil",
+      "tech_score": 63
+    },
+    {
+      "code": "095610",
+      "name": "테스",
+      "tech_score": 34
+    },
+    {
+      "code": "196170",
+      "name": "알테오젠",
+      "tech_score": 57
+    },
+    {
+      "code": "267270",
+      "name": "HD건설기계",
+      "tech_score": 55
+    },
+    {
+      "code": "068270",
+      "name": "셀트리온",
+      "tech_score": 37
+    },
+    {
+      "code": "267260",
+      "name": "HD현대일렉트릭",
+      "tech_score": 23
+    },
+    {
       "code": "316140",
       "name": "우리금융지주",
       "tech_score": 76
     },
     {
-      "code": "064400",
-      "name": "LG씨엔에스",
-      "tech_score": 38
+      "code": "017670",
+      "name": "SK텔레콤",
+      "tech_score": 43
     },
     {
-      "code": "062040",
-      "name": "산일전기",
-      "tech_score": 61
+      "code": "000500",
+      "name": "가온전선",
+      "tech_score": 58
     },
     {
-      "code": "204270",
-      "name": "제이앤티씨",
-      "tech_score": 53
+      "code": "035720",
+      "name": "카카오",
+      "tech_score": 30
     },
     {
-      "code": "051910",
-      "name": "LG화학",
-      "tech_score": 48
+      "code": "033780",
+      "name": "KT&G",
+      "tech_score": 51
     },
     {
-      "code": "307950",
-      "name": "현대오토에버",
-      "tech_score": 23
+      "code": "010140",
+      "name": "삼성중공업",
+      "tech_score": 33
     },
     {
-      "code": "000810",
-      "name": "삼성화재",
-      "tech_score": 52
-    },
-    {
-      "code": "095340",
-      "name": "ISC",
-      "tech_score": 56
+      "code": "015760",
+      "name": "한국전력",
+      "tech_score": 40
     },
     {
       "code": "079550",
@@ -404,34 +389,74 @@
       "tech_score": 51
     },
     {
-      "code": "009540",
-      "name": "HD한국조선해양",
-      "tech_score": 23
-    },
-    {
-      "code": "420770",
-      "name": "기가비스",
+      "code": "005290",
+      "name": "동진쎄미켐",
       "tech_score": 34
     },
     {
-      "code": "119850",
-      "name": "지엔씨에너지",
-      "tech_score": 66
+      "code": "347700",
+      "name": "스피어",
+      "tech_score": 56
     },
     {
-      "code": "131970",
-      "name": "두산테스나",
-      "tech_score": 39
+      "code": "086280",
+      "name": "현대글로비스",
+      "tech_score": 48
+    },
+    {
+      "code": "084370",
+      "name": "유진테크",
+      "tech_score": 51
     },
     {
       "code": "016360",
       "name": "삼성증권",
-      "tech_score": 46
+      "tech_score": 39
     },
     {
-      "code": "145020",
-      "name": "휴젤",
+      "code": "089030",
+      "name": "테크윙",
+      "tech_score": 63
+    },
+    {
+      "code": "000810",
+      "name": "삼성화재",
+      "tech_score": 52
+    },
+    {
+      "code": "032820",
+      "name": "우리기술",
+      "tech_score": 68
+    },
+    {
+      "code": "352820",
+      "name": "하이브",
       "tech_score": 40
+    },
+    {
+      "code": "078930",
+      "name": "GS",
+      "tech_score": 57
+    },
+    {
+      "code": "009540",
+      "name": "HD한국조선해양",
+      "tech_score": 33
+    },
+    {
+      "code": "064400",
+      "name": "LG씨엔에스",
+      "tech_score": 43
+    },
+    {
+      "code": "058610",
+      "name": "에스피지",
+      "tech_score": 68
+    },
+    {
+      "code": "051910",
+      "name": "LG화학",
+      "tech_score": 55
     },
     {
       "code": "083650",
@@ -444,19 +469,14 @@
       "tech_score": 56
     },
     {
-      "code": "089970",
-      "name": "브이엠",
-      "tech_score": 46
+      "code": "267250",
+      "name": "HD현대",
+      "tech_score": 55
     },
     {
-      "code": "006260",
-      "name": "LS",
-      "tech_score": 39
-    },
-    {
-      "code": "327260",
-      "name": "RF머트리얼즈",
-      "tech_score": 66
+      "code": "247540",
+      "name": "에코프로비엠",
+      "tech_score": 28
     },
     {
       "code": "071050",
@@ -464,29 +484,9 @@
       "tech_score": 43
     },
     {
-      "code": "042660",
-      "name": "한화오션",
-      "tech_score": 33
-    },
-    {
-      "code": "267270",
-      "name": "HD건설기계",
-      "tech_score": 55
-    },
-    {
-      "code": "087010",
-      "name": "펩트론",
-      "tech_score": 43
-    },
-    {
-      "code": "015760",
-      "name": "한국전력",
-      "tech_score": 33
-    },
-    {
-      "code": "098460",
-      "name": "고영",
-      "tech_score": 46
+      "code": "024110",
+      "name": "기업은행",
+      "tech_score": 23
     }
   ]
 }
