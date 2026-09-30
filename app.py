@@ -28,9 +28,17 @@ from screener_core import (
 # 최우선 모델이 실패하면 다음 모델로 자동 전환. 가끔 갱신이 필요할 수 있음(2026-09-16 기준 확인).
 GROQ_MODEL_CANDIDATES = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
 
+# 재시도/모델 전환으로 해결되지 않는 오류(인증·접근 차단)는 즉시 중단하고 원인을 알기 쉬운 문구로 안내
+GROQ_FATAL_STATUS_MESSAGES = {
+    401: "Groq API 키가 유효하지 않습니다(401). Secrets의 GROQ_API_KEY 값을 확인해 주세요.",
+    403: "Groq API가 이 서버의 네트워크 접근을 차단했습니다(403 Access denied). "
+         "잠시 후 다시 시도하거나, Streamlit Cloud의 Manage app → Reboot app으로 앱을 재부팅해 보세요.",
+}
+
 def call_groq_chat(messages, temperature=None, max_retries=2):
     """Groq 채팅 완성 호출 공통 헬퍼.
     모델별로 최대 max_retries회 짧게 재시도하고, 그래도 실패하면 다음 후보 모델로 넘어간다.
+    단, 401/403처럼 재시도해도 소용없는 오류는 즉시 중단하고 안내 문구를 반환한다.
     반환: (성공 여부, 성공 시 응답 텍스트 / 실패 시 마지막 에러 메시지)
     """
     last_err = None
@@ -44,6 +52,9 @@ def call_groq_chat(messages, temperature=None, max_retries=2):
                 response = client.chat.completions.create(**kwargs)
                 return True, response.choices[0].message.content
             except Exception as e:
+                fatal_msg = GROQ_FATAL_STATUS_MESSAGES.get(getattr(e, "status_code", None))
+                if fatal_msg:
+                    return False, fatal_msg
                 last_err = e
                 if attempt < max_retries - 1:
                     time.sleep(0.5 * (attempt + 1))
@@ -1133,9 +1144,10 @@ def get_individual_stock_ai_analysis(fundamentals, tech, news_list):
     4. **최종 AI 투자 전략 & 가이드**: 추천 매매 전략(분할 매수, 관망, 매도 등)과 목표/손절 대응 팁.
     """
     ok, content = call_groq_chat([{"role": "user", "content": prompt}])
-    if ok:
-        return content
-    return f"⚠️ AI 분석 리포트 생성 중 오류가 발생했습니다: {content}"
+    if not ok:
+        # 예외는 st.cache_data에 캐시되지 않으므로, 실패한 리포트가 15분간 그대로 노출되는 것을 막는다.
+        raise RuntimeError(content)
+    return content
 
 def render_data_ts_caption(ts, cache_minutes=None):
     """캐시된 데이터의 실제 계산 시각 캡션. 캐시 히트 시에도 처음 계산된 시각이 그대로 표시되어,
@@ -1247,6 +1259,7 @@ def get_price_move_reason_analysis(kospi_data, semi_data):
     5. 응답은 반드시 한국어로만, 마크다운으로 가독성 있게 작성하세요.
     """
     ok, content = call_groq_chat([{"role": "user", "content": prompt}], temperature=0.3)
+    meta["ai_ok"] = ok  # 호출부가 실패 결과를 캐시에서 비우는 데 사용
     if ok:
         return content, kospi_news, semi_news, meta
     return f"⚠️ AI 등락 원인 분석 중 오류가 발생했습니다: {content}", kospi_news, semi_news, meta
@@ -1301,6 +1314,7 @@ def get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors):
     4. 글자 크기가 너무 크지 않도록 마크다운 구조(강조 등)를 활용하여 정중하고 명확한 어조로 요약해 주세요.
     """
     ok, content = call_groq_chat([{"role": "user", "content": prompt}], temperature=0.3)
+    meta["ai_ok"] = ok  # 호출부가 실패 결과를 캐시에서 비우는 데 사용
     if ok:
         return content, market_news, meta
     return f"⚠️ AI 시장 분석 중 오류가 발생했습니다: {content}", market_news, meta
@@ -1622,6 +1636,8 @@ if menu == "종합 대시보드":
             get_price_move_reason_analysis.clear()
         with st.spinner("AI가 코스피·반도체 등락 원인을 분석하고 있습니다..."):
             reason_analysis, kospi_news_used, semi_news_used, reason_meta = get_price_move_reason_analysis(kospi_data, semi_data)
+        if not reason_meta["ai_ok"]:
+            get_price_move_reason_analysis.clear()  # 실패 결과가 1시간 캐시되지 않도록 비움(다음 조회 시 재시도)
         st.info(f"**🔍 오늘 코스피·반도체 등락 원인 분석 (AI 추정)**\n\n{reason_analysis}")
         st.caption(f"⏱ 이 분석은 {reason_meta['ts']} 기준 데이터로 생성됨 (최대 1시간 캐시) · 뉴스 톤: {_format_sentiment_text(reason_meta['sentiment'])}")
         news_col1, news_col2 = st.columns(2)
@@ -1656,6 +1672,8 @@ if menu == "종합 대시보드":
             get_market_ai_briefing.clear()
         with st.spinner("AI가 오늘의 시장 상황과 실제 뉴스를 종합 분석하고 있습니다..."):
             market_briefing, market_news_used, briefing_meta = get_market_ai_briefing(kospi_data, kosdaq_data, top_sectors)
+            if not briefing_meta["ai_ok"]:
+                get_market_ai_briefing.clear()  # 실패 결과가 1시간 캐시되지 않도록 비움(다음 조회 시 재시도)
             st.info(market_briefing)
             st.caption(f"⏱ 이 분석은 {briefing_meta['ts']} 기준 데이터로 생성됨 (최대 1시간 캐시) · 뉴스 톤: {_format_sentiment_text(briefing_meta['sentiment'])}")
             st.caption(
@@ -2478,7 +2496,10 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                             if GENAI_AVAILABLE:
                                 st.markdown("#### 🤖 AI 심층 투자 분석 리포트")
                                 with st.spinner("AI가 재무·기술·뉴스를 종합한 심층 리포트를 작성하고 있습니다..."):
-                                    ai_report = get_individual_stock_ai_analysis(fundamentals, tech, news)
+                                    try:
+                                        ai_report = get_individual_stock_ai_analysis(fundamentals, tech, news)
+                                    except RuntimeError as e:
+                                        ai_report = f"⚠️ AI 분석 리포트 생성 중 오류가 발생했습니다: {e}"
                                 st.info(ai_report)
 
                             st.markdown("#### 🔍 상세 지표 분석")
