@@ -306,47 +306,42 @@ def fetch_upper_limit_stocks():
 
     return results, now_kst().strftime('%H:%M')
 
+# 순매수 상위 집계 기간 (화면 표시명 → API periodType). DAY는 가장 최근 영업일 하루 기준.
+NET_BUYING_PERIODS = {"1일": "DAY", "1주일": "WEEK", "1개월": "MONTH", "3개월": "THREE_MONTH"}
+
 @st.cache_data(ttl=3600)
-def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10):
-    gubun = 9000 if investor_type == "foreign" else 1000
-    sosok = "01" if market_type == "KOSPI" else "02"  # 반드시 2자리 문자열("01"/"02") — 정수 0/1은 404 발생
-    # NOTE(2026-07-27): 겉page(sise_deal_rank.naver)는 실제 데이터가 없는 껍데기이고,
-    # 진짜 표 데이터는 iframe으로 별도 로드되는 sise_deal_rank_iframe.naver 에 있음 (개발자도구 Network 탭으로 확인)
-    url = f"https://finance.naver.com/sise/sise_deal_rank_iframe.naver?sosok={sosok}&investor_gubun={gubun}&type=buy"
+def _fetch_net_buying_top_cached(investor_type, market_type, top_n, period):
+    # NOTE(2026-10-01): 기존 finance.naver.com/sise/sise_deal_rank_iframe.naver 는 네이버가 종료(HTTP 410)함.
+    # 새 Npay 증권(stock.naver.com)의 "투자자별 매매동향" 화면이 쓰는 JSON API로 교체.
+    #   investorType: FOREIGNER(외국인) / ORGANIZATION(기관), marketType: KOSPI / KOSDAQ(대문자),
+    #   periodType: DAY(가장 최근 영업일) / WEEK / MONTH / THREE_MONTH, tradeType: KRX
+    url = "https://stock.naver.com/api/domestic/market/trend/trendForeignOrg"
+    params = {
+        "investorType": "FOREIGNER" if investor_type == "foreign" else "ORGANIZATION",
+        "tradeType": "KRX",
+        "marketType": market_type,
+        "startIdx": 0,
+        "pageSize": top_n,
+        "periodType": period,
+    }
+    res = get_naver_session().get(url, params=params, timeout=5)
+    res.raise_for_status()
+    buy_list = (res.json().get("sections") or {}).get("buyRankList") or []
+    stocks = []
+    for item in buy_list:
+        name = (item.get("itemname") or "").strip()
+        if name and name not in stocks:
+            stocks.append(name)
+    if not stocks:
+        # 빈 결과를 정상값으로 돌려주면 1시간 동안 캐시되므로, 예외로 올려 캐시되지 않게 함
+        raise ValueError("순매수 상위 데이터가 비어 있음")
+    return stocks[:top_n], now_kst().strftime('%H:%M')
 
+def fetch_net_buying_top(investor_type="foreign", market_type="KOSPI", top_n=10, period="DAY"):
+    """외국인/기관 순매수 상위 종목명 리스트와 조회 시각을 반환. period는 NET_BUYING_PERIODS의 API 값.
+    실패하면 ([], 시각)을 반환하며, 실패 결과는 캐시되지 않는다(성공한 결과만 1시간 캐시)."""
     try:
-        res = get_naver_session().get(url, timeout=5)
-        res.encoding = res.apparent_encoding
-        soup = BeautifulSoup(res.text, 'html.parser')
-
-        # 이 페이지는 "이전 영업일"과 "최근 영업일" 두 날짜의 순매수 상위가 나란히(날짜별 박스 2개) 표시되는 구조.
-        # NOTE(2026-09-16): 표 class가 기존 type_5에서 type_1로 변경됨. 날짜 박스(.box_type_ms) 기준으로
-        # 가장 마지막(=가장 최근 날짜) 박스 안의 표만 사용.
-        date_boxes = soup.select('.box_type_ms')
-        target_table = date_boxes[-1].select_one('table.type_1') if date_boxes else None
-        if target_table:
-            stocks = []
-            for a in target_table.find_all('a'):
-                href = a.get('href', '')
-                if 'main.naver?code=' in href:
-                    name = a.text.strip()
-                    if name and name not in stocks:
-                        stocks.append(name)
-                    if len(stocks) >= top_n:
-                        break
-            return stocks, now_kst().strftime('%H:%M')
-
-        # 표 구조가 예상과 다르면(방어적 처리), 페이지 전체에서 종목 링크만 모아 상위 top_n개 사용
-        stocks = []
-        for a in soup.find_all('a'):
-            href = a.get('href', '')
-            if 'main.naver?code=' in href:
-                name = a.text.strip()
-                if name and name not in stocks:
-                    stocks.append(name)
-                if len(stocks) >= top_n:
-                    break
-        return stocks, now_kst().strftime('%H:%M')
+        return _fetch_net_buying_top_cached(investor_type, market_type, top_n, period)
     except Exception:
         return [], now_kst().strftime('%H:%M')
 
@@ -1704,8 +1699,10 @@ elif menu == "시장 자금 & 업종 분석":
                 st.error("업종 데이터를 불러오는 데 실패했습니다.")
             
     with tab2:
-        st.write("외국인 및 기관이 7일간 연속/집중 매수하는 코스피/코스닥 상위 10개 종목을 도출하고 매수 사유(관련 최신 뉴스)를 분석합니다.")
-        
+        st.write("선택한 기간 동안 외국인 및 기관이 가장 많이 순매수한 코스피/코스닥 상위 10개 종목을 도출하고 매수 사유(관련 최신 뉴스)를 분석합니다.")
+        period_label = st.radio("집계 기간", list(NET_BUYING_PERIODS), index=1, horizontal=True)
+        period = NET_BUYING_PERIODS[period_label]
+
         col1, col2 = st.columns(2)
         with col1:
             st.markdown("#### 🌐 코스피 (KOSPI)")
@@ -1719,13 +1716,15 @@ elif menu == "시장 자금 & 업종 분석":
                 kpi_type = "foreign" if kospi_investor == "외국인" else "institution"
                 kdq_type = "foreign" if kosdaq_investor == "외국인" else "institution"
                 
-                kpi_stocks, kpi_ts = fetch_net_buying_top(kpi_type, "KOSPI", 10)
-                kdq_stocks, kdq_ts = fetch_net_buying_top(kdq_type, "KOSDAQ", 10)
+                kpi_stocks, kpi_ts = fetch_net_buying_top(kpi_type, "KOSPI", 10, period)
+                kdq_stocks, kdq_ts = fetch_net_buying_top(kdq_type, "KOSDAQ", 10, period)
 
                 st.markdown("---")
                 c1, c2 = st.columns(2)
                 with c1:
-                    st.success(f"코스피 {kospi_investor} 집중 매수 상위 10선")
+                    st.success(f"코스피 {kospi_investor} {period_label} 순매수 상위 10선")
+                    if not kpi_stocks:
+                        st.warning("순매수 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.")
                     for idx, stock in enumerate(kpi_stocks, 1):
                         news = fetch_headlines_rss(stock)
                         reason = news[0]['title'] if news else "관련 기사 없음 (기술적/패시브 자금 매수 추정)"
@@ -1736,7 +1735,9 @@ elif menu == "시장 자금 & 업종 분석":
                         render_data_ts_caption(kpi_ts, cache_minutes=60)
 
                 with c2:
-                    st.success(f"코스닥 {kosdaq_investor} 집중 매수 상위 10선")
+                    st.success(f"코스닥 {kosdaq_investor} {period_label} 순매수 상위 10선")
+                    if not kdq_stocks:
+                        st.warning("순매수 데이터를 불러오지 못했습니다. 잠시 후 다시 시도해 주세요.")
                     for idx, stock in enumerate(kdq_stocks, 1):
                         news = fetch_headlines_rss(stock)
                         reason = news[0]['title'] if news else "관련 기사 없음 (기술적/패시브 자금 매수 추정)"
