@@ -81,13 +81,15 @@ def compute_technical_indicators(df_fdr):
     bb_std = df['close'].rolling(window=20).std()
     df['BB_UPPER'] = df['SMA20'] + 2 * bb_std
     df['BB_LOWER'] = df['SMA20'] - 2 * bb_std
-    bb_range = (df['BB_UPPER'] - df['BB_LOWER']).replace(0, pd.NA)
+    # 0 → pd.NA는 컬럼을 object 타입으로 만들어 아래 rolling().mean()이 DataError를 내는 종목(거래정지 등
+    # 14일 고저가 동일)이 있어 float NaN을 쓴다 — 정상 구간의 계산 결과는 동일.
+    bb_range = (df['BB_UPPER'] - df['BB_LOWER']).replace(0, float('nan'))
     df['BB_PCT_B'] = (df['close'] - df['BB_LOWER']) / bb_range
 
     # 스토캐스틱(%K 14일, %D 3일 이동평균)
     lowest_low = df['low'].rolling(window=14).min()
     highest_high = df['high'].rolling(window=14).max()
-    stoch_range = (highest_high - lowest_low).replace(0, pd.NA)
+    stoch_range = (highest_high - lowest_low).replace(0, float('nan'))
     df['STOCH_K'] = (df['close'] - lowest_low) / stoch_range * 100
     df['STOCH_D'] = df['STOCH_K'].rolling(window=3).mean()
 

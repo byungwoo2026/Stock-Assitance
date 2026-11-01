@@ -24,6 +24,16 @@ from screener_core import (
     compute_technical_indicators, compute_technical_score_at_row, score_full_pool,
 )
 
+# 2026-10-31 — 'AI 종목 진단'(추세·패턴·수급·거래량 체크리스트 → 등급)의 규칙 엔진과 Plotly 차트 빌더.
+# 기존 calculate_stock_score(눌림목 철학)와 점수를 섞지 않도록 별도 모듈로 분리했고, 둘 다 streamlit에 의존하지 않는다.
+import diagnosis_core as dc
+import diagnosis_chart as dchart
+import watchlist_core as wlc   # 관심종목 JSON 구조·검증(streamlit 비의존)
+import os
+from collections import Counter
+import invest_sites_core as isc      # '투자사이트' 탭: 분석 글 수집·종목 추출·요약·주가 영향도(streamlit 비의존)
+import update_invest_sites as isu     # 같은 수집기를 GitHub Actions가 매일 실행하고, 탭의 '지금 수집'도 호출한다
+
 # Groq가 특정 모델을 예고 없이 단종시킨 전례가 있어(예: llama-3.3-70b-versatile),
 # 최우선 모델이 실패하면 다음 모델로 자동 전환. 가끔 갱신이 필요할 수 있음(2026-09-16 기준 확인).
 GROQ_MODEL_CANDIDATES = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
@@ -66,7 +76,7 @@ st.title("📈 나만의 AI 투자 조수 대시보드")
 st.markdown("시장의 자금 쏠림, 주주 수급, 주요 뉴스 및 기술적 매수 신호를 분석합니다.")
 
 # 화면 상단 가로 버튼(탭)형 메뉴 — st.radio를 버튼처럼 보이도록 CSS로 스타일링
-MENU_OPTIONS = ["종합 대시보드", "시장 자금 & 업종 분석", "주요 기업 헤드라인 뉴스", "외인 수급 & 기술적 조건 스크리너", "최우수 애널리스트 추천 종목", "가치재평가주", "퀀트 투자 리스트", "개별종목분석"]
+MENU_OPTIONS = ["종합 대시보드", "시장 자금 & 업종 분석", "주요 기업 헤드라인 뉴스", "외인 수급 & 기술적 조건 스크리너", "최우수 애널리스트 추천 종목", "가치재평가주", "퀀트 투자 리스트", "AI 종목 진단", "투자사이트", "개별종목분석"]
 
 st.markdown("""
 <style>
@@ -2276,6 +2286,672 @@ def calculate_stock_score(fundamentals, tech, news_list):
 
     total_score = news_suqub_total + val_score + trend_score + tech_score + mgmt_score
     return int(total_score), news_suqub_total, val_score, trend_score, tech_score, mgmt_score
+
+# ==========================================
+# AI 종목 진단 — 판정은 전부 diagnosis_core.py의 규칙(같은 입력 → 같은 결과). LLM은 '재료 요약'에만 사용하며 등급에 반영하지 않음.
+# ==========================================
+DIAG_VERDICT_COLORS = {
+    "매수 고려": "green", "지켜보기": "orange", "사지 않기": "red",
+    "매도 고려": "red", "보유 유지": "green", "손절 고려": "red",
+    "분할 익절 고려": "orange", "물타기 고려": "blue", "추세 점검": "orange",
+}
+DIAG_POSITIVE_STATES = ("상승", "유입", "급증↑", "쌍바닥", "역헤드앤숄더", "박스권 돌파")
+DIAG_NEGATIVE_STATES = ("하락", "이탈", "급증↓", "쌍봉", "헤드앤숄더", "박스권 이탈")
+
+@st.cache_data(ttl=300)
+def fetch_diag_ohlcv(code, lookback_days):
+    df = dc.fetch_ohlcv(code, lookback_days)
+    if df is None or df.empty:
+        # 예외는 st.cache_data에 캐시되지 않으므로, 일시적인 조회 실패가 5분간 굳어지는 것을 막는다.
+        raise ValueError("시세 데이터를 불러오지 못했습니다.")
+    return df
+
+@st.cache_data(ttl=300)
+def fetch_diag_flow(code):
+    flow = dc.fetch_investor_flow(code)
+    if flow is None:
+        raise ValueError("수급 데이터를 불러오지 못했습니다.")
+    return flow
+
+@st.cache_data(ttl=21600)
+def get_code_market_map():
+    """종목코드 -> 'KOSPI'/'KOSDAQ'. 시장 지수 대비 모멘텀(참고 신호)에 쓴다."""
+    universe = fetch_market_universe()
+    return dict(zip(universe["Code"], universe["Market"])) if not universe.empty else {}
+
+@st.cache_data(ttl=300)
+def fetch_diag_index(market, lookback_days):
+    s = dc.fetch_index_close(market, lookback_days)
+    if s is None:
+        raise ValueError("지수 데이터를 불러오지 못했습니다.")   # 예외는 캐시되지 않는다
+    return s
+
+def get_diag_index(code, lookback_days):
+    """종목이 속한 시장 지수의 종가. 시장을 모르거나 조회에 실패하면 None → 모멘텀 참고 신호만 '평가 불가'로 두고 나머지는 그대로 진단."""
+    market = get_code_market_map().get(code)
+    if not market:
+        return None
+    try:
+        return fetch_diag_index(market, lookback_days)
+    except Exception:
+        return None
+
+@st.cache_data(ttl=1800)
+def get_news_sentiment_counts(news_list):
+    """뉴스 감성(긍정/중립/부정) 개수. AI 판정 실패는 예외로 알려 캐시되지 않게 한다."""
+    sentiment = classify_news_sentiment_ai(news_list)
+    if sentiment is None:
+        raise RuntimeError("감성 분류에 실패했습니다.")
+    counts = {"긍정": 0, "중립": 0, "부정": 0}
+    for verdict in sentiment.values():
+        counts[verdict] += 1
+    return counts
+
+@st.cache_data(ttl=1800)
+def get_material_summary_ai(stock_name, news_list):
+    """'요즘 이 종목의 재료' 3줄 요약. 기사 제목에 없는 내용은 지어내지 않도록 제한."""
+    news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list])
+    prompt = f"""
+    당신은 주식 뉴스 요약가입니다. 아래는 '{stock_name}' 관련 최근 기사 제목입니다.
+    투자자가 알아야 할 '요즘 이 종목의 재료'를 한국어 불릿 3개 이내로 요약하세요.
+    - 기사 제목에 없는 내용(수치·원인·전망 포함)은 절대 지어내지 마세요.
+    - 매수/매도 의견이나 호재·악재 판단은 쓰지 말고, 어떤 일이 있었는지 사실만 정리하세요.
+    - 반드시 한국어로만 작성하세요.
+
+    [기사 제목]
+    {news_text}
+    """
+    ok, content = call_groq_chat([{"role": "user", "content": prompt}], temperature=0.3)
+    if not ok:
+        raise RuntimeError(content)
+    return content
+
+def resolve_diag_stock(user_input):
+    """종목명 또는 6자리 코드 → (코드, 종목명, 비슷한 종목명 후보). 찾지 못하면 코드가 None."""
+    code_map = get_stock_code_map()
+    text = user_input.strip()
+    if text.isdigit() and len(text) == 6:
+        return text, next((n for n, c in code_map.items() if c == text), text), []
+    if text in code_map:
+        return code_map[text], text, []
+    return None, text, [n for n in code_map if text and text in n][:5]
+
+def render_diag_pillar(col, axis, state, detail):
+    color = "#d60000" if state.startswith(DIAG_POSITIVE_STATES) else "#1857e0" if state.startswith(DIAG_NEGATIVE_STATES) else "#6b7280"
+    col.markdown(f"""
+        <div style="border:1px solid #e6e6e6; border-radius:8px; padding:10px 12px; height:100%;">
+            <div style="font-size:0.8rem; color:rgba(49,51,63,0.6);">{axis}</div>
+            <div style="font-size:1.15rem; font-weight:700; color:{color}; line-height:1.3;">{state}</div>
+            <div style="font-size:0.75rem; color:gray;">{detail}</div>
+        </div>
+    """, unsafe_allow_html=True)
+
+def render_check_line(c):
+    icon = {True: "✅", False: "❌", None: "➖"}[c.passed]
+    st.markdown(f"{icon} **{c.axis}** · {c.label}  \n<span style='color:gray; font-size:0.85rem;'>{c.detail}</span>",
+                unsafe_allow_html=True)
+
+def render_diagnosis(diag, name, mode, key_prefix="diag"):
+    """진단 결과 한 종목의 상세 화면. 같은 화면에 두 번 그려질 수 있어(종목 진단 탭 / 관심종목 탭) 위젯 키에 key_prefix를 쓴다."""
+    res = diag.results[mode]
+    close, prev_close = diag.df['close'].iloc[-1], diag.df['close'].iloc[-2]
+    st.markdown(f"### {name} ({diag.code}) · {diag.as_of:%Y-%m-%d} 종가 {close:,.0f}원 ({(close / prev_close - 1) * 100:+.2f}%)")
+
+    with st.container(border=True):
+        grade_col, text_col = st.columns([1, 4])
+        big = res.grade or res.score_text
+        sub = f"{mode} 진단" + (f" · 핵심 통과 {res.score_text}" if res.grade else "")   # 매도는 큰 글씨가 이미 '약세 신호 n/m'
+        grade_col.markdown(f"<div style='font-size:3rem; font-weight:800; line-height:1.1;'>{big}</div>"
+                           f"<div style='color:gray; font-size:0.8rem;'>{sub}</div>",
+                           unsafe_allow_html=True)
+        text_col.markdown(f"#### :{DIAG_VERDICT_COLORS.get(res.verdict, 'gray')}[{res.verdict}]")
+        text_col.markdown(f"**{res.action}**")
+
+    if mode == "보유" and res.extra.get("pnl") is not None:
+        m1, m2, m3 = st.columns(3)
+        m1.metric("평단 대비", f"{res.extra['pnl'] * 100:+.1f}%")
+        m2.metric("평단가", f"{res.extra['buy_price']:,.0f}원")
+        m3.metric("손절선(평단 -8%)", f"{res.extra['stop_line']:,.0f}원")
+    elif mode == "매수":
+        if diag.risk:
+            st.caption(f"참고 손절 {diag.risk['stop']:,.0f}원 · 목표 {diag.risk['target']:,.0f}원 (현재가 -2×ATR / +3×ATR, 변동성 기반 근사치)")
+        st.caption("※ 등급 A·B = 매수 고려, C = 지켜보기, D = 사지 않기. 종가가 240일선 아래면 점수와 무관하게 C 이하로 제한됩니다.")
+
+    st.markdown("##### 핵심 체크리스트 (점수 반영)")
+    for c in (c for c in res.checks if c.scored):
+        render_check_line(c)
+    if diag.flow_net is None:
+        st.caption("※ 수급은 네이버가 최근 5거래일만 제공해, 조회에 실패했거나 과거 시점을 진단할 때는 평가에서 빠지고 등급은 나머지 항목의 비율로 계산됩니다.")
+
+    st.markdown("##### 참고 신호 (점수 미반영)")
+    st.caption("10일선·20일선·정배열·패턴은 과거 검증에서 시장·기간마다 부호가 바뀌거나 오히려 음(-)이어서 점수에 넣지 않고 참고로만 보여줍니다."
+               + (" 6~2개월 모멘텀(지수 대비)은 2020년 이후에는 뚜렷했지만 2006~2019년 독립 구간에서는 방향만 같고 통계적으로 유의하지 않아 역시 참고로만 둡니다."
+                  if mode == "매수" else ""))
+    for c in (c for c in res.checks if not c.scored):
+        render_check_line(c)
+
+    pillar_cols = st.columns(4)
+    for col, axis in zip(pillar_cols, ("추세", "수급", "패턴", "거래량")):
+        render_diag_pillar(col, axis, diag.pillars[axis]["state"], diag.pillars[axis]["detail"])
+
+    st.markdown("##### 차트")
+    tf_col, period_col = st.columns(2)
+    timeframe = tf_col.radio("차트 봉", dchart.TIMEFRAMES, horizontal=True, key=f"{key_prefix}_timeframe")
+    period_label = period_col.radio("표시 기간", list(dchart.VIEW_MONTHS), index=1, horizontal=True, key=f"{key_prefix}_period")
+    fig = dchart.build_figure(diag.df, timeframe, dchart.VIEW_MONTHS[period_label],
+                              diag.overlay_patterns(mode), title=f"{name} ({diag.code})")
+    st.plotly_chart(fig, theme=None, key=f"{key_prefix}_chart")
+    st.caption("※ 진단은 일봉 기준이며, 주봉·월봉은 같은 패턴을 겹쳐 보여주는 표시용입니다. ①②③… 은 패턴 꼭짓점, 점선은 넥라인(박스권은 상·하단)입니다.")
+
+    st.markdown("##### 📰 요즘 이 종목의 재료")
+    st.caption("※ 최근 7일 기사 기준이며 진단 시점과 무관합니다. 재료는 AI 요약이라 참고용으로만 보여주고 등급에는 반영하지 않습니다.")
+    news = fetch_headlines_rss(name)
+    if not news:
+        st.write("최근 관련 뉴스가 없습니다.")
+        return
+    if GENAI_AVAILABLE:
+        try:
+            counts = get_news_sentiment_counts(news)
+            st.caption(f"기사 감성 — 긍정 {counts['긍정']} · 중립 {counts['중립']} · 부정 {counts['부정']}")
+        except Exception:
+            pass
+        try:
+            st.info(get_material_summary_ai(name, news))
+        except RuntimeError as e:
+            st.caption(f"⚠️ AI 재료 요약을 불러오지 못했습니다: {e}")
+    render_news_links(news, "📰 참고한 관련 기사 보기")
+
+def render_diag_single():
+    input_col, btn_col = st.columns([4, 1], vertical_alignment="bottom")
+    stock_input = input_col.text_input("종목명 또는 6자리 종목코드", placeholder="예: POSCO홀딩스 또는 005490", key="diag_input")
+    run_clicked = btn_col.button("진단 시작", key="diag_go", width="stretch")
+    if run_clicked and stock_input.strip():
+        st.session_state["diag_query"] = stock_input.strip()
+
+    mode = st.radio("진단 모드", ["매수", "보유", "매도"], horizontal=True, key="diag_mode",
+                    format_func=lambda m: f"{m} 진단",
+                    help="매수: 지금 사도 되는가 / 보유: 들고 있는 종목을 어떻게 할 것인가(평단가 입력) / 매도: 팔아야 할 신호가 있는가")
+    buy_price = None
+    if mode == "보유":
+        price_input = st.number_input("평단가(원) — 입력하면 손익 기준으로 손절·익절·물타기를 판정합니다", min_value=0, value=0, step=100, key="diag_buy_price")
+        buy_price = float(price_input) if price_input > 0 else None
+
+    today = now_kst().date()
+    when_col, date_col = st.columns(2)
+    when = when_col.radio("진단 시점", ["현재", "과거 날짜"], horizontal=True, key="diag_when")
+    as_of = None
+    if when == "과거 날짜":
+        as_of = date_col.date_input("날짜", value=today - timedelta(days=30), max_value=today, key="diag_date")
+
+    query = st.session_state.get("diag_query")
+    if query:
+        code, name, suggestions = resolve_diag_stock(query)
+        if not code:
+            st.warning("올바른 종목명 또는 6자리 종목코드를 입력해주세요." + (f" 혹시 이 종목인가요? {', '.join(suggestions)}" if suggestions else ""))
+        else:
+            days_back = (today - as_of).days if as_of else 0
+            lookback = 700 + ((days_back // 100) + 1) * 100 if days_back > 0 else 700   # MA240이 계산될 만큼 진단 시점 이전 이력 확보
+            with st.spinner("시세와 수급을 불러와 진단하는 중입니다..."):
+                try:
+                    df_raw = fetch_diag_ohlcv(code, lookback)
+                except Exception as e:
+                    df_raw = None
+                    st.error(f"시세 데이터를 불러오지 못했습니다: {e}")
+                if df_raw is not None:
+                    try:
+                        flow = fetch_diag_flow(code)
+                    except Exception:
+                        flow = None   # 수급만 평가에서 빠지고 나머지 항목은 그대로 진단
+                    diag = dc.diagnose(code, as_of=as_of, buy_price=buy_price, df_raw=df_raw, flow=flow,
+                                       index_close=get_diag_index(code, lookback))
+                    if diag is None:
+                        st.error("진단에 필요한 시세 데이터(최소 30거래일)가 부족합니다.")
+                    else:
+                        render_diagnosis(diag, name, mode)
+
+# --- 관심종목 일괄 진단 -----------------------------------------------------------------
+# 관심종목은 session_state에만 보관한다(Streamlit Cloud는 디스크가 휘발성). JSON으로 내려받아 두었다가 다시 불러온다.
+# 위젯 상태를 지우거나 바꿔야 하는 동작(입력창 비우기, 선택 그룹 바꾸기)은 on_click 콜백에서 처리한다 —
+# 위젯이 이미 그려진 뒤의 스크립트 본문에서는 그 위젯의 session_state 값을 바꿀 수 없다.
+WL_SIGNAL_ICONS = {"매수 고려": "🟢", "지켜보기": "🟠", "사지 않기": "⚪", "매도 고려": "🔴"}
+
+def _wl_get():
+    if "watchlist" not in st.session_state:
+        st.session_state["watchlist"] = wlc.empty_watchlist()
+    return st.session_state["watchlist"]
+
+def _wl_changed(message=None, kind="success"):
+    """목록이 바뀌면 이전 일괄 진단 결과는 무효이고, 편집 표는 새 키로 다시 만든다."""
+    st.session_state["wl_version"] = st.session_state.get("wl_version", 0) + 1
+    st.session_state.pop("wl_results", None)
+    if message:
+        st.session_state["wl_msg"] = (kind, message)
+
+def _wl_add_cb():
+    wl, group = _wl_get(), st.session_state.get("wl_group")
+    added, dup, failed = [], [], []
+    for token in [t.strip() for t in st.session_state.get("wl_add_text", "").split(",") if t.strip()]:
+        code, name, _ = resolve_diag_stock(token)
+        if not code:
+            failed.append(token)
+        elif wlc.add_stock(wl, group, code, name):
+            added.append(name)
+        else:
+            dup.append(name)
+    st.session_state["wl_add_text"] = ""
+    parts = ([f"추가: {', '.join(added)}"] if added else []) + ([f"이미 있거나 그룹이 가득 참: {', '.join(dup)}"] if dup else []) \
+        + ([f"찾지 못함: {', '.join(failed)}"] if failed else [])
+    kind = "success" if added and not (dup or failed) else "warning"
+    if added:
+        _wl_changed(" / ".join(parts), kind)
+    elif parts:
+        st.session_state["wl_msg"] = (kind, " / ".join(parts))
+
+def _wl_new_group_cb():
+    name = st.session_state.get("wl_new_group", "").strip()
+    if wlc.add_group(_wl_get(), name):
+        st.session_state["wl_group"] = name
+        _wl_changed(f"그룹을 만들었습니다: {name}")
+    else:
+        st.session_state["wl_msg"] = ("warning", "그룹 이름이 비었거나 이미 있습니다(그룹은 최대 20개).")
+    st.session_state["wl_new_group"] = ""
+
+def _wl_delete_group_cb():
+    wl, group = _wl_get(), st.session_state.get("wl_group")
+    if wlc.delete_group(wl, group):
+        st.session_state["wl_group"] = next(iter(wl["groups"]))
+        _wl_changed(f"그룹을 삭제했습니다: {group}")
+    else:
+        st.session_state["wl_msg"] = ("warning", "마지막 하나 남은 그룹은 삭제할 수 없습니다.")
+
+def _wl_remove_cb(group, key):
+    codes = st.session_state.get(key, [])
+    wlc.remove_stocks(_wl_get(), group, codes)
+    st.session_state[key] = []
+    if codes:
+        _wl_changed(f"{len(codes)}개 종목을 삭제했습니다.")
+
+def run_watchlist_diagnosis(items, max_workers=8):
+    """관심종목 전체를 병렬로 진단. 반환: [(item, Diagnosis 또는 None, 실패 사유 또는 None)]. 시세·수급은 5분 캐시를 공유."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(item):
+        code = item["code"]
+        try:
+            df_raw = fetch_diag_ohlcv(code, 700)
+        except Exception:
+            return item, None, "시세 조회 실패"
+        try:
+            flow = fetch_diag_flow(code)
+        except Exception:
+            flow = None   # 수급만 평가에서 빠지고 나머지는 그대로 진단
+        diag = dc.diagnose(code, buy_price=item.get("buy_price"), df_raw=df_raw, flow=flow,
+                           index_close=get_diag_index(code, 700))
+        return (item, diag, None) if diag is not None else (item, None, "시세 이력 부족(30거래일 미만)")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return list(executor.map(one, items))
+
+def render_diag_watchlist():
+    wl = _wl_get()
+    version = st.session_state.get("wl_version", 0)
+    st.caption("※ 관심종목은 이 브라우저 세션에만 보관됩니다(Streamlit Cloud는 저장 공간이 휘발성). 아래 JSON으로 내려받아 두었다가 다시 불러오세요.")
+
+    msg = st.session_state.pop("wl_msg", None)
+    if msg:
+        getattr(st, msg[0])(msg[1])
+
+    # JSON 입출력은 편집 표가 갱신된 뒤의 값을 내려받도록 맨 아래(편집 표 다음)에서 채우고, 자리는 먼저 잡아 둔다.
+    io_box = st.container()
+
+    uploaded = st.file_uploader("관심종목 JSON 불러오기(현재 목록을 덮어씁니다)", type="json", key="wl_upload")
+    if uploaded is not None and st.session_state.get("wl_loaded_id") != uploaded.file_id:
+        try:
+            st.session_state["watchlist"] = wlc.loads(uploaded.getvalue().decode("utf-8"))
+            st.session_state["wl_loaded_id"] = uploaded.file_id   # 같은 파일을 rerun마다 다시 적용해 편집 내용을 덮어쓰지 않도록
+            st.session_state["wl_group"] = next(iter(st.session_state["watchlist"]["groups"]))
+            _wl_changed(f"불러오기 완료: 그룹 {len(st.session_state['watchlist']['groups'])}개")
+            st.rerun()
+        except (ValueError, UnicodeDecodeError) as e:
+            st.error(f"불러오기에 실패했습니다: {e}")
+
+    groups = list(wl["groups"])
+    if st.session_state.get("wl_group") not in groups:
+        st.session_state["wl_group"] = groups[0]
+    g1, g2, g3, g4 = st.columns([2, 2, 1, 1], vertical_alignment="bottom")
+    group = g1.selectbox("그룹", groups, key="wl_group")
+    g2.text_input("새 그룹 이름", key="wl_new_group", placeholder="예: 반도체")
+    g3.button("그룹 만들기", key="wl_new_group_btn", on_click=_wl_new_group_cb, width="stretch")
+    g4.button("그룹 삭제", key="wl_del_group_btn", on_click=_wl_delete_group_cb, width="stretch")
+
+    a1, a2 = st.columns([4, 1], vertical_alignment="bottom")
+    a1.text_input("종목 추가 — 종목명 또는 6자리 코드(콤마로 여러 개)", key="wl_add_text", placeholder="예: POSCO홀딩스, 005930, 삼성전자")
+    a2.button("추가", key="wl_add_btn", on_click=_wl_add_cb, width="stretch")
+
+    items = wl["groups"][group]
+    if not items:
+        io_box.download_button("⬇️ 관심종목 JSON 내려받기", wlc.dumps(wl), file_name="watchlist.json", mime="application/json", key="wl_download")
+        st.info("관심종목이 비어 있습니다. 위에서 종목을 추가하거나 JSON을 불러오세요.")
+        return
+
+    editor_df = pd.DataFrame({
+        "종목명": [i["name"] for i in items], "코드": [i["code"] for i in items],
+        "평단가": pd.to_numeric([i["buy_price"] for i in items], errors="coerce"),
+        "수량": pd.to_numeric([i["qty"] for i in items], errors="coerce"),
+        "메모": [i["memo"] for i in items],
+    })
+    edited = st.data_editor(
+        editor_df, hide_index=True, width="stretch", key=f"wl_editor_{group}_{version}", disabled=["종목명", "코드"],
+        column_config={"평단가": st.column_config.NumberColumn("평단가(원)", min_value=0, step=100, format="%d"),
+                       "수량": st.column_config.NumberColumn(min_value=0, step=1, format="%d"),
+                       "메모": st.column_config.TextColumn(max_chars=wlc.MAX_MEMO_LEN)})
+    for item, (_, row) in zip(items, edited.iterrows()):
+        wlc.update_item(item, row["평단가"], row["수량"], row["메모"])
+    io_box.download_button("⬇️ 관심종목 JSON 내려받기", wlc.dumps(wl), file_name="watchlist.json", mime="application/json", key="wl_download")
+
+    rm_key = f"wl_remove_{group}"
+    r1, r2 = st.columns([4, 1], vertical_alignment="bottom")
+    names = {i["code"]: i["name"] for i in items}
+    r1.multiselect("삭제할 종목", list(names), format_func=lambda c: f"{names[c]} ({c})", key=rm_key)
+    r2.button("선택 삭제", key=f"{rm_key}_btn", on_click=_wl_remove_cb, args=(group, rm_key), width="stretch")
+
+    st.divider()
+    run_clicked = st.button(f"📊 '{group}' 일괄 진단 실행 ({len(items)}종목)", key="wl_run", type="primary")
+    if run_clicked:
+        with st.spinner("시세와 수급을 불러와 진단하는 중입니다..."):
+            results = run_watchlist_diagnosis(items)
+        st.session_state["wl_results"] = {"group": group, "ts": now_kst().strftime('%H:%M'), "results": results,
+                                          "sig": tuple((i["code"], i["buy_price"]) for i in items)}
+
+    saved = st.session_state.get("wl_results")
+    if not saved or saved["group"] != group:
+        st.info("일괄 진단을 실행하면 종목별 등급·신호 표가 나옵니다. 평단가를 입력한 종목은 보유 판정도 함께 계산됩니다.")
+        return
+    if saved["sig"] != tuple((i["code"], i["buy_price"]) for i in items):
+        st.warning("평단가가 바뀌어 아래 결과가 오래되었습니다. 일괄 진단을 다시 실행하세요.")
+    st.caption(f"마지막 실행 {saved['ts']} · 시세·수급은 5분간 캐시됩니다.")
+
+    ok = [(item, diag) for item, diag, _ in saved["results"] if diag is not None]
+    failed = [f"{item['name']}({reason})" for item, diag, reason in saved["results"] if diag is None]
+    if failed:
+        st.caption(f"⚠️ 진단하지 못한 종목: {', '.join(failed)}")
+    if not ok:
+        return
+
+    table = pd.DataFrame([dc.to_row(diag, item["name"]) for item, diag in ok])
+    counts = table["신호"].value_counts()
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("전체", len(table))
+    for col, signal in zip(metric_cols[1:], dc.SIGNAL_ORDER):
+        col.metric(f"{WL_SIGNAL_ICONS[signal]} {signal}", int(counts.get(signal, 0)))
+
+    f1, f2 = st.columns([3, 2])
+    picked = f1.multiselect("신호 필터", list(dc.SIGNAL_ORDER), default=list(dc.SIGNAL_ORDER), key="wl_filter")
+    sort_by = f2.radio("정렬", ["등급순", "등락률순", "이름순"], horizontal=True, key="wl_sort")
+    view = table[table["신호"].isin(picked)]
+    if sort_by == "등급순":
+        view = view.sort_values(["_grade_rank", "_ratio", "종목명"], ascending=[True, False, True])
+    elif sort_by == "등락률순":
+        view = view.sort_values("등락률%", ascending=False)
+    else:
+        view = view.sort_values("종목명")
+    view = view.reset_index(drop=True)
+    if view.empty:
+        st.info("선택한 신호에 해당하는 종목이 없습니다.")
+        return
+
+    shown = view.assign(신호=view["신호"].map(lambda s: f"{WL_SIGNAL_ICONS[s]} {s}"))[
+        ["종목명", "신호", "매수 등급", "핵심 통과", "매도 판정", "보유 판정", "손익%", "종가", "등락률%", "추세", "수급", "거래량", "패턴"]]
+    event = st.dataframe(
+        shown, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="wl_table",
+        column_config={"종가": st.column_config.NumberColumn(format="%d"),
+                       "등락률%": st.column_config.NumberColumn(format="%+.2f"),
+                       "손익%": st.column_config.NumberColumn(format="%+.1f")})
+    st.caption("※ 매수 등급·핵심 통과 = 240일선·수급·거래량 기준. 신호는 위험 우선(매도 고려 > 매수 고려 > 사지 않기 > 지켜보기)으로 하나만 표시합니다. 행을 클릭하면 상세 진단이 아래에 열립니다.")
+
+    selected = event.selection.rows
+    if not selected:
+        return
+    code = view.iloc[selected[0]]["코드"]
+    item, diag = next((it, d) for it, d in ok if d.code == code)
+    st.divider()
+    mode = st.radio("상세 진단 모드", ["매수", "보유", "매도"], horizontal=True, key="wl_mode", format_func=lambda m: f"{m} 진단")
+    render_diagnosis(diag, item["name"], mode, key_prefix="wl")
+
+if menu == "AI 종목 진단":
+    st.subheader("🩺 AI 종목 진단")
+    st.markdown("240일선·수급·거래량 3개 핵심 항목으로 등급을 매기고, 10일선·20일선·정배열·패턴·6~2개월 모멘텀은 참고 신호로 보여줍니다. 판정은 모두 규칙 기반이라 같은 데이터면 항상 같은 결과가 나옵니다.")
+    st.caption("※ 투자 참고용 점검표입니다. 과거 검증(코스피 상위 300·코스닥 상위 100, 20일·60일 보유, 수급은 과거 데이터가 없어 제외)에서 "
+               "'사지 않기'(종가가 240일선 아래)는 2020년 이후 세 시장 모두 시장 대비 열위였고 2006~2014년에도 같은 방향이었지만, "
+               "2015~2019년에는 효과가 없었습니다(장세 의존). '매수 고려'가 '지켜보기'보다 낫다는 근거는 확인되지 않았습니다. "
+               "매수 신호보다는 피해야 할 종목을 거르는 용도에 가깝습니다. 투자 판단과 책임은 본인에게 있습니다.")
+    tab_single, tab_watch = st.tabs(["🔎 종목 진단", "⭐ 관심종목 일괄 진단"])
+    with tab_single:
+        render_diag_single()
+    with tab_watch:
+        render_diag_watchlist()
+
+# --- 투자사이트 ---------------------------------------------------------------------------
+# 버핏연구소·Stock Issue Service·SMIC의 분석 글을 모아 언급 종목 현황, 핵심 요약, 글 이후 주가 영향도를 보여준다.
+# 글 수집은 GitHub Actions(update_invest_sites.py)가 매일 하고 invest_sites_data.json에 쌓인다. 시세·현황은 화면을 열 때마다 새로 계산한다.
+INVEST_DATA_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "invest_sites_data.json")
+INVEST_TONE_ICON = {"긍정": "🟢", "중립": "⚪", "부정": "🔴"}
+INVEST_SOURCE_NAMES = {k: v["name"] for k, v in isc.SOURCES.items()}
+INVEST_HIDDEN_BY_DEFAULT = ("eduinfom",)    # 'AI 보조 작성'이 하루 수십 건씩 쏟아지는 출처 — 기본은 숨기고 출처 필터에서 켠다
+INVEST_MAX_PRICED = 150     # 한 화면에서 시세를 새로 조회하는 최대 종목 수(5분 캐시, 8개 병렬)
+
+@st.cache_data(ttl=600)
+def load_invest_data(mtime):
+    return isc.load_data(INVEST_DATA_PATH)
+
+def invest_data():
+    try:
+        mtime = os.path.getmtime(INVEST_DATA_PATH)
+    except OSError:
+        mtime = 0
+    return load_invest_data(mtime)
+
+def invest_prices(codes):
+    """언급 종목의 최근 종가 시리즈(5분 캐시 공유). 조회 실패 종목은 None."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    def one(code):
+        try:
+            return code, fetch_diag_ohlcv(code, 300)["Close"].astype(float).dropna()
+        except Exception:
+            return code, None
+
+    with ThreadPoolExecutor(8) as ex:
+        return dict(ex.map(one, sorted(codes)))
+
+def invest_stock_table(arts, prices):
+    """종목별로 묶은 언급 현황. 현재가·전일비·글 이후 수익률·목표가 여력은 지금 시세로 계산한다."""
+    rows = []
+    by_code = {}
+    for a in arts:
+        for s in a.get("stocks", []):                           # 주 종목과 제목에 함께 나온 관련 종목 모두
+            by_code.setdefault(s["code"], []).append(a)
+    for code, items in by_code.items():
+        items.sort(key=lambda a: (a["date"] or "", a["id"]), reverse=True)
+        last = items[0]
+        name = next(s["name"] for s in last["stocks"] if s["code"] == code)
+        close = prices.get(code)
+        row = {"종목명": name, "코드": code, "최근 언급일": last["date"], "언급 글": len(items),
+               "출처": " · ".join(sorted({INVEST_SOURCE_NAMES[a["source"]] for a in items})),
+               "논조": " ".join(f"{INVEST_TONE_ICON[t]}{sum(1 for a in items if a.get('tone') == t)}" for t in ("긍정", "중립", "부정")),
+               "_date": last["date"]}
+        tgt = next((a for a in items if a.get("target_price")), None)
+        if tgt:
+            row["최근 의견"] = f"{tgt.get('broker', '')} {tgt.get('opinion', '')} {tgt['target_price']:,}원" + (f" ({tgt['target_dir']})" if tgt.get("target_dir") else "")
+        if close is not None and len(close) > 2:
+            now = float(close.iloc[-1])
+            row["현재가"], row["전일비%"] = now, (now / float(close.iloc[-2]) - 1) * 100
+            pos = int(close.index.searchsorted(pd.Timestamp(last["date"])))
+            if 0 < pos < len(close) - 1:                       # 최근 글이 나온 날 종가 → 지금
+                row["글 이후%"] = (now / float(close.iloc[pos]) - 1) * 100
+            if tgt:
+                row["목표가 여력%"] = (tgt["target_price"] / now - 1) * 100
+        row["핵심"] = (isc.BYLINE.sub("", last["summary"][0])[:90] + "…") if last.get("summary") else ""
+        rows.append(row)
+    df = pd.DataFrame(rows)
+    return df.sort_values(["_date", "언급 글"], ascending=False).reset_index(drop=True) if len(df) else df
+
+def render_invest_article(a, key):
+    stock_txt = ", ".join(s["name"] for s in a.get("stocks", [])) or "(상장 종목 아님)"
+    flags = " 🤖 AI 보조 작성" if a.get("ai_assisted") else ""
+    with st.container(border=True):
+        st.markdown(f"**[{a['title']}]({a['url']})**  \n"
+                    f"<span style='color:gray; font-size:0.85rem;'>{INVEST_SOURCE_NAMES[a['source']]} · {a['kind']} · {a['date']} · {stock_txt}{flags}</span>",
+                    unsafe_allow_html=True)
+        facts = [f"{INVEST_TONE_ICON.get(a.get('tone'), '⚪')} 논조 {a.get('tone', '중립')}(제목 키워드 기준)"]
+        if a.get("broker"):
+            facts.append(a["broker"])
+        if a.get("opinion"):
+            facts.append(f"의견 {a['opinion']}")
+        if a.get("target_price"):
+            facts.append(f"목표가 {a['target_price']:,}원" + (f" ← {a['target_prev']:,}원" if a.get("target_prev") else "") + (f" ({a['target_dir']})" if a.get("target_dir") else ""))
+        st.caption(" · ".join(facts))
+        for s in a.get("summary", []):
+            st.markdown(f"- {isc.BYLINE.sub('', s)}")
+        if a.get("summary_by") == "rule":
+            st.caption("※ 원문 앞부분을 발췌한 요약입니다.")
+        rx = a.get("reaction")
+        if rx:
+            parts = [f"공표 전 20일 {rx['abn_pre20'] * 100:+.1f}%p"] if "abn_pre20" in rx else []
+            if "abn_d0" in rx:
+                parts.append(f"당일 {rx['abn_d0'] * 100:+.1f}%p")
+            for k in isc.POST_DAYS:
+                if f"abn_post{k}" in rx:
+                    parts.append(f"공표 후 {k}일 {rx[f'abn_post{k}'] * 100:+.1f}%p")
+            if parts:
+                st.caption("📈 지수 대비 초과수익: " + " · ".join(parts))
+
+def render_invest_chart(code, name, arts, close):
+    import plotly.graph_objects as go
+    c = close.tail(160)
+    fig = go.Figure(go.Scatter(x=c.index, y=c.values, mode="lines", line=dict(color="#1857e0", width=1.6), name="종가"))
+    for a in arts:
+        pos = int(c.index.searchsorted(pd.Timestamp(a["date"])))
+        if pos >= len(c):
+            continue
+        fig.add_trace(go.Scatter(x=[c.index[pos]], y=[c.iloc[pos]], mode="markers", name=INVEST_SOURCE_NAMES[a["source"]],
+                                 marker=dict(size=11, symbol="diamond", color={"긍정": "#d60000", "부정": "#1857e0"}.get(a.get("tone"), "#6b7280"), line=dict(width=1, color="white")),
+                                 text=[a["title"][:50]], hoverinfo="text+x+y", showlegend=False))
+    fig.update_layout(height=320, margin=dict(l=10, r=10, t=30, b=10), title=f"{name}({code}) — ◆는 분석 글이 나온 날(빨강=긍정, 파랑=부정, 회색=중립)", hovermode="x unified")
+    st.plotly_chart(fig, theme=None, key=f"invest_chart_{code}")
+
+def render_invest_sites():
+    st.markdown("버핏연구소·Stock Issue Service·SMIC의 분석 글에서 **언급된 종목**을 모아 현황을 보여주고, 글의 **핵심을 요약**하고, 글이 나온 뒤 **주가가 어떻게 움직였는지**를 봅니다.")
+    st.caption("※ 원문은 저장하지 않고 제목·날짜·링크와 짧은 요약만 보관하며, 모든 글에 원문 링크를 붙입니다. 요약은 원문 발췌 또는 AI 요약이라 원문과 다를 수 있습니다. "
+               "논조는 제목 키워드·목표가 방향으로 매긴 거친 분류이고, Stock Issue Service 글은 'AI 보조 작성'으로 표기돼 있습니다. 투자 판단과 책임은 본인에게 있습니다.")
+    data = invest_data()
+    arts_all = data.get("articles", [])
+    if not arts_all:
+        st.info("아직 수집된 글이 없습니다. 아래 '지금 수집'을 누르거나 `python update_invest_sites.py`를 실행하세요.")
+    top = st.columns([2, 2, 2, 1.4])
+    days = top[0].selectbox("기간", [7, 14, 30, 60], index=1, format_func=lambda d: f"최근 {d}일", key="invest_days")
+    srcs = top[1].multiselect("출처", list(INVEST_SOURCE_NAMES), default=[k for k in INVEST_SOURCE_NAMES if k not in INVEST_HIDDEN_BY_DEFAULT],
+                              format_func=INVEST_SOURCE_NAMES.get, key="invest_srcs")
+    tones = top[2].multiselect("논조", ["긍정", "중립", "부정"], default=["긍정", "중립", "부정"], key="invest_tones")
+    if top[3].button("지금 수집", key="invest_refresh", help="최근 3일 새 글을 지금 수집합니다(요약은 원문 발췌, 약 1~2분)."):
+        with st.spinner("새 글을 수집하고 주가 반응을 계산하는 중입니다..."):
+            try:
+                isu.run_update(INVEST_DATA_PATH, days=3, use_llm=False, log=lambda *_: None)
+                load_invest_data.clear()
+                st.rerun()
+            except Exception as e:
+                st.error(f"수집에 실패했습니다: {e}")
+    updated = data.get("updated")
+    totals = data.get("meta", {}).get("sources", {})
+    st.caption(f"마지막 업데이트: {updated[:16].replace('T', ' ') if updated else '-'} (평일 장 마감 후 자동 수집) · 최근 60일 {len(arts_all):,}건 표시 · 누적 {sum(totals.values()):,}건("
+               + " · ".join(f"{INVEST_SOURCE_NAMES.get(k, k)} {v:,}" for k, v in totals.items()) + ")")
+
+    since = (now_kst().date() - timedelta(days=days)).strftime("%Y-%m-%d")
+    arts = [a for a in arts_all if (a.get("date") or "") >= since and a["source"] in srcs and (a.get("tone", "중립") in tones)]
+    hidden = Counter(a["source"] for a in arts_all if (a.get("date") or "") >= since and a["source"] not in srcs)
+    if hidden:
+        st.caption("※ 출처 필터로 숨겨진 글: " + " · ".join(f"{INVEST_SOURCE_NAMES[k]} {v:,}건" for k, v in hidden.items())
+                   + (" (AI 보조 작성 글이 많아 기본은 숨깁니다. '출처'에서 추가하면 보입니다.)" if any(k in INVEST_HIDDEN_BY_DEFAULT for k in hidden) else ""))
+    tab_stock, tab_arts, tab_impact = st.tabs(["📌 언급 종목 현황", "📰 글 요약", "📊 주가 영향도"])
+
+    with tab_stock:
+        recent_codes = []                                      # 최근 언급 순서로 중복 제거
+        for a in sorted(arts, key=lambda a: (a.get("date") or "", a["id"]), reverse=True):
+            for s in a.get("stocks", []):
+                if s["code"] not in recent_codes:
+                    recent_codes.append(s["code"])
+        if not recent_codes:
+            st.info("조건에 맞는 언급 종목이 없습니다.")
+        else:
+            if len(recent_codes) > INVEST_MAX_PRICED:
+                st.caption(f"※ 언급 종목이 {len(recent_codes)}개라 시세·현황은 최근 언급 {INVEST_MAX_PRICED}개 종목만 계산합니다(기간이나 출처를 좁히면 더 볼 수 있습니다).")
+                keep = set(recent_codes[:INVEST_MAX_PRICED])
+                arts = [dict(a, stocks=[s for s in a.get("stocks", []) if s["code"] in keep]) for a in arts]
+                arts = [a for a in arts if a["stocks"] or a["source"] == "smic"]
+            with st.spinner("현재 시세를 불러오는 중입니다..."):
+                prices = invest_prices(set(recent_codes[:INVEST_MAX_PRICED]))
+            table = invest_stock_table(arts, prices)
+            m = st.columns(4)
+            m[0].metric("언급 종목", len(table))
+            m[1].metric("글", len({a["id"] for a in arts if a.get("stocks")}))
+            m[2].metric("2곳 이상이 다룬 종목", int(sum(1 for _, r in table.iterrows() if r["출처"].count("·") >= 1)))
+            up = table["전일비%"].dropna() if "전일비%" in table else pd.Series(dtype=float)
+            m[3].metric("전일 상승 종목", f"{int((up > 0).sum())}/{len(up)}")
+            show = table.drop(columns=["_date"])
+            event = st.dataframe(show, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="invest_table",
+                                 column_config={"현재가": st.column_config.NumberColumn(format="localized"), "전일비%": st.column_config.NumberColumn(format="%+.2f"),
+                                                "글 이후%": st.column_config.NumberColumn(format="%+.1f", help="가장 최근 글이 나온 날 종가 → 현재가"),
+                                                "목표가 여력%": st.column_config.NumberColumn(format="%+.1f", help="가장 최근 목표가 ÷ 현재가 − 1"),
+                                                "핵심": st.column_config.TextColumn(width="large")})
+            sel = event.selection.rows if event and event.selection else []
+            if sel:
+                row = table.iloc[sel[0]]
+                code = row["코드"]
+                st.divider()
+                mine = sorted([a for a in arts if any(s["code"] == code for s in a.get("stocks", []))], key=lambda a: a["date"], reverse=True)
+                if prices.get(code) is not None:
+                    render_invest_chart(code, row["종목명"], mine, prices[code])
+                for i, a in enumerate(mine[:10]):
+                    render_invest_article(a, f"stock_{code}_{i}")
+            else:
+                st.caption("종목 행을 클릭하면 아래에 주가 차트와 글 요약이 열립니다.")
+
+    with tab_arts:
+        ordered = sorted(arts, key=lambda a: (a.get("date") or "", a["id"]), reverse=True)
+        st.caption(f"{len(ordered)}건 중 최신 60건")
+        for i, a in enumerate(ordered[:60]):
+            render_invest_article(a, f"art_{i}")
+
+    with tab_impact:
+        impact = pd.DataFrame(data.get("impact") or [])
+        if impact.empty:
+            st.info("영향도를 계산할 표본이 아직 없습니다. `python update_invest_sites.py --backfill-days 365`로 과거 글을 모아 주세요.")
+        else:
+            st.markdown("글이 나온 날을 기준으로 종목 수익률에서 **같은 기간 시장 지수(코스피/코스닥) 수익률을 뺀 초과수익**의 평균입니다.")
+            st.caption("공표 전 20일 = 글이 나오기 전 이미 움직였는지 · 공표 당일 = 글과 같은 날의 반응(글을 읽고 따라 살 수 있는 수익이 아님) · 공표 후 N일 = 글이 나온 날 종가 이후의 수익(읽고 난 뒤 기준). "
+                       "같은 날 나온 글은 하루 평균으로 묶고 그 날짜 시계열로 t값(Newey-West)을 냈습니다. 날짜가 30개 미만인 칸은 비웁니다.")
+            n = data.get("meta", {}).get("with_reaction", 0)
+            st.caption(f"주가 반응을 계산한 글 {n:,}건 기준(같은 종목·같은 날·같은 출처의 중복은 1건으로 집계).")
+            fmt = {c: "{:+.2f}" for c in impact.columns if c.endswith("%") and c != "5일 승률%"}
+            fmt["글 수"], fmt["날짜 수"] = "{:,.0f}", "{:,.0f}"
+            fmt.update({c: "{:.1f}" for c in impact.columns if c.endswith(" t")})
+            fmt["5일 승률%"] = "{:.0f}"
+            st.dataframe(impact.style.format(fmt, na_rep="-"), hide_index=True, width="stretch")
+            import plotly.graph_objects as go
+            cols = ["공표 전 20일 초과%", "공표 당일 초과%", "공표 후 1일 초과%", "공표 후 5일 초과%", "공표 후 20일 초과%"]
+            g = impact[impact["그룹"].isin(["전체"] + [f"source={k}" for k in INVEST_SOURCE_NAMES])]
+            fig = go.Figure()
+            for _, r in g.iterrows():
+                label = "전체" if r["그룹"] == "전체" else INVEST_SOURCE_NAMES.get(r["그룹"].split("=")[1], r["그룹"])
+                fig.add_trace(go.Bar(name=f"{label} ({int(r['글 수'])}건)", x=[c.replace(" 초과%", "") for c in cols], y=[r[c] for c in cols]))
+            fig.update_layout(barmode="group", height=340, margin=dict(l=10, r=10, t=30, b=10), yaxis_title="지수 대비 초과수익 평균(%p)", title="글 전후 평균 초과수익")
+            st.plotly_chart(fig, theme=None, key="invest_impact_chart")
+            st.warning("해석할 때 주의: ① 증권사 리포트·이슈 글은 대개 이미 일어난 실적·주가 변동을 뒤따라 나옵니다(공표 전 20일·당일 값을 보세요). ② 평균은 t값(|t|<2면 우연과 구별이 어려움)과 함께 보세요. "
+                       "③ 현재 시총 상위·언급 종목 위주라 생존편향이 있고, 거래비용은 반영하지 않았습니다.")
+
+if menu == "투자사이트":
+    st.subheader("📚 투자사이트")
+    render_invest_sites()
 
 if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완벽히 일치시켰습니다.
     st.subheader("🤖 개별종목분석")
