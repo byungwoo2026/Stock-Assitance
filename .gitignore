@@ -7,3 +7,6 @@ __pycache__/
 .streamlit/secrets.toml
 
 .streamlit/secrets.toml
+dart_cache/
+dart_인증키.txt
+*인증키*
