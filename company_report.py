@@ -606,6 +606,7 @@ def build_report(raw, price, price_date=None, naver_annual=None, risk_levels=Non
 
     filings = parse_filings(raw.get("filings") or [], today, risk_levels)
     return {"code": raw["code"], "name": raw["name"], "fs": "연결" if fs == "CFS" else "별도", "annual_year": A, "financial_like": financial_like, "currency": currency,
+            "rcept_no": next((r.get("rcept_no") for r in raw["main_a"] if r.get("rcept_no")), None),      # 사업보고서 접수번호(3단계 서술의 원문·캐시 키)
             "interim": {k: interim[k] for k in ("year", "rc", "label")} if interim else None,
             "header": head, "annual": annual, "holders": holders, "treasury": treasury, "valuation": valuation, "mix": raw.get("mix"),
             "filings": filings, "notes": notes}

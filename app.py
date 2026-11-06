@@ -37,8 +37,11 @@ import risk_disclosure as rdisc       # 'AI 종목 진단'의 위험 공시 경�
 import company_report as crep         # 'AI 종목 진단'의 종목 분석 보고서(DART 숫자만: 재무·현금흐름·매출 구성·주주·공시·피어 비교·밸류 시뮬레이터)
 import segment_mix as smix            # 보고서의 매출 구성(사업부문·제품·지역)
 import peer_compare as pcmp           # 보고서의 피어 비교(같은 업종 시총 비슷한 종목을 같은 방식으로 계산)
+import filing_text as ftext           # 보고서의 AI 서술 재료: 사업보고서 본문 섹션(사업의 개요·경영진단·제재·소송·핵심감사사항)
+import report_narrative as rnar       # 보고서의 AI 서술(사업 요약·변화·비판적 리스크). LLM은 서술만, 숫자·인용은 코드가 검증
 import dart_core
 import plotly.graph_objects as go
+from streamlit.errors import StreamlitAPIException
 
 # Groq가 특정 모델을 예고 없이 단종시킨 전례가 있어(예: llama-3.3-70b-versatile),
 # 최우선 모델이 실패하면 다음 모델로 자동 전환. 가끔 갱신이 필요할 수 있음(2026-09-16 기준 확인).
@@ -2766,6 +2769,83 @@ def render_report_simulator(rep, code, key_prefix, peer_summary=None):
                "순이익 × PER을 곱한 단순 산식이라 예측도 기업가치 평가도 아닙니다. 과거 PER은 사업연도 말 주가 기준 3개 연도뿐이고, 이익이 급변한 종목(후행 이익이 사업연도의 2배 이상 등)은 "
                "배수 기준점이 현재 이익과 맞지 않을 수 있습니다. PER 기준점에 쓴 네이버 값은 DART 순이익과 출처가 달라 소수점 단위로 어긋날 수 있습니다.")
 
+def _md_safe(s):
+    """공시 원문·AI 문장을 st.markdown에 넣기 전 마크다운 기호를 무력화한다: $ 쌍은 수식, ~ 쌍은 취소선, [..](..)는 클릭 가능한 링크(원문·모델 출력에 섞이면 안 됨)가 된다.
+    공백은 한 칸으로 줄여 줄바꿈이 목록·제목으로 바뀌지 않게 한다."""
+    s = re.sub(r"\s+", " ", str(s))
+    for ch in ("\\", "$", "~", "[", "]", "`", "*", "_", "<", ">"):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+def render_narrative_result(res):
+    """검증을 통과한 AI 서술 + 근거(F·Q) + 탈락 문장. 인용은 코드가 원문 발췌와 대조한 것만 나온다."""
+    label = {q["id"]: q["label"] for q in res.get("excerpts", [])}
+    url = crep.DART_VIEW + (res.get("rcept_no") or "")
+    for key in ("business", "changes", "risks", "questions"):
+        items = res.get(key) or []
+        if not items and key != "risks":
+            continue
+        st.markdown(f"**{rnar.SECTION_NAMES[key]}**")
+        if not items:
+            st.caption("검증을 통과한 리스크 문장이 없습니다(근거가 약하거나 숫자·인용 검증에서 모두 탈락). 아래 '검증에서 탈락한 문장'과 공시 원문을 직접 확인해 주세요.")
+        for it in items:
+            if key == "risks":
+                st.markdown(f"- **{_md_safe(it['title'])}** — {_md_safe(it['text'])}" if it.get("title") else f"- {_md_safe(it['text'])}")
+                if it.get("quote"):
+                    st.markdown(f"> “{_md_safe(it['quote'])}” — 사업보고서 · {label.get(it.get('quote_id'), '')} · [DART 원문]({url})")
+            else:
+                st.markdown(f"- {_md_safe(it['text'])}")
+            st.caption("근거 " + " · ".join(it["refs"]))
+    st.caption(f"생성 {res['generated_at']} · {res['model']} · 검증 통과 {res['kept']}/{res['asked']}문장"
+               + (f" · 앞선 시도 실패: {', '.join(res['llm_errors'])}" if res.get("llm_errors") else ""))
+    if res.get("dropped"):
+        with st.expander(f"검증에서 탈락한 문장 ({len(res['dropped'])})"):
+            for d in res["dropped"]:
+                st.markdown(f"- [{rnar.SECTION_NAMES.get(d['section'], d['section'])}] {_md_safe(d['text'])} — **{_md_safe(d['reason'])}**")
+    with st.expander("근거 목록 (사실 F · 공시 원문 Q)"):
+        st.markdown("**사실 F** — 위 보고서 숫자를 코드가 문장으로 옮긴 것(종가에 따라 변하는 시총·PER은 넣지 않음)")
+        for f in res.get("facts", []):
+            st.markdown(f"- **{f['id']}** {_md_safe(f['text'])}")
+        st.markdown(f"**공시 원문 발췌 Q** — [사업보고서 원문]({url})에서 뽑은 부분(글자 예산 안에서 위험 단서가 있는 문단 위주)")
+        for q in res.get("excerpts", []):
+            st.markdown(f"- **{q['id']}** ({q['label']}) {_md_safe(q['text'])}")
+
+def render_report_narrative(rep, code, key_prefix):
+    st.markdown("##### 🤖 AI 서술 — 사업 요약 · 최근 변화 · 비판적 리스크")
+    st.caption("사업보고서 본문과 위 숫자만 재료로 Groq가 쓰고, 코드가 검증합니다. 검증은 ① 문장 속 숫자가 근거에 있는지 ② 인용문이 원문에 그대로 있는지 "
+               "③ 전망·목표가·매수/매도 표현이 없는지만 확인합니다. 해석이 맞는지까지 보장하지는 않으니 인용 원문을 직접 확인하세요. 자동 실행하지 않고 버튼을 눌렀을 때만 생성합니다.")
+    if not rep.get("rcept_no"):
+        st.info("사업보고서 접수번호를 찾지 못해 AI 서술을 만들 수 없습니다.")
+        return
+    state_key = f"{key_prefix}_narr_{code}_{rep['rcept_no']}"
+    res = st.session_state.get(state_key) or rnar.load_cached(rep)       # 같은 보고서·같은 숫자면 이전 결과를 바로 보여준다(디스크 캐시)
+    if st.button("다시 생성" if res else "AI 서술 생성", key=f"{key_prefix}_narr_btn_{code}",
+                 help="처음엔 DART 본문 내려받기 포함 20초 안팎. Groq 무료 한도(분당 8,000토큰) 때문에 연달아 누르면 최대 1분 더 기다릴 수 있습니다."):
+        try:
+            api_key = str(st.secrets["GROQ_API_KEY"])
+        except Exception:
+            api_key = None
+        if not GENAI_AVAILABLE or not api_key:
+            st.info("💡 Groq 패키지 또는 GROQ_API_KEY(Secrets)가 없어 AI 서술을 만들 수 없습니다.")
+        else:
+            with st.spinner("사업보고서 본문을 읽고 서술을 만드는 중입니다(최대 1분)..."):
+                try:
+                    sections = ftext.fetch_sections(rep["rcept_no"])
+                    new = rnar.generate(rep, sections, rnar.groq_llm(api_key))
+                except (rnar.NarrativeError, dart_core.DartError) as e:
+                    st.warning(f"AI 서술을 만들지 못했습니다: {e}")
+                except Exception as e:
+                    st.warning(f"AI 서술을 만들지 못했습니다({type(e).__name__}).")
+                else:
+                    rnar.save_cached(rep, new)
+                    st.session_state[state_key] = res = new
+                    try:
+                        st.rerun(scope="fragment")      # 버튼 라벨('다시 생성')을 새 상태로 다시 그린다. 조각 재실행 중에만 허용된다
+                    except StreamlitAPIException:       # 전체 재실행 중에 불린 경우 — 지금 상태 그대로 그린다(RerunException은 BaseException이라 여기서 잡히지 않는다)
+                        pass
+    if res:
+        render_narrative_result(res)
+
 @st.fragment
 def render_company_report(code, name, price, price_date, key_prefix):
     """종목 분석 보고서. 슬라이더를 움직여도 이 조각만 다시 그린다(진단 화면 전체를 다시 계산하지 않음)."""
@@ -2802,6 +2882,7 @@ def render_company_report(code, name, price, price_date, key_prefix):
     render_report_filings(rep, code, key_prefix)
     peer_summary = render_report_peers(rep, code, name, key_prefix)
     render_report_simulator(rep, code, key_prefix, peer_summary)
+    render_report_narrative(rep, code, key_prefix)
 
     with st.expander("계산 기준과 데이터 한계"):
         st.markdown(
