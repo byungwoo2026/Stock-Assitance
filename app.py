@@ -33,6 +33,15 @@ import os
 from collections import Counter
 import invest_sites_core as isc      # '투자사이트' 탭: 분석 글 수집·종목 추출·요약·주가 영향도(streamlit 비의존)
 import update_invest_sites as isu     # 같은 수집기를 GitHub Actions가 매일 실행하고, 탭의 '지금 수집'도 호출한다
+import risk_disclosure as rdisc       # 'AI 종목 진단'의 위험 공시 경고(DART) — 검증을 통과한 감자·관리종목/상장폐지 사유·감사의견만
+import company_report as crep         # 'AI 종목 진단'의 종목 분석 보고서(DART 숫자만: 재무·현금흐름·매출 구성·주주·공시·피어 비교·밸류 시뮬레이터)
+import segment_mix as smix            # 보고서의 매출 구성(사업부문·제품·지역)
+import peer_compare as pcmp           # 보고서의 피어 비교(같은 업종 시총 비슷한 종목을 같은 방식으로 계산)
+import filing_text as ftext           # 보고서의 AI 서술 재료: 사업보고서 본문 섹션(사업의 개요·경영진단·제재·소송·핵심감사사항)
+import report_narrative as rnar       # 보고서의 AI 서술(사업 요약·변화·비판적 리스크). LLM은 서술만, 숫자·인용은 코드가 검증
+import dart_core
+import plotly.graph_objects as go
+from streamlit.errors import StreamlitAPIException
 
 # Groq가 특정 모델을 예고 없이 단종시킨 전례가 있어(예: llama-3.3-70b-versatile),
 # 최우선 모델이 실패하면 다음 모델로 자동 전환. 가끔 갱신이 필요할 수 있음(2026-09-16 기준 확인).
@@ -2290,6 +2299,13 @@ def calculate_stock_score(fundamentals, tech, news_list):
 # ==========================================
 # AI 종목 진단 — 판정은 전부 diagnosis_core.py의 규칙(같은 입력 → 같은 결과). LLM은 '재료 요약'에만 사용하며 등급에 반영하지 않음.
 # ==========================================
+# DART 키는 환경변수 DART_API_KEY 또는 .streamlit/secrets.toml 에서 읽는다(dart_core). 클라우드 Secrets 는 st.secrets 로 오므로 환경변수로 옮겨 둔다.
+try:
+    if "DART_API_KEY" in st.secrets:
+        os.environ.setdefault("DART_API_KEY", str(st.secrets["DART_API_KEY"]))
+except Exception:
+    pass    # secrets 가 없는 환경 — 위험 공시 확인만 '키 없음'으로 안내하고 나머지 진단은 그대로 동작
+
 DIAG_VERDICT_COLORS = {
     "매수 고려": "green", "지켜보기": "orange", "사지 않기": "red",
     "매도 고려": "red", "보유 유지": "green", "손절 고려": "red",
@@ -2391,11 +2407,514 @@ def render_check_line(c):
     st.markdown(f"{icon} **{c.axis}** · {c.label}  \n<span style='color:gray; font-size:0.85rem;'>{c.detail}</span>",
                 unsafe_allow_html=True)
 
-def render_diagnosis(diag, name, mode, key_prefix="diag"):
-    """진단 결과 한 종목의 상세 화면. 같은 화면에 두 번 그려질 수 있어(종목 진단 탭 / 관심종목 탭) 위젯 키에 key_prefix를 쓴다."""
-    res = diag.results[mode]
+@st.cache_data(ttl=600, show_spinner=False)
+def fetch_risk_flags(code, as_of_str):
+    """DART에서 최근 위험 공시(감자·관리종목·감사의견)를 찾는다. 실패는 예외 대신 ('err', 사유)로 돌려 10분간 DART를 다시 두드리지 않는다."""
+    try:
+        return "ok", rdisc.fetch_flags(code, datetime.strptime(as_of_str, "%Y-%m-%d").date())
+    except Exception as e:      # DartError 메시지는 키를 담지 않는다(dart_core)
+        return "err", f"{type(e).__name__}: {str(e)[:100]}"
+
+def run_risk_flags(codes, max_workers=6):
+    """관심종목 전체의 위험 공시를 병렬로 확인. 반환: {코드: ('ok', 목록) 또는 ('err', 사유)}."""
+    from concurrent.futures import ThreadPoolExecutor
+    today = now_kst().strftime("%Y-%m-%d")
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        return dict(zip(codes, executor.map(lambda c: fetch_risk_flags(c, today), codes)))
+
+def render_risk_flags(code, risk_asof=None):
+    """검증을 통과한 위험 공시(감자 · 관리종목 지정/상장폐지 사유 · 감사의견)가 최근 있었는지 DART에서 찾아 경고로 보여준다. 등급·신호에는 반영하지 않는다."""
+    asof = risk_asof or now_kst().date()
+    status, payload = fetch_risk_flags(code, asof.strftime("%Y-%m-%d"))
+    if status == "err":
+        st.caption(f"⚠️ DART 위험 공시를 확인하지 못했습니다({payload}). Secrets에 DART_API_KEY가 있는지 확인해 주세요.")
+        return
+    recent = [f for f in payload if f["in_window"]]
+    older = [f for f in payload if not f["in_window"]]
+    for f in recent:
+        box, icon = (st.error, "🔴") if f["level"] == "경고" else (st.warning, "🟠")
+        box(f"**{icon} 위험 공시 {f['level']} — {f['label']}** ({f['date']:%Y-%m-%d} 공시, {f['days_ago']}일 전)  \n"
+            f"{f['evidence']}  \n[DART 원문 보기]({f['url']})")
+    if recent:
+        with st.expander("위험 공시 경고의 근거와 한계"):
+            for f in recent:
+                st.markdown(f"- **{f['label']}** — {f['caveat']}")
+            st.markdown(
+                f"- 근거: {rdisc.EVIDENCE_NOTE}. 같은 날·같은 시장 다른 종목과 견주고, 두 기간(2019~2022 / 2023~2026)에서 방향이 같은지 확인한 유형만 담았습니다.\n"
+                "- 효과 크기는 평균 −5% 안팎으로 작고, 공시 당일에 이미 평균 −1% 안팎이 반영돼 있습니다. 개별 종목의 하락을 예측하는 것이 아니라 '이 공시 뒤 평균적으로 시장보다 약했다'는 과거 통계입니다.\n"
+                "- 거래정지·상장폐지 종목은 가격이 멈춰 수익률 0으로 잡혀 하락이 과소평가됩니다. 등급과 신호에는 반영하지 않았습니다.")
+    if older:
+        st.caption("검증 구간(공시 후 30일) 밖의 최근 6개월 내 위험 공시: "
+                   + " · ".join(f"[{f['label']} {f['date']:%Y-%m-%d}]({f['url']})" for f in older))
+    if not payload:
+        st.caption("➖ 최근 6개월 DART 공시에 감자·관리종목 지정/상장폐지 사유·감사의견 부적정 관련 위험 공시가 없습니다(그 밖의 위험은 이 확인에 포함되지 않습니다)."
+                   + (" 과거 날짜 진단이라 그 날짜까지의 공시만 봅니다." if risk_asof else ""))
+
+# --- 종목 분석 보고서(1단계: DART 숫자만) -------------------------------------------------------
+# 모든 숫자는 company_report.build_report 한 곳에서 계산하고 여기서는 그리기만 한다(같은 지표를 화면마다 다시 계산하지 않는다).
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_company_report_raw(code, today_str):
+    """DART 원자료. 실패는 예외 대신 ('err', 사유)·('nodata', 사유)로 돌려 같은 종목을 열 때마다 DART를 다시 두드리지 않는다."""
+    try:
+        return "ok", crep.fetch_raw(code, datetime.strptime(today_str, "%Y-%m-%d").date())
+    except crep.NoDartData as e:
+        return "nodata", str(e)
+    except Exception as e:      # DartError 메시지는 키를 담지 않는다(dart_core)
+        return "err", f"{type(e).__name__}: {str(e)[:100]}"
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_naver_annual(code):
+    """네이버 연간 재무(연도별 PER) — 밸류 시뮬레이터의 과거 PER 범위 근거. 실패하면 None."""
+    try:
+        res = get_naver_session().get(f"https://m.stock.naver.com/api/stock/{code}/finance/annual", timeout=5)
+        return res.json() if res.status_code == 200 else None
+    except Exception:
+        return None
+
+def _rep_scale(values, currency):
+    """차트 축 단위. 원화는 최대값에 맞춰 조원/억원, 외화는 백만."""
+    peak = max((abs(v) for v in values if v is not None), default=0)
+    if currency != "KRW":
+        return 1e6, f"백만 {currency}"
+    return (1e12, "조원") if peak >= 1e12 else (1e8, "억원")
+
+def _rep_annual_figure(rows, currency):
+    years = [str(r["year"]) for r in rows]
+    div, unit = _rep_scale([r["revenue"] for r in rows] + [r["op"] for r in rows], currency)
+    scaled = lambda k: [None if r[k] is None else r[k] / div for r in rows]
+    fig = go.Figure()
+    fig.add_bar(x=years, y=scaled("revenue"), name="매출액", marker_color="#9ca3af")
+    fig.add_bar(x=years, y=scaled("op"), name="영업이익", marker_color="#d60000")
+    fig.add_scatter(x=years, y=[r["op_margin"] for r in rows], name="영업이익률(%)", yaxis="y2", mode="lines+markers", line=dict(color="#1857e0"))
+    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.15),
+                      yaxis=dict(title=unit), yaxis2=dict(title="%", overlaying="y", side="right", showgrid=False), hovermode="x unified")
+    return fig
+
+def _rep_cash_figure(rows, currency):
+    years = [str(r["year"]) for r in rows]
+    div, unit = _rep_scale([r["ocf"] for r in rows] + [r["capex"] for r in rows], currency)
+    scaled = lambda k: [None if r[k] is None else r[k] / div for r in rows]
+    fig = go.Figure()
+    fig.add_bar(x=years, y=scaled("ocf"), name="영업활동현금흐름", marker_color="#9ca3af")
+    fig.add_bar(x=years, y=scaled("capex"), name="CAPEX(유형+무형 취득)", marker_color="#64748b")
+    fig.add_scatter(x=years, y=scaled("fcf"), name="FCF", mode="lines+markers", line=dict(color="#d60000"))
+    fig.update_layout(barmode="group", height=300, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.15), yaxis=dict(title=unit), hovermode="x unified")
+    return fig
+
+def _rep_annual_dataframe(rep):
+    cur, rows = rep["currency"], rep["annual"]["rows"]
+    ni_label = "순이익(지배주주)" if rep["annual"]["ni_basis"] == "지배주주" else "순이익(전체)"
+    spec = [("매출액", "revenue", "amt"), ("영업이익", "op", "amt"), ("영업이익률", "op_margin", "pct"), (ni_label, "ni", "amt"),
+            ("자산총계", "assets", "amt"), ("부채총계", "liab", "amt"), ("자본총계", "equity", "amt"), ("부채비율", "debt_ratio", "pct0"), ("ROE", "roe", "pct"),
+            ("영업활동현금흐름", "ocf", "amt"), ("CAPEX", "capex", "amt"), ("FCF", "fcf", "amt")]
+    fmt = {"amt": lambda v: crep.fmt_amount(v, cur), "pct": crep.fmt_pct, "pct0": lambda v: crep.fmt_pct(v, 0)}
+    data = {str(r["year"]): [fmt[kind](r[key]) for _, key, kind in spec] for r in rows}
+    return pd.DataFrame(data, index=[label for label, _, _ in spec])
+
+def render_report_header(rep):
+    h, cur = rep["header"], rep["currency"]
+    ttm = h["ttm"]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("종가", f"{h['price']:,.0f}원" if h["price"] else "—", help=f"{h['price_date']:%Y-%m-%d} 종가(진단 화면과 같은 시세)" if h["price_date"] else None)
+    c2.metric("시가총액", crep.fmt_won(h["market_cap"]),
+              help=(f"종가 × 보통주 발행주식수 {h['shares_common']:,.0f}주({h['shares_date']} 기준, 자기주식 포함)" if h["shares_common"] else "주식수를 읽지 못했습니다."))
+    per_txt = "적자" if h["per_status"] == "loss" else crep.fmt_mult(h["per"])
+    c3.metric("PER (후행)", per_txt, help=f"시가총액 ÷ 후행 순이익. 이익 기준: {ttm['label']}. 최근 사업연도 기준 PER은 {crep.fmt_mult(h['per_fy'])}")
+    c4, c5, c6 = st.columns(3)
+    pbr_txt = "자본잠식" if h["pbr_status"] == "neg" else crep.fmt_mult(h["pbr"], 2)
+    c4.metric("PBR", pbr_txt, help=f"시가총액 ÷ 자본({h['equity_label']}, {crep.fmt_amount(h['equity'], cur)})")
+    c5.metric("PSR (후행)", crep.fmt_mult(h["psr"], 2), help="시가총액 ÷ 후행 매출")
+    c6.metric("영업이익률 (후행)", crep.fmt_pct(h["op_margin_ttm"]), help="후행 영업이익 ÷ 후행 매출")
+    st.caption(f"후행 지표 기준: {ttm['label']} · 후행 매출 {crep.fmt_amount(ttm['revenue'], cur)} · 영업이익 {crep.fmt_amount(ttm['op'], cur)} · 순이익 {crep.fmt_amount(ttm['ni'], cur)}")
+    if h.get("pref_note"):
+        st.caption("※ " + h["pref_note"])
+
+def render_report_holders(rep):
+    ho, tr = rep["holders"], rep["treasury"]
+    left, right = st.columns(2)
+    with left:
+        st.markdown("##### 최대주주·특수관계인")
+        if not ho or not ho["major"]:
+            st.caption("DART에서 최대주주 현황을 받지 못했습니다.")
+        else:
+            m = ho["major"]
+            st.markdown(f"**{m['name']}** {crep.fmt_pct(m['ratio'], 2)} · 특수관계인 합계 **{crep.fmt_pct(ho['group_ratio'], 2)}**")
+            st.caption(f"{ho['period']}(결산일 {ho['date']}) 기준 보통주")
+            df = pd.DataFrame([{"이름": p["name"], "관계": p["relate"], "지분율(%)": p["ratio"],
+                                "기초 대비(%p)": None if p["ratio"] is None or p["prev_ratio"] is None else round(p["ratio"] - p["prev_ratio"], 2)}
+                               for p in ho["people"][:10]])
+            st.dataframe(df, hide_index=True, width="stretch",
+                         column_config={"지분율(%)": st.column_config.NumberColumn(format="%.2f"), "기초 대비(%p)": st.column_config.NumberColumn(format="%+.2f")})
+    with right:
+        st.markdown("##### 자기주식")
+        if not tr or tr["end"] is None:
+            st.caption("DART에서 자기주식 현황을 받지 못했습니다.")
+        else:
+            a, b = st.columns(2)
+            a.metric("보유 자기주식", f"{tr['end']:,.0f}주", help="자기주식은 의결권이 없고 시가총액 계산에는 포함돼 있습니다.")
+            b.metric("발행주식 대비", crep.fmt_pct(tr["ratio"], 2))
+            if tr["acquired"] is not None:
+                st.caption(f"{tr['period']} 기준 기간 중 취득 {tr['acquired']:,.0f}주 · 처분 {tr['disposed']:,.0f}주 · 소각 {tr['cancelled']:,.0f}주 (기초 {tr['begin']:,.0f}주)")
+            else:
+                st.caption(f"{tr.get('period') or '최신 보고서'} 기준 보유 수량만 확인했습니다(기간 중 취득·처분·소각 내역은 받지 못함).")
+
+def render_report_filings(rep, code, key_prefix):
+    st.markdown("##### 최근 공시 (90일)")
+    noise = st.checkbox(f"{crep.NOISE_TAG} 포함", value=False, key=f"{key_prefix}_rep_noise_{code}",
+                        help="임원·주요주주가 주식을 사고팔 때마다 올라오는 보고서입니다. 양이 많아 기본은 숨깁니다.")
+    shown = [f for f in rep["filings"] if noise or f["tag"] != crep.NOISE_TAG]
+    if not shown:
+        st.caption("최근 90일 공시가 없습니다.")
+        return
+    df = pd.DataFrame([{"날짜": f["date"].isoformat(), "구분": ("🔴 " if f["risk"] == "경고" else "🟠 " if f["risk"] else "") + f["tag"],
+                        "제목": f["title"], "원문": f["url"]} for f in shown])
+    st.dataframe(df, hide_index=True, width="stretch", column_config={"원문": st.column_config.LinkColumn("DART", display_text="원문 보기")})
+    st.caption("🔴·🟠 = 위 '위험 공시' 경고에 해당하는 공시(과거 통계 근거가 있는 유형만). 나머지 구분은 제목 키워드로 붙인 분류라 틀릴 수 있습니다.")
+
+def _mix_figure(members):
+    labels = [m["label"][:26] + ("…" if len(m["label"]) > 26 else "") for m in members]
+    shares = [m["share"] for m in members]
+    colors = ["#cbd5e1" if m.get("derived") else "#1857e0" for m in members]
+    fig = go.Figure(go.Bar(x=shares, y=labels, orientation="h", marker_color=colors, text=[f"{v:.1f}%" if v is not None else "" for v in shares], textposition="outside"))
+    fig.update_layout(height=max(220, 34 * len(members) + 60), margin=dict(l=10, r=40, t=10, b=10), yaxis=dict(autorange="reversed"),
+                      xaxis=dict(title="비중(%)", range=[0, max([v for v in shares if v is not None] + [10]) * 1.18]), showlegend=False)
+    return fig
+
+def render_report_mix(rep, code, key_prefix):
+    st.markdown("##### 매출 구성")
+    mix = rep.get("mix")
+    if not mix or not mix.get("views"):
+        st.caption("사업보고서에서 사업부문·제품·지역별 매출 구성을 읽지 못했습니다(주석을 태그하지 않았거나 표 서식을 해석하지 못한 경우). 금융업처럼 매출 구분이 없는 업종도 해당합니다.")
+        return
+    link = crep.DART_VIEW + mix.get("rcept_no", "")
+    views, cur = mix["views"], rep["currency"]
+    titles = [v["title"] for v in views]
+    pick = st.radio("보기", titles, horizontal=True, key=f"{key_prefix}_mix_view_{code}") if len(titles) > 1 else titles[0]
+    v = next(x for x in views if x["title"] == pick)
+    end = mix.get("period_end")
+    st.caption(f"{pick} · {end[:4] + '년' if end else '최근 사업연도'} · 출처: {v['source']} · [DART 원문]({link})")
+    if v["note"]:
+        st.caption("※ " + v["note"])
+    members = smix.compact_members(v["members"])
+    st.plotly_chart(_mix_figure(members), theme=None, key=f"{key_prefix}_mix_chart_{code}")
+    rows = []
+    for m in members:
+        row = {"구성": m["label"], "매출": crep.fmt_amount(m["cur"], cur), "비중(%)": m["share"]}
+        if v["has_prev"]:
+            row["전기 매출"] = crep.fmt_amount(m.get("prev"), cur)
+            row["증감률(%)"] = (m["cur"] / m["prev"] - 1) * 100 if m.get("prev") else None
+        if v["has_op"]:
+            row["영업이익"] = crep.fmt_amount(m.get("op_cur"), cur) if m.get("op_cur") is not None else "—"
+            row["영업이익률(%)"] = m["op_cur"] / m["cur"] * 100 if m.get("op_cur") is not None and m["cur"] else None
+        rows.append(row)
+    cfg = {"비중(%)": st.column_config.NumberColumn(format="%.1f"), "증감률(%)": st.column_config.NumberColumn(format="%+.1f"),
+           "영업이익률(%)": st.column_config.NumberColumn(format="%.1f")}
+    st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", column_config={k: c for k, c in cfg.items() if k in rows[0]})
+    st.caption("※ 회사가 공시한 구분을 그대로 옮긴 값입니다(구분 기준은 회사마다 다르고, 같은 이름이라도 해마다 범위가 바뀔 수 있습니다). 연결 매출과 합계가 맞지 않는 보기는 위 안내를 참고하세요.")
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def fetch_industry_info(code):
+    """네이버 업종(industryCode)과 그 업종 전체 종목·시가총액. 실패하면 None."""
+    try:
+        session = get_naver_session()
+        integ = session.get(f"https://m.stock.naver.com/api/stock/{code}/integration", timeout=5).json()
+        ind_code = integ.get("industryCode")
+        if not ind_code:
+            return None
+        merged = None
+        for page in (1, 2, 3):
+            res = session.get(f"https://m.stock.naver.com/api/stocks/industry/{ind_code}", params={"page": page, "pageSize": 100}, timeout=8)
+            if res.status_code != 200:
+                break
+            data = res.json()
+            parsed = pcmp.parse_industry(data)
+            merged = parsed if merged is None else {**merged, "stocks": merged["stocks"] + parsed["stocks"]}
+            if page * 100 >= (data.get("totalCount") or 0):
+                break
+        return merged
+    except Exception:
+        return None
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_peer_metrics(code, today_str):
+    """비교 종목 하나의 지표(보고서와 같은 build_report로 계산). 실패는 {'code', 'error'}로 돌려 캐시한다."""
+    try:
+        today = datetime.strptime(today_str, "%Y-%m-%d").date()
+        raw = crep.fetch_raw(code, today, light=True)
+        df = fetch_diag_ohlcv(code, 30)
+        rep = crep.build_report(raw, float(df["Close"].iloc[-1]), df.index[-1].date(), None)
+        return pcmp.metrics_from_report(rep)
+    except crep.NoDartData as e:
+        return {"code": code, "error": str(e)[:60]}
+    except Exception as e:
+        return {"code": code, "error": f"{type(e).__name__}: {str(e)[:60]}"}
+
+def render_report_peers(rep, code, name, key_prefix):
+    """피어 비교 표. 반환: 피어 PER 중앙값 요약(시뮬레이터가 같은 값을 쓴다) 또는 None."""
+    from concurrent.futures import ThreadPoolExecutor
+    st.markdown("##### 피어 비교 (같은 업종·비슷한 시가총액)")
+    industry = fetch_industry_info(code)
+    override = st.text_input("비교 종목 직접 지정(쉼표로 구분, 최대 8개)", key=f"{key_prefix}_peer_override_{code}", placeholder="예: 한미반도체, 000660 — 비우면 자동 선정",
+                             help="자동 선정은 네이버 업종 분류라 사업 구조가 다른 종목이 섞일 수 있습니다. 직접 정하면 그 종목들과 비교합니다.")
+    codes, failed_names = [], []
+    if override.strip():
+        for token in [t.strip() for t in override.split(",") if t.strip()][:pcmp.MAX_PEERS]:
+            c, _, _ = resolve_diag_stock(token)
+            if c and c != code:
+                codes.append(c)
+            elif not c:
+                failed_names.append(token)
+        basis = "직접 지정"
+    elif industry:
+        subject_cap = rep["header"]["market_cap"] or next((x["market_cap"] for x in industry["stocks"] if x["code"] == code), None)
+        codes = pcmp.pick_peers(industry, code, subject_cap, set(dart_core.corp_codes()))
+        basis = f"네이버 업종 '{industry['name']}'에서 시가총액이 가장 비슷한 {len(codes)}개"
+    else:
+        basis = ""
+    if failed_names:
+        st.caption(f"찾지 못한 종목: {', '.join(failed_names)}")
+    if not codes:
+        st.caption("업종 분류를 받지 못했거나 비교할 종목이 없어 피어 비교를 건너뜁니다. 위 입력칸에 비교 종목을 직접 적어 볼 수 있습니다.")
+        return None
+    today_str = now_kst().date().strftime("%Y-%m-%d")
+    with st.spinner(f"비교 종목 {len(codes)}곳의 재무를 DART에서 계산하는 중입니다(처음 한 번은 20초 안팎, 이후엔 캐시)..."):
+        with ThreadPoolExecutor(6) as ex:
+            results = list(ex.map(lambda c: fetch_peer_metrics(c, today_str), codes))
+    peers = [m for m in results if "error" not in m]
+    bad = [f"{m['code']}({m['error']})" for m in results if "error" in m]
+    subject = pcmp.metrics_from_report(rep)
+    subject["name"] = name
+    summ = pcmp.summarize(subject, peers)
+    table = []
+    for m, mark in [(subject, "◀ 이 종목")] + [(p, "") for p in sorted(peers, key=lambda x: -(x["market_cap"] or 0))]:
+        table.append({"종목": f"{m['name']} {mark}".strip(), "시가총액": crep.fmt_won(m["market_cap"]) if m["currency"] == "KRW" else "—",
+                      "PER(후행)": m["per"], "PBR": m["pbr"], "PSR(후행)": m["psr"], "영업이익률(%)": m["op_margin"], "ROE(%)": m["roe"],
+                      "매출 증가율(%)": m["rev_growth"], "부채비율(%)": m["debt_ratio"]})
+    med = summ["median"]
+    table.append({"종목": f"피어 중앙값(n={summ['n']})", "시가총액": "—", "PER(후행)": med["per"], "PBR": med["pbr"], "PSR(후행)": med["psr"], "영업이익률(%)": med["op_margin"],
+                  "ROE(%)": med["roe"], "매출 증가율(%)": med["rev_growth"], "부채비율(%)": med["debt_ratio"]})
+    st.dataframe(pd.DataFrame(table), hide_index=True, width="stretch",
+                 column_config={"PER(후행)": st.column_config.NumberColumn(format="%.1f"), "PBR": st.column_config.NumberColumn(format="%.2f"),
+                                "PSR(후행)": st.column_config.NumberColumn(format="%.2f"), "영업이익률(%)": st.column_config.NumberColumn(format="%.1f"),
+                                "ROE(%)": st.column_config.NumberColumn(format="%.1f"), "매출 증가율(%)": st.column_config.NumberColumn(format="%+.1f"),
+                                "부채비율(%)": st.column_config.NumberColumn(format="%.0f")})
+    gaps = []
+    for key, label, kind in (("per", "PER", "pct"), ("pbr", "PBR", "pct"), ("op_margin", "영업이익률", "pp"), ("roe", "ROE", "pp"), ("rev_growth", "매출 증가율", "pp")):
+        g = summ["gap"].get(key)
+        if g is not None:
+            gaps.append(f"{label} {g:+.0f}%" if kind == "pct" else f"{label} {g:+.1f}%p")
+    if gaps:
+        st.caption("피어 중앙값 대비 이 종목: " + " · ".join(gaps) + " (배수는 중앙값 대비 %, 비율 지표는 %p 차이)")
+    st.caption(f"비교 기준: {basis}. 이 종목과 비교 종목 모두 같은 계산(후행 12개월 순이익 ÷ 종가 기준 시가총액 등)이라 위 헤더와 같은 정의입니다. "
+               "중앙값은 값이 있는 비교 종목이 3개 이상일 때만 냅니다(적자·자본잠식 종목의 PER·PBR은 제외, 영업이익률이 ±100%를 넘는 지주사 등은 영업이익률만 제외). 업종 분류는 대분류라 사업 구조가 다른 종목이 섞일 수 있습니다."
+               + (f" 불러오지 못한 종목: {', '.join(bad)}." if bad else "")
+               + (f" 외화 보고 회사는 중앙값에서 제외: {', '.join(summ['excluded'])}." if summ["excluded"] else ""))
+    return {"per_median": med["per"], "n": summ["n"]}
+
+def render_report_simulator(rep, code, key_prefix, peer_summary=None):
+    h, v = rep["header"], rep["valuation"]
+    st.markdown("##### 밸류에이션 시뮬레이터 (순이익 × PER)")
+    if rep["currency"] != "KRW" or not h["market_cap_all"] or not v["ni_base"] or v["ni_base"] <= 0:
+        st.caption("순이익이 0 이하이거나 시가총액을 계산하지 못해(또는 외화 보고 회사라) 시뮬레이터를 제공하지 않습니다.")
+        return
+    cap, price = h["market_cap_all"], h["price"]
+    last_ni = rep["annual"]["rows"][-1]["ni"]
+    options = {f"후행 12개월 순이익 ({crep.fmt_won(v['ni_base'])})": v["ni_base"]} if h["ttm"]["is_ttm"] else {}
+    if last_ni and last_ni > 0:
+        options[f"{rep['annual_year']} 사업연도 순이익 ({crep.fmt_won(last_ni)})"] = last_ni
+    if not options:
+        options[f"순이익 ({crep.fmt_won(v['ni_base'])})"] = v["ni_base"]
+    c1, c2 = st.columns(2)
+    base_label = c1.radio("이익 기준", list(options), key=f"{key_prefix}_rep_base_{code}") if len(options) > 1 else next(iter(options))
+    if len(options) == 1:
+        c1.markdown(f"**이익 기준** · {base_label}")
+    growth = c2.slider("순이익 증감 가정(%)", -50, 100, 0, 5, key=f"{key_prefix}_rep_growth_{code}",
+                       help="기준 순이익을 얼마나 늘리거나 줄여 볼지. 전망이 아니라 '이만큼 달라지면 주가가 어떻게 되나'를 보는 가정값입니다.")
+    ni = options[base_label] * (1 + growth / 100)
+
+    rng = v["range"]
+    per_now = v["per_now"]
+    anchor = per_now or (rng["mid"] if rng else 10.0)
+    per_cap = float(max(40, int(max(anchor, rng["high"] if rng else 0) * 1.5 // 5 + 1) * 5))
+    per = st.slider("적용 PER(배)", 1.0, per_cap, float(min(max(round(anchor * 2) / 2, 1.0), per_cap)), 0.5, key=f"{key_prefix}_rep_per_{code}")
+    sim = crep.scenario(ni, cap, price, per)
+    m1, m2, m3 = st.columns(3)
+    m1.metric("목표 시가총액", crep.fmt_won(sim["cap"]), help="이익 × PER")
+    m2.metric("목표 주가", f"{sim['price']:,.0f}원", f"{sim['upside'] * 100:+.1f}%", delta_color="inverse",
+              help="현재가 × (목표 시총 ÷ 현재 시총). 우선주가 있어도 현재가 대비 비율이 같게 나옵니다.")
+    m3.metric("가정 순이익", crep.fmt_won(ni), help=f"{base_label} × (1 {growth:+d}%)")
+
+    st.markdown("**PER 기준점** (같은 이익 가정으로 계산)")
+    rows = []
+    if per_now:
+        s = crep.scenario(ni, cap, price, per_now)
+        rows.append({"기준": "현재 후행 PER", "PER(배)": per_now, "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100, "근거": f"종가 ÷ 후행 순이익({h['ttm']['label']})"})
+    if rng:
+        yrs = f"{rng['years'][0]}~{rng['years'][-1]}"
+        for lab, key in (("Bear · 과거 최저", "low"), ("Base · 과거 중앙", "mid"), ("Bull · 과거 최고", "high")):
+            s = crep.scenario(ni, cap, price, rng[key])
+            rows.append({"기준": lab, "PER(배)": rng[key], "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100,
+                         "근거": f"이 종목의 {yrs} 사업연도 말 PER {rng['n']}개 중 {'최저' if key == 'low' else '중앙' if key == 'mid' else '최고'}(네이버)"})
+    if peer_summary and peer_summary.get("per_median"):         # 위 '피어 비교' 표의 중앙값과 같은 숫자(출처·계산이 같다)
+        s = crep.scenario(ni, cap, price, peer_summary["per_median"])
+        rows.append({"기준": "피어 PER 중앙값", "PER(배)": peer_summary["per_median"], "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100,
+                     "근거": f"위 '피어 비교' 표 {peer_summary['n']}개 종목의 후행 PER 중앙값(적자 제외)"})
+    if rows:
+        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
+                     column_config={"PER(배)": st.column_config.NumberColumn(format="%.1f"), "목표 주가": st.column_config.NumberColumn(format="%d"),
+                                    "현재가 대비(%)": st.column_config.NumberColumn(format="%+.1f")})
+    else:
+        st.caption("이 종목의 과거 PER(최소 2개 사업연도)과 피어 PER 중앙값을 모두 얻지 못해 기준점을 만들지 못했습니다. 위 슬라이더로 직접 가정해 보세요.")
+    st.caption("※ Bear·Base·Bull은 '낮은·중간·높은 배수'라는 뜻이지 주가 하락·상승 예측이 아닙니다. 후행 이익이 과거보다 크게 늘었다면 Bear 배수로도 현재가보다 높게 나옵니다. "
+               "순이익 × PER을 곱한 단순 산식이라 예측도 기업가치 평가도 아닙니다. 과거 PER은 사업연도 말 주가 기준 3개 연도뿐이고, 이익이 급변한 종목(후행 이익이 사업연도의 2배 이상 등)은 "
+               "배수 기준점이 현재 이익과 맞지 않을 수 있습니다. PER 기준점에 쓴 네이버 값은 DART 순이익과 출처가 달라 소수점 단위로 어긋날 수 있습니다.")
+
+def _md_safe(s):
+    """공시 원문·AI 문장을 st.markdown에 넣기 전 마크다운 기호를 무력화한다: $ 쌍은 수식, ~ 쌍은 취소선, [..](..)는 클릭 가능한 링크(원문·모델 출력에 섞이면 안 됨)가 된다.
+    공백은 한 칸으로 줄여 줄바꿈이 목록·제목으로 바뀌지 않게 한다."""
+    s = re.sub(r"\s+", " ", str(s))
+    for ch in ("\\", "$", "~", "[", "]", "`", "*", "_", "<", ">"):
+        s = s.replace(ch, "\\" + ch)
+    return s
+
+def render_narrative_result(res):
+    """검증을 통과한 AI 서술 + 근거(F·Q) + 탈락 문장. 인용은 코드가 원문 발췌와 대조한 것만 나온다."""
+    label = {q["id"]: q["label"] for q in res.get("excerpts", [])}
+    url = crep.DART_VIEW + (res.get("rcept_no") or "")
+    for key in ("business", "changes", "risks", "questions"):
+        items = res.get(key) or []
+        if not items and key != "risks":
+            continue
+        st.markdown(f"**{rnar.SECTION_NAMES[key]}**")
+        if not items:
+            st.caption("검증을 통과한 리스크 문장이 없습니다(근거가 약하거나 숫자·인용 검증에서 모두 탈락). 아래 '검증에서 탈락한 문장'과 공시 원문을 직접 확인해 주세요.")
+        for it in items:
+            if key == "risks":
+                st.markdown(f"- **{_md_safe(it['title'])}** — {_md_safe(it['text'])}" if it.get("title") else f"- {_md_safe(it['text'])}")
+                if it.get("quote"):
+                    st.markdown(f"> “{_md_safe(it['quote'])}” — 사업보고서 · {label.get(it.get('quote_id'), '')} · [DART 원문]({url})")
+            else:
+                st.markdown(f"- {_md_safe(it['text'])}")
+            st.caption("근거 " + " · ".join(it["refs"]))
+    st.caption(f"생성 {res['generated_at']} · {res['model']} · 검증 통과 {res['kept']}/{res['asked']}문장"
+               + (f" · 앞선 시도 실패: {', '.join(res['llm_errors'])}" if res.get("llm_errors") else ""))
+    if res.get("dropped"):
+        with st.expander(f"검증에서 탈락한 문장 ({len(res['dropped'])})"):
+            for d in res["dropped"]:
+                st.markdown(f"- [{rnar.SECTION_NAMES.get(d['section'], d['section'])}] {_md_safe(d['text'])} — **{_md_safe(d['reason'])}**")
+    with st.expander("근거 목록 (사실 F · 공시 원문 Q)"):
+        st.markdown("**사실 F** — 위 보고서 숫자를 코드가 문장으로 옮긴 것(종가에 따라 변하는 시총·PER은 넣지 않음)")
+        for f in res.get("facts", []):
+            st.markdown(f"- **{f['id']}** {_md_safe(f['text'])}")
+        st.markdown(f"**공시 원문 발췌 Q** — [사업보고서 원문]({url})에서 뽑은 부분(글자 예산 안에서 위험 단서가 있는 문단 위주)")
+        for q in res.get("excerpts", []):
+            st.markdown(f"- **{q['id']}** ({q['label']}) {_md_safe(q['text'])}")
+
+def render_report_narrative(rep, code, key_prefix):
+    st.markdown("##### 🤖 AI 서술 — 사업 요약 · 최근 변화 · 비판적 리스크")
+    st.caption("사업보고서 본문과 위 숫자만 재료로 Groq가 쓰고, 코드가 검증합니다. 검증은 ① 문장 속 숫자가 근거에 있는지 ② 인용문이 원문에 그대로 있는지 "
+               "③ 전망·목표가·매수/매도 표현이 없는지만 확인합니다. 해석이 맞는지까지 보장하지는 않으니 인용 원문을 직접 확인하세요. 자동 실행하지 않고 버튼을 눌렀을 때만 생성합니다.")
+    if not rep.get("rcept_no"):
+        st.info("사업보고서 접수번호를 찾지 못해 AI 서술을 만들 수 없습니다.")
+        return
+    state_key = f"{key_prefix}_narr_{code}_{rep['rcept_no']}"
+    res = st.session_state.get(state_key) or rnar.load_cached(rep)       # 같은 보고서·같은 숫자면 이전 결과를 바로 보여준다(디스크 캐시)
+    if st.button("다시 생성" if res else "AI 서술 생성", key=f"{key_prefix}_narr_btn_{code}",
+                 help="처음엔 DART 본문 내려받기 포함 20초 안팎. Groq 무료 한도(분당 8,000토큰) 때문에 연달아 누르면 최대 1분 더 기다릴 수 있습니다."):
+        try:
+            api_key = str(st.secrets["GROQ_API_KEY"])
+        except Exception:
+            api_key = None
+        if not GENAI_AVAILABLE or not api_key:
+            st.info("💡 Groq 패키지 또는 GROQ_API_KEY(Secrets)가 없어 AI 서술을 만들 수 없습니다.")
+        else:
+            with st.spinner("사업보고서 본문을 읽고 서술을 만드는 중입니다(최대 1분)..."):
+                try:
+                    sections = ftext.fetch_sections(rep["rcept_no"])
+                    new = rnar.generate(rep, sections, rnar.groq_llm(api_key))
+                except (rnar.NarrativeError, dart_core.DartError) as e:
+                    st.warning(f"AI 서술을 만들지 못했습니다: {e}")
+                except Exception as e:
+                    st.warning(f"AI 서술을 만들지 못했습니다({type(e).__name__}).")
+                else:
+                    rnar.save_cached(rep, new)
+                    st.session_state[state_key] = res = new
+                    try:
+                        st.rerun(scope="fragment")      # 버튼 라벨('다시 생성')을 새 상태로 다시 그린다. 조각 재실행 중에만 허용된다
+                    except StreamlitAPIException:       # 전체 재실행 중에 불린 경우 — 지금 상태 그대로 그린다(RerunException은 BaseException이라 여기서 잡히지 않는다)
+                        pass
+    if res:
+        render_narrative_result(res)
+
+@st.fragment
+def render_company_report(code, name, price, price_date, key_prefix):
+    """종목 분석 보고서. 슬라이더를 움직여도 이 조각만 다시 그린다(진단 화면 전체를 다시 계산하지 않음)."""
+    today = now_kst().date()
+    with st.spinner("DART에서 재무·주주·공시를 불러오는 중입니다(처음 한 번은 10초 안팎, 이후엔 캐시)..."):
+        status, payload = fetch_company_report_raw(code, today.strftime("%Y-%m-%d"))
+        if status == "ok":
+            naver = fetch_naver_annual(code)
+            r_status, flags = fetch_risk_flags(code, today.strftime("%Y-%m-%d"))
+            risk_levels = {f["rno"]: f["level"] for f in flags} if r_status == "ok" else {}
+            rep = crep.build_report(payload, price, price_date, naver, risk_levels)
+    if status == "nodata":
+        st.info(payload)
+        return
+    if status == "err":
+        st.warning(f"DART에서 보고서 자료를 받지 못했습니다({payload}). Secrets에 DART_API_KEY가 있는지, 일일 요청 한도를 넘지 않았는지 확인해 주세요.")
+        return
+
+    interim = f" · {rep['interim']['year']} {rep['interim']['label']}보고서" if rep["interim"] else ""
+    st.caption(f"{rep['name']} · {rep['fs']}재무제표 · {rep['annual_year']} 사업보고서{interim}까지 반영 · 모든 숫자는 DART 공시와 종가로 코드가 계산합니다(AI 추정·전망 없음).")
+    if rep["currency"] != "KRW":
+        st.warning(f"이 회사는 재무제표가 {rep['currency']} 단위입니다. 아래 금액은 원화가 아닙니다.")
+    render_report_header(rep)
+
+    st.markdown("##### 5개년 실적")
+    st.plotly_chart(_rep_annual_figure(rep["annual"]["rows"], rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_annual_{code}")
+    st.dataframe(_rep_annual_dataframe(rep), width="stretch")
+    if not rep["financial_like"] and any(r["fcf"] is not None for r in rep["annual"]["rows"]):
+        st.markdown("##### 현금흐름")
+        st.plotly_chart(_rep_cash_figure(rep["annual"]["rows"], rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_cash_{code}")
+        st.caption("FCF = 영업활동현금흐름 − (유형자산 취득 + 무형자산 취득). 리스·임대 자산 투자와 사업 인수는 반영하지 않습니다.")
+    render_report_mix(rep, code, key_prefix)
+    render_report_holders(rep)
+    render_report_filings(rep, code, key_prefix)
+    peer_summary = render_report_peers(rep, code, name, key_prefix)
+    render_report_simulator(rep, code, key_prefix, peer_summary)
+    render_report_narrative(rep, code, key_prefix)
+
+    with st.expander("계산 기준과 데이터 한계"):
+        st.markdown(
+            "- **후행 12개월** = 직전 사업연도 + 올해 누적 − 전년 동기 누적(올해 분기·반기 보고서가 아직 없으면 직전 사업연도).\n"
+            "- **순이익·ROE** = 지배기업 소유주 몫(지배·비지배 구분이 없으면 당기순이익 전체). ROE는 평균 자본 기준, 부채비율 = 부채총계 ÷ 자본총계.\n"
+            "- **시가총액** = 종가 × 최신 보고서의 보통주 발행주식수. PER·PBR·PSR은 이 시가총액을 쓰고, 우선주가 있으면 보통주 가격으로 환산해 합친 값을 씁니다.\n"
+            "- 같은 지표를 이 화면의 다른 곳에서 다시 계산하지 않습니다. 네이버·증권사 화면의 PER과 다른 것은 이익 기준(후행 12개월 vs 전년 확정 vs 추정)이 달라서입니다.\n"
+            "- 분기·반기 보고서는 감사 전 숫자이고, 정정 공시가 나오면 값이 바뀔 수 있습니다. 결산월이 12월이 아닌 회사는 '사업연도' 표기가 회계연도 기준입니다.")
+        if rep["notes"]:
+            st.markdown("**이 종목에서 비어 있거나 대체된 항목**")
+            for n in rep["notes"]:
+                st.markdown(f"- {n}")
+
+def render_diagnosis(diag, name, mode, key_prefix="diag", risk_asof=None):
+    """진단 결과 한 종목의 상세 화면. 같은 화면에 두 번 그려질 수 있어(종목 진단 탭 / 관심종목 탭) 위젯 키에 key_prefix를 쓴다.
+    risk_asof: 과거 날짜 진단일 때 그 날짜(위험 공시를 그 날짜까지만 본다). None이면 오늘."""
     close, prev_close = diag.df['close'].iloc[-1], diag.df['close'].iloc[-2]
     st.markdown(f"### {name} ({diag.code}) · {diag.as_of:%Y-%m-%d} 종가 {close:,.0f}원 ({(close / prev_close - 1) * 100:+.2f}%)")
+    render_risk_flags(diag.code, risk_asof)
+    # 보고서 탭은 열었을 때만 DART를 부른다(on_change="rerun" + .open). 매매 진단은 항상 그려 위젯 상태가 탭을 오가도 유지된다.
+    tab_signal, tab_report = st.tabs(["📈 매매 진단", "📑 종목 분석 보고서"], key=f"{key_prefix}_detail_tabs", on_change="rerun")
+    with tab_signal:
+        render_diagnosis_signals(diag, name, mode, key_prefix)
+    with tab_report:
+        if risk_asof is not None:
+            st.info("재무·주주·공시는 현재 시점 자료라 과거 날짜 진단에서는 보고서를 보여주지 않습니다. 진단 시점을 '현재'로 바꿔 주세요.")
+        elif tab_report.open:
+            render_company_report(diag.code, name, float(close), diag.as_of, key_prefix)
+
+def render_diagnosis_signals(diag, name, mode, key_prefix):
+    """매매 진단 본문(등급·체크리스트·차트·재료). 종목 헤더와 위험 공시 경고는 render_diagnosis가 위에 그린다."""
+    res = diag.results[mode]
 
     with st.container(border=True):
         grade_col, text_col = st.columns([1, 4])
@@ -2507,7 +3026,7 @@ def render_diag_single():
                     if diag is None:
                         st.error("진단에 필요한 시세 데이터(최소 30거래일)가 부족합니다.")
                     else:
-                        render_diagnosis(diag, name, mode)
+                        render_diagnosis(diag, name, mode, risk_asof=as_of)
 
 # --- 관심종목 일괄 진단 -----------------------------------------------------------------
 # 관심종목은 session_state에만 보관한다(Streamlit Cloud는 디스크가 휘발성). JSON으로 내려받아 두었다가 다시 불러온다.
@@ -2660,7 +3179,9 @@ def render_diag_watchlist():
     if run_clicked:
         with st.spinner("시세와 수급을 불러와 진단하는 중입니다..."):
             results = run_watchlist_diagnosis(items)
-        st.session_state["wl_results"] = {"group": group, "ts": now_kst().strftime('%H:%M'), "results": results,
+        with st.spinner("DART에서 최근 위험 공시를 확인하는 중입니다..."):
+            flags = run_risk_flags([item["code"] for item, diag, _ in results if diag is not None])
+        st.session_state["wl_results"] = {"group": group, "ts": now_kst().strftime('%H:%M'), "results": results, "flags": flags,
                                           "sig": tuple((i["code"], i["buy_price"]) for i in items)}
 
     saved = st.session_state.get("wl_results")
@@ -2679,6 +3200,12 @@ def render_diag_watchlist():
         return
 
     table = pd.DataFrame([dc.to_row(diag, item["name"]) for item, diag in ok])
+    flags = saved.get("flags")      # 이 기능이 생기기 전에 만든 결과에는 없다
+    flags_ok = bool(flags) and any(s == "ok" for s, _ in flags.values())
+    if flags_ok:
+        table["위험 공시"] = table["코드"].map(lambda c: rdisc.short_text(flags[c][1]) if flags.get(c, ("err",))[0] == "ok" else "확인 불가")
+    elif flags:
+        st.caption(f"⚠️ DART 위험 공시를 확인하지 못했습니다({next(iter(flags.values()))[1]}). Secrets에 DART_API_KEY가 있는지 확인해 주세요.")
     counts = table["신호"].value_counts()
     metric_cols = st.columns(5)
     metric_cols[0].metric("전체", len(table))
@@ -2701,13 +3228,18 @@ def render_diag_watchlist():
         return
 
     shown = view.assign(신호=view["신호"].map(lambda s: f"{WL_SIGNAL_ICONS[s]} {s}"))[
-        ["종목명", "신호", "매수 등급", "핵심 통과", "매도 판정", "보유 판정", "손익%", "종가", "등락률%", "추세", "수급", "거래량", "패턴"]]
+        ["종목명", "신호", "매수 등급", "핵심 통과", "매도 판정", "보유 판정", "손익%", "종가", "등락률%", "추세", "수급", "거래량", "패턴"]
+        + (["위험 공시"] if flags_ok else [])]
     event = st.dataframe(
         shown, hide_index=True, width="stretch", on_select="rerun", selection_mode="single-row", key="wl_table",
         column_config={"종가": st.column_config.NumberColumn(format="%d"),
                        "등락률%": st.column_config.NumberColumn(format="%+.2f"),
                        "손익%": st.column_config.NumberColumn(format="%+.1f")})
     st.caption("※ 매수 등급·핵심 통과 = 240일선·수급·거래량 기준. 신호는 위험 우선(매도 고려 > 매수 고려 > 사지 않기 > 지켜보기)으로 하나만 표시합니다. 행을 클릭하면 상세 진단이 아래에 열립니다.")
+    if flags_ok:
+        n_flag = int(table["위험 공시"].str.startswith(("🔴", "🟠")).sum())
+        st.caption(f"※ 위험 공시 = DART 공시 후 30일 이내의 🔴 경고(감자 결정, 관리종목 지정·상장폐지 사유)·🟠 주의(감사의견 부적정·거절·자본잠식 사실확인, 관리종목 지정 우려 안내). 지금 {n_flag}종목. "
+                   "과거 통계상 이런 공시 뒤 평균적으로 시장보다 약했다는 뜻이며 신호·등급과는 별개입니다. 상세 진단에서 근거와 한계를 볼 수 있습니다.")
 
     selected = event.selection.rows
     if not selected:
