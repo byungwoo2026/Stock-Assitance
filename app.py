@@ -2846,6 +2846,25 @@ def render_report_narrative(rep, code, key_prefix):
     if res:
         render_narrative_result(res)
 
+def render_dart_probe(key):
+    """DART 접속이 안 될 때, 이 서버에서 어느 단계(이름 확인·포트·HTTPS)가 막히는지 보여준다. 키는 쓰지 않는다."""
+    if not st.button("DART 접속 점검", key=key, help="이 서버에서 DART까지 접속이 되는지 단계별로 확인합니다(키는 쓰지 않습니다)."):
+        return
+    with st.spinner("접속을 단계별로 시험하는 중입니다(최대 30초)..."):
+        rows = dart_core.probe_connection()
+    st.dataframe(
+        pd.DataFrame({"단계": [r["step"] for r in rows], "결과": ["성공" if r["ok"] else "실패" for r in rows],
+                      "소요(초)": [r["sec"] for r in rows], "상세": [r["detail"] for r in rows]}),
+        hide_index=True, width="stretch")
+    dart = [r for r in rows if not r["step"].startswith("대조군")]
+    control = next((r for r in rows if r["step"].startswith("대조군")), None)
+    if all(r["ok"] for r in dart):
+        st.caption("DART까지 접속은 됩니다. 일시적인 지연이었을 수 있으니 잠시 뒤 다시 시도해 주세요.")
+    elif control and control["ok"]:
+        st.caption("국내 사이트(네이버)는 되는데 DART만 막혀 있습니다. 이 서버(해외)에서의 DART 접속이 제한된 것으로 보입니다.")
+    else:
+        st.caption("대조군도 실패했습니다. 이 서버의 네트워크 문제일 수 있으니 잠시 뒤 다시 시도해 주세요.")
+
 @st.fragment
 def render_company_report(code, name, price, price_date, key_prefix):
     """종목 분석 보고서. 슬라이더를 움직여도 이 조각만 다시 그린다(진단 화면 전체를 다시 계산하지 않음)."""
@@ -2862,6 +2881,8 @@ def render_company_report(code, name, price, price_date, key_prefix):
         return
     if status == "err":
         st.warning(f"DART에서 보고서 자료를 받지 못했습니다({payload}). Secrets에 DART_API_KEY가 있는지, 일일 요청 한도를 넘지 않았는지 확인해 주세요.")
+        if "ConnectTimeout" in payload or "ConnectionError" in payload:
+            render_dart_probe(f"{key_prefix}_dartprobe_{code}")
         return
 
     interim = f" · {rep['interim']['year']} {rep['interim']['label']}보고서" if rep["interim"] else ""
