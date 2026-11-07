@@ -499,5 +499,58 @@ class CachedListTests(unittest.TestCase):
             self.assertEqual(dart_core.cached_list("x.json", corp_code="1"), [{"ok": 1}])
 
 
+class ProbeConnectionTests(unittest.TestCase):
+    """클라우드에서 DART 접속이 안 될 때 어느 단계가 막히는지 보여 주는 점검."""
+
+    def _resp(self, status=200, body=b"x" * 100):
+        return mock.Mock(status_code=status, content=body)
+
+    def test_all_steps_ok(self):
+        with mock.patch("socket.getaddrinfo", return_value=[(0, 0, 0, "", ("1.2.3.4", 443))]), \
+             mock.patch("socket.create_connection") as cc, \
+             mock.patch.object(dart_core.requests, "get", return_value=self._resp()):
+            rows = dart_core.probe_connection()
+        self.assertEqual([r["step"] for r in rows], ["이름 확인(DNS)", "443 포트 접속", "HTTPS 요청", "대조군: 네이버 증권"])
+        self.assertTrue(all(r["ok"] for r in rows))
+        cc.assert_called_once()
+
+    def test_tcp_timeout_skips_https_but_runs_control(self):
+        with mock.patch("socket.getaddrinfo", return_value=[(0, 0, 0, "", ("1.2.3.4", 443))]), \
+             mock.patch("socket.create_connection", side_effect=TimeoutError("timed out")), \
+             mock.patch.object(dart_core.requests, "get", return_value=self._resp()):
+            rows = dart_core.probe_connection()
+        steps = {r["step"]: r for r in rows}
+        self.assertTrue(steps["이름 확인(DNS)"]["ok"])
+        self.assertFalse(steps["443 포트 접속"]["ok"])
+        self.assertIn("TimeoutError", steps["443 포트 접속"]["detail"])
+        self.assertNotIn("HTTPS 요청", steps)                     # 포트가 막혔으면 HTTPS는 시험하지 않는다
+        self.assertTrue(steps["대조군: 네이버 증권"]["ok"])       # 대조군은 항상 돈다
+
+    def test_dns_failure_stops_early(self):
+        import socket
+        with mock.patch("socket.getaddrinfo", side_effect=socket.gaierror("no such host")), \
+             mock.patch.object(dart_core.requests, "get", return_value=self._resp()):
+            rows = dart_core.probe_connection()
+        self.assertEqual([r["step"] for r in rows], ["이름 확인(DNS)", "대조군: 네이버 증권"])
+        self.assertFalse(rows[0]["ok"])
+
+    def test_probe_never_reads_the_key(self):
+        with mock.patch("socket.getaddrinfo", return_value=[(0, 0, 0, "", ("1.2.3.4", 443))]), \
+             mock.patch("socket.create_connection"), \
+             mock.patch.object(dart_core.requests, "get", return_value=self._resp()) as g, \
+             mock.patch.object(dart_core, "load_key", side_effect=AssertionError("키를 읽으면 안 된다")):
+            dart_core.probe_connection()
+        for call in g.call_args_list:
+            self.assertNotIn("crtfc_key", str(call))
+
+    def test_request_uses_short_connect_timeout(self):
+        with mock.patch.object(dart_core.requests, "get", return_value=self._resp()) as g, \
+             mock.patch.object(dart_core, "load_key", return_value="K"), \
+             mock.patch.object(dart_core.time, "sleep"):
+            dart_core._request("list.json")
+        self.assertEqual(g.call_args.kwargs["timeout"], (dart_core.CONNECT_TIMEOUT, dart_core.READ_TIMEOUT))
+        self.assertLessEqual(dart_core.CONNECT_TIMEOUT, 15)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)

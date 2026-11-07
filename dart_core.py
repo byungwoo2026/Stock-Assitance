@@ -25,6 +25,8 @@ BASE ="https://opendart.fss.or.kr/api/"
 _HERE = os.path.dirname(os.path.abspath(__file__))
 CACHE_DIR = os.path.join(_HERE, "dart_cache")
 SECRETS_PATH = os.path.join(_HERE, ".streamlit", "secrets.toml")
+CONNECT_TIMEOUT = 10         # 접속 대기(초) — 접속이 안 되는 환경에서 한 요청이 3분씩 매달리지 않게 짧게
+READ_TIMEOUT = 60            # 응답 대기(초) — corpCode.xml 같은 큰 zip을 받는 시간
 MIN_INTERVAL = 0.12          # 요청 간 최소 간격(초) — 연속 호출이 차단되지 않게
 PAGE_COUNT = 100             # list.json 최대 페이지 크기
 NO_DATA = "013"
@@ -63,13 +65,52 @@ def _request(path, **params):
     last = None
     for attempt in range(3):
         try:
-            resp = requests.get(BASE + path, params=params, timeout=60)
+            resp = requests.get(BASE + path, params=params, timeout=(CONNECT_TIMEOUT, READ_TIMEOUT))
             resp.raise_for_status()
             return resp
         except requests.RequestException as e:
             last = type(e).__name__              # 메시지·URL은 버린다(키 포함)
             time.sleep(1.5 * (attempt + 1))
     raise DartError(f"DART 요청 실패({path}): {last}")
+
+
+PROBE_CONTROL_URL = "https://m.stock.naver.com/"      # 대조군 — 앱이 이미 쓰는 국내 사이트
+
+
+def probe_connection(host="opendart.fss.or.kr", timeout=8):
+    """이 서버에서 DART까지 어느 단계에서 막히는지 점검한다. 키는 쓰지 않는다(키 없는 요청도 응답은 온다).
+    반환: [{"step", "ok", "sec", "detail"}] — 이름 확인 → 443 포트 접속 → HTTPS 요청 → 대조군(국내 사이트) 순."""
+    import socket
+    out = []
+
+    def run(step, fn):
+        t0 = time.time()
+        try:
+            detail = fn()
+            ok = True
+        except Exception as e:                      # 요청 URL에 키가 없으므로 메시지를 짧게 남겨도 안전하다
+            detail, ok = f"{type(e).__name__}: {str(e)[:120]}", False
+        out.append({"step": step, "ok": ok, "sec": round(time.time() - t0, 1), "detail": detail})
+        return ok
+
+    addrs = []
+
+    def dns():
+        addrs.extend(sorted({a[4][0] for a in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)}))
+        return ", ".join(addrs)
+
+    def tcp():
+        with socket.create_connection((addrs[0], 443), timeout=timeout):
+            return f"{addrs[0]}:443 연결됨"
+
+    def https():
+        r = requests.get(f"https://{host}/api/corpCode.xml", timeout=(timeout, timeout))
+        return f"HTTP {r.status_code}, {len(r.content):,}바이트(키 없는 요청이라 오류 안내 페이지가 정상)"
+
+    if run("이름 확인(DNS)", dns) and run("443 포트 접속", tcp):
+        run("HTTPS 요청", https)
+    run("대조군: 네이버 증권", lambda: f"HTTP {requests.get(PROBE_CONTROL_URL, timeout=(timeout, timeout)).status_code}")
+    return out
 
 
 def get_json(path, **params):
