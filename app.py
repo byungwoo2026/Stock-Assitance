@@ -2305,6 +2305,14 @@ try:
         os.environ.setdefault("DART_API_KEY", str(st.secrets["DART_API_KEY"]))
 except Exception:
     pass    # secrets 가 없는 환경 — 위험 공시 확인만 '키 없음'으로 안내하고 나머지 진단은 그대로 동작
+dart_core.UNREACHABLE_TTL = 600     # DART에 접속이 안 되면(배포 서버는 해외 접속이 막힘) 10분간은 종목마다 다시 기다리지 않는다
+
+DART_UNREACHABLE = ("이 환경에서는 DART에 접속되지 않습니다(접속 시간 초과). 배포 앱(Streamlit Cloud)은 해외 서버라 "
+                    "DART가 접속을 받지 않는 것으로 확인됐고, 이 PC에서 로컬로 실행하면 정상 동작합니다.")
+
+def dart_unreachable(payload):
+    """fetch_* 가 돌려준 오류 사유가 '접속 불가'인지 — 키·한도 문제와 다른 안내를 하려고 구분한다."""
+    return "ConnectTimeout" in str(payload)
 
 DIAG_VERDICT_COLORS = {
     "매수 고려": "green", "지켜보기": "orange", "사지 않기": "red",
@@ -2427,7 +2435,10 @@ def render_risk_flags(code, risk_asof=None):
     asof = risk_asof or now_kst().date()
     status, payload = fetch_risk_flags(code, asof.strftime("%Y-%m-%d"))
     if status == "err":
-        st.caption(f"⚠️ DART 위험 공시를 확인하지 못했습니다({payload}). Secrets에 DART_API_KEY가 있는지 확인해 주세요.")
+        if dart_unreachable(payload):
+            st.caption(f"⚠️ 위험 공시(감자·관리종목·감사의견)를 확인하지 못했습니다. '위험 공시 없음'이 아니라 '확인 못 함'입니다. {DART_UNREACHABLE}")
+        else:
+            st.caption(f"⚠️ DART 위험 공시를 확인하지 못했습니다({payload}). Secrets에 DART_API_KEY가 있는지 확인해 주세요.")
         return
     recent = [f for f in payload if f["in_window"]]
     older = [f for f in payload if not f["in_window"]]
@@ -2880,9 +2891,11 @@ def render_company_report(code, name, price, price_date, key_prefix):
         st.info(payload)
         return
     if status == "err":
-        st.warning(f"DART에서 보고서 자료를 받지 못했습니다({payload}). Secrets에 DART_API_KEY가 있는지, 일일 요청 한도를 넘지 않았는지 확인해 주세요.")
-        if "ConnectTimeout" in payload or "ConnectionError" in payload:
+        if dart_unreachable(payload) or "ConnectionError" in payload:
+            st.warning(f"종목 분석 보고서를 만들 수 없습니다. {DART_UNREACHABLE}")
             render_dart_probe(f"{key_prefix}_dartprobe_{code}")
+        else:
+            st.warning(f"DART에서 보고서 자료를 받지 못했습니다({payload}). Secrets에 DART_API_KEY가 있는지, 일일 요청 한도를 넘지 않았는지 확인해 주세요.")
         return
 
     interim = f" · {rep['interim']['year']} {rep['interim']['label']}보고서" if rep["interim"] else ""
@@ -3226,7 +3239,11 @@ def render_diag_watchlist():
     if flags_ok:
         table["위험 공시"] = table["코드"].map(lambda c: rdisc.short_text(flags[c][1]) if flags.get(c, ("err",))[0] == "ok" else "확인 불가")
     elif flags:
-        st.caption(f"⚠️ DART 위험 공시를 확인하지 못했습니다({next(iter(flags.values()))[1]}). Secrets에 DART_API_KEY가 있는지 확인해 주세요.")
+        reason = next(iter(flags.values()))[1]
+        if dart_unreachable(reason):
+            st.caption(f"⚠️ 위험 공시를 확인하지 못했습니다. '위험 공시 없음'이 아니라 '확인 못 함'입니다. {DART_UNREACHABLE}")
+        else:
+            st.caption(f"⚠️ DART 위험 공시를 확인하지 못했습니다({reason}). Secrets에 DART_API_KEY가 있는지 확인해 주세요.")
     counts = table["신호"].value_counts()
     metric_cols = st.columns(5)
     metric_cols[0].metric("전체", len(table))

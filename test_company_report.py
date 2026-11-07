@@ -552,5 +552,76 @@ class ProbeConnectionTests(unittest.TestCase):
         self.assertLessEqual(dart_core.CONNECT_TIMEOUT, 15)
 
 
+class UnreachableTests(unittest.TestCase):
+    """DART에 접속이 안 되는 환경(해외 서버): 종목마다 다시 기다리지 않고 바로 포기한다 — 단, 앱이 켠 경우에만."""
+
+    def setUp(self):
+        self._ttl = dart_core.UNREACHABLE_TTL
+        dart_core._unreachable_until = 0.0
+        patches = [mock.patch.object(dart_core, "load_key", return_value="K"), mock.patch.object(dart_core.time, "sleep")]
+        for p in patches:
+            p.start()
+            self.addCleanup(p.stop)
+
+    def tearDown(self):
+        dart_core.UNREACHABLE_TTL = self._ttl
+        dart_core._unreachable_until = 0.0
+
+    def _timeout(self):
+        return dart_core.requests.exceptions.ConnectTimeout("x")
+
+    def test_connect_timeout_gives_up_after_two_attempts(self):
+        with mock.patch.object(dart_core.requests, "get", side_effect=self._timeout()) as g:
+            with self.assertRaises(dart_core.DartError) as cm:
+                dart_core._request("list.json")
+        self.assertEqual(g.call_count, 2)
+        self.assertIn("ConnectTimeout", str(cm.exception))
+
+    def test_other_errors_still_retry_three_times(self):
+        with mock.patch.object(dart_core.requests, "get", side_effect=dart_core.requests.exceptions.ReadTimeout("x")) as g:
+            with self.assertRaises(dart_core.DartError):
+                dart_core._request("list.json")
+        self.assertEqual(g.call_count, 3)
+
+    def test_disabled_by_default_so_scripts_keep_retrying(self):
+        dart_core.UNREACHABLE_TTL = 0
+        with mock.patch.object(dart_core.requests, "get", side_effect=self._timeout()) as g:
+            for _ in range(2):
+                with self.assertRaises(dart_core.DartError):
+                    dart_core._request("list.json")
+        self.assertEqual(g.call_count, 4)                          # 두 번째 호출도 다시 시도한다
+
+    def test_enabled_second_call_fails_fast_without_network(self):
+        dart_core.UNREACHABLE_TTL = 600
+        with mock.patch.object(dart_core.requests, "get", side_effect=self._timeout()) as g:
+            with self.assertRaises(dart_core.DartError):
+                dart_core._request("list.json")
+            n = g.call_count
+            with self.assertRaises(dart_core.DartError) as cm:
+                dart_core._request("corpCode.xml")
+        self.assertEqual(g.call_count, n)                          # 두 번째는 네트워크를 건드리지 않았다
+        self.assertIn("ConnectTimeout", str(cm.exception))         # 앱이 '접속 불가'로 알아보는 표식은 유지된다
+
+    def test_recovers_after_ttl(self):
+        dart_core.UNREACHABLE_TTL = 600
+        with mock.patch.object(dart_core.requests, "get", side_effect=self._timeout()):
+            with self.assertRaises(dart_core.DartError):
+                dart_core._request("list.json")
+        dart_core._unreachable_until = 0.0                          # 시간이 지난 것으로 본다
+        ok = mock.Mock(status_code=200)
+        with mock.patch.object(dart_core.requests, "get", return_value=ok) as g:
+            self.assertIs(dart_core._request("list.json"), ok)
+        g.assert_called_once()
+
+    def test_http_error_does_not_trip_the_breaker(self):
+        dart_core.UNREACHABLE_TTL = 600
+        bad = mock.Mock(status_code=500)
+        bad.raise_for_status.side_effect = dart_core.requests.exceptions.HTTPError("500")
+        with mock.patch.object(dart_core.requests, "get", return_value=bad):
+            with self.assertRaises(dart_core.DartError):
+                dart_core._request("list.json")
+        self.assertEqual(dart_core._unreachable_until, 0.0)         # 서버가 응답한 오류는 '접속 불가'가 아니다
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
