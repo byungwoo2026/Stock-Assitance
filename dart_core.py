@@ -36,8 +36,16 @@ STATUS_MSG = {
     "901": "키 사용 기간 만료",
 }
 
+UNREACHABLE_TTL = 0          # 접속 시간 초과 뒤 바로 포기할 시간(초). 0이면 끔 — 조사 스크립트는 그대로 재시도, 앱만 켠다
+
 _last_call = 0.0
+_unreachable_until = 0.0
 _lock = threading.Lock()
+
+
+def _set_unreachable(seconds):
+    global _unreachable_until
+    _unreachable_until = time.time() + seconds
 
 
 class DartError(Exception):
@@ -62,6 +70,9 @@ def _request(path, **params):
             time.sleep(wait)
         _last_call = time.time()
     params["crtfc_key"] = load_key()
+    left = _unreachable_until - time.time()
+    if left > 0:                                  # 방금 접속이 안 됐다 — 종목마다 다시 기다리지 않고 바로 알린다
+        raise DartError(f"DART 요청 실패({path}): ConnectTimeout(최근 접속 실패 — {int(left // 60) + 1}분 안에는 다시 시도하지 않음)")
     last = None
     for attempt in range(3):
         try:
@@ -70,7 +81,11 @@ def _request(path, **params):
             return resp
         except requests.RequestException as e:
             last = type(e).__name__              # 메시지·URL은 버린다(키 포함)
+            if last == "ConnectTimeout" and attempt >= 1:
+                break                            # 접속 자체가 안 되는 환경 — 두 번 시도했으면 충분하다
             time.sleep(1.5 * (attempt + 1))
+    if last == "ConnectTimeout" and UNREACHABLE_TTL > 0:
+        _set_unreachable(UNREACHABLE_TTL)
     raise DartError(f"DART 요청 실패({path}): {last}")
 
 
