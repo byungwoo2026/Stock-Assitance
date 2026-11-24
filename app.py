@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timedelta, timezone
 import time
 import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 import json
 import threading
 # pyrefly: ignore [missing-import]
@@ -39,6 +40,8 @@ import segment_mix as smix            # 보고서의 매출 구성(사업부문�
 import peer_compare as pcmp           # 보고서의 피어 비교(같은 업종 시총 비슷한 종목을 같은 방식으로 계산)
 import filing_text as ftext           # 보고서의 AI 서술 재료: 사업보고서 본문 섹션(사업의 개요·경영진단·제재·소송·핵심감사사항)
 import report_narrative as rnar       # 보고서의 AI 서술(사업 요약·변화·비판적 리스크). LLM은 서술만, 숫자·인용은 코드가 검증
+import recent_financials as rfin      # '개별종목분석'의 AI 심층 리포트·종합점수용 최근 분기 실적(네이버 분기 재무) — 연간 수치만 쓰던 문제 보완
+import report_number_check as rnc     # AI 심층 리포트 숫자 검증: 제공 데이터에 없는 숫자(직접 계산·지어낸 값)에 ⚠️ 표시
 import dart_core
 import plotly.graph_objects as go
 from streamlit.errors import StreamlitAPIException
@@ -157,7 +160,16 @@ def fetch_headlines_rss(keyword, max_n=5, period="7d"):
             
             title = title_elem.text if title_elem is not None else ""
             link = link_elem.text if link_elem is not None else "#"
-            
+
+            # 발행일(KST, YYYY-MM-DD) — AI 리포트가 '최근 뉴스'와 오래된 뉴스를 구분하도록 프롬프트에 넣는다.
+            pub_date = None
+            date_elem = item.find('pubDate')
+            if date_elem is not None and date_elem.text:
+                try:
+                    pub_date = parsedate_to_datetime(date_elem.text).astimezone(KST).strftime('%Y-%m-%d')
+                except Exception:
+                    pub_date = None
+
             # 구글 RSS 타이틀 특성상 뒤에 붙는 ' - 언론사' 분리 처리
             press = "주요 언론"
             if " - " in title:
@@ -166,7 +178,7 @@ def fetch_headlines_rss(keyword, max_n=5, period="7d"):
                 press = parts[1]
                 
             if title:
-                headlines.append({"title": title, "press": press, "link": link})
+                headlines.append({"title": title, "press": press, "link": link, "date": pub_date})
     except Exception:
         # 상태코드는 200인데 XML 파싱 자체가 실패하는 등 예외 상황도
         # 화면을 빨간 에러박스로 깨뜨리지 않고 조용히 넘어가도록 처리
@@ -645,6 +657,7 @@ def fetch_stock_name_and_fundamentals(code):
         sector_per = 0.0
 
         op_margin, roe = "0", "0"
+        annual_period = None   # op_margin·roe가 어느 결산연도 값인지(예: '202512') — 리포트에 기간을 밝히기 위해
         op_margin_series, revenue_series = [], []
         try:
             fin_res = session.get(f"https://m.stock.naver.com/api/stock/{code}/finance/annual", timeout=5)
@@ -674,6 +687,7 @@ def fetch_stock_name_and_fundamentals(code):
                 return values
 
             if latest_actual_key:
+                annual_period = latest_actual_key
                 op_margin_row = row_by_title('영업이익률')
                 if op_margin_row:
                     op_margin = (op_margin_row.get('columns') or {}).get(latest_actual_key, {}).get('value') or "0"
@@ -705,7 +719,8 @@ def fetch_stock_name_and_fundamentals(code):
             "sector_per": sector_per,
             "op_margin": clean_num(op_margin),
             "roe": clean_num(roe),
-            "op_margin_avg": op_margin_avg,          # 확인 가능한 연도 전체 평균 영업이익률 (없으면 None)
+            "annual_period": annual_period,           # 위 op_margin·roe(연간)의 결산연도 키 (없으면 None)
+            "op_margin_avg": op_margin_avg,        # 확인 가능한 연도 전체 평균 영업이익률 (없으면 None)
             "op_margin_years": len(op_margin_series),
             "revenue_growth": revenue_growth_avg,     # 확인 가능한 연도들의 평균 매출성장률(%) (없으면 None)
             "revenue_growth_years": len(revenue_growth_points),
@@ -734,6 +749,7 @@ def analyze_stock_technical(code):
 
         return {
             "price": last['close'],
+            "price_date": df.index[-1].strftime('%Y-%m-%d'),  # 이 지표들의 기준 거래일 (리포트에 명시)
             "sma20": last['SMA20'],
             "sma60": last['SMA60'],
             "macd": last['MACD'],
@@ -1124,44 +1140,154 @@ def get_ai_summary(news_list):
         return content
     return f"⚠️ AI 분석 중 오류가 발생했습니다. (Secrets 설정이나 키 값을 확인해 주세요): {content}"
 
+@st.cache_data(ttl=300)  # 5분 캐싱 (버튼 재클릭 시 재호출 방지. 실패는 예외로 알려 '실패'가 캐시되지 않게 함)
+def _fetch_recent_financials_cached(code):
+    parsed = rfin.fetch_quarterly(get_naver_session(), code, now_kst().date())
+    if parsed is None:
+        raise RuntimeError("최근 분기 실적을 불러오지 못했습니다.")
+    return parsed
+
+def fetch_recent_financials(code):
+    """최근 확정 분기 실적(네이버 분기 재무). 조회 실패 시 None — 호출한 쪽이 '분기 실적 미반영'으로 처리한다."""
+    try:
+        return _fetch_recent_financials_cached(code)
+    except Exception:
+        return None
+
+def _annual_line_for_prompt(fundamentals):
+    """연간(최근 결산연도) 영업이익률·ROE 한 줄. 어느 연도 값인지 반드시 밝힌다(기간 없는 숫자가 '최신'으로 오해되는 것을 막음)."""
+    period = fundamentals.get('annual_period')
+    if not period:
+        return "- 최근 결산연도(연간) 영업이익률·ROE: 제공되지 않음"
+    return (f"- 최근 결산연도({rfin.period_label(period)}) 연간: "
+            f"영업이익률 {fundamentals['op_margin']}%, ROE {fundamentals['roe']}%")
+
 @st.cache_data(ttl=900)  # 15분 캐싱 (버튼 재클릭마다 불필요한 API 재호출 방지)
-def get_individual_stock_ai_analysis(fundamentals, tech, news_list):
-    news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list]) if news_list else "최근 관련 뉴스 없음"
-    prompt = f"""
+def get_individual_stock_ai_analysis(fundamentals, tech, news_list, recent=None):
+    """recent: fetch_recent_financials 결과(최근 분기 실적). 없으면 연간 수치만으로 쓰되 그 사실을 리포트에 밝히게 한다."""
+    today = now_kst().strftime('%Y-%m-%d')
+    price_date = tech.get('price_date') or "확인 불가"
+    news_text = "\n".join(
+        [f"- [{n.get('date') or '날짜 미상'}] [{n['press']}] {n['title']}" for n in news_list]
+    ) if news_list else "최근 관련 뉴스 없음"
+
+    # 화면의 '참고 손절가·목표가'와 같은 함수·같은 값을 넘겨, AI가 임의의 목표가를 만들어 화면과 어긋나지 않게 한다.
+    # '현재가 대비 %'도 코드가 계산해 준다 — AI가 직접 계산하게 두면 제공 데이터에 없는 숫자가 되어 검증기에 걸린다.
+    risk_levels = compute_risk_levels(tech['price'], tech.get('atr'))
+    risk_text = (f"- 참고 손절가: {int(risk_levels['stop_loss']):,}원 "
+                 f"(현재가 대비 {(risk_levels['stop_loss'] / tech['price'] - 1) * 100:+.1f}%, 현재가 − 2×ATR14)\n"
+                 f"    - 참고 목표가: {int(risk_levels['target_price']):,}원 "
+                 f"(현재가 대비 {(risk_levels['target_price'] / tech['price'] - 1) * 100:+.1f}%, 현재가 + 3×ATR14)"
+                 if risk_levels else "- 제공되지 않음")
+
+    sector_per = fundamentals.get('sector_per') or 0
+    def _vs_sector(per_value):
+        if per_value and per_value > 0 and sector_per > 0:
+            return f" (동일업종 PER 중앙값 대비 {(per_value / sector_per - 1) * 100:+.1f}%)"
+        return ""
+
+    if recent:
+        quarter_block = rfin.format_prompt_block(recent)
+        financial_basis = f"{recent['latest']['label']} 분기"
+    else:
+        quarter_block = ("[최근 분기 실적]\n- 조회 실패: 분기 실적 수치는 제공되지 않았습니다. "
+                         "아래 연간 수치만으로 판단하되, 최신 분기 실적이 반영되지 않았다는 점을 보고서 첫머리에 밝히세요.")
+        financial_basis = "최근 분기 실적 없음(연간 수치만 사용)"
+
+    # 프롬프트 = 규칙 + 데이터 + 구성. 숫자 검증기의 허용 목록은 '데이터' 부분에서만 뽑는다(규칙 문구의 예시 숫자가 섞이지 않게).
+    rules_text = f"""
     당신은 전문 주식 투자 분석가(리서치 센터장)입니다.
     다음 개별 종목 정보를 바탕으로 투자자에게 깊이 있고 전문적인 'AI 심층 투자 분석 보고서'를 작성해주세요.
 
+    [작성 규칙 — 반드시 지킬 것]
+    1. 보고서 맨 위에 '대상 종목: {fundamentals['name']}', '작성일: {today}', '재무 기준: {financial_basis}', '주가·기술지표 기준일: {price_date}' 네 줄을 그대로 적으세요.
+    2. 재무 평가는 아래 [최근 분기 실적]의 '가장 최근 확정 분기'를 중심으로 하세요. 영업이익률·ROE·부채비율 등을 말할 때는 반드시 기간(예: 2026.09 분기)을 함께 적고, 연간 수치는 보조로만 쓰세요.
+       최근 분기와 최근 결산연도 수치가 크게 다르면(개선/악화) 그 차이를 가장 먼저 짚으세요.
+       [최근 분기 실적]에 ⚠ 경고(최신 분기 미반영 등)가 있으면 재무 평가 첫머리에서 그 내용을 그대로 밝히세요.
+    3. 숫자는 이 요청에 적힌 값과 '코드가 계산한 값'만 쓰세요. 새로 계산한 수치를 만들지 말고 제공된 변화율(%, %p)을 인용하세요. 'N배 상승·개선' 같은 배수 표현도 직접 계산해 쓰지 마세요.
+       현금성 자산·총부채 금액, 업종 평균 영업이익률, 컨센서스처럼 제공되지 않은 수치를 만들거나 기억으로 채우지 마세요. 정말 필요한 경우에만 '제공된 데이터에 없음'이라고 한 번 쓰고, 표 칸을 채우려고 반복하지 말고 그 행·열은 생략하세요.
+    4. 비교 기준으로 쓸 수 있는 업종 수치는 제공된 '동일업종 PER 중앙값'뿐입니다. '산업 평균'·'시장 평균' 숫자를 임의로 만들지 마세요.
+    5. 금융업(은행·증권·보험)은 부채비율이 구조적으로 높으므로 일반 기업 기준으로 위험하다고 판단하지 마세요.
+    6. 뉴스는 날짜를 확인해 최근 것을 중심으로 평가하고 오래된 뉴스는 비중을 낮추세요. 뉴스 제목에 없는 사실을 덧붙이지 마세요.
+       제목에 이 종목({fundamentals['name']})이 나오지 않거나 다른 회사 이야기로 보이는 기사는 평가에서 제외하세요.
+    7. 매매 전략의 목표가·손절가는 아래 [참고 손절가·목표가]에 제공된 값만 쓰세요(제공되지 않았다면 가격을 제시하지 말고 기준만 서술). 비율(%)로 가격을 새로 만들지 마세요.
+    8. 리포트의 숫자는 자동 검증됩니다. 제공된 데이터에 없는 숫자(직접 계산한 비율·배수, 어림한 가격 구간 포함)는 ⚠️ 표시로 독자에게 경고됩니다.
+    """
+    data_text = f"""
     [종목 기본 정보]
     - 종목명: {fundamentals['name']}
-    - 영업이익률: {fundamentals['op_margin']}%
-    - ROE: {fundamentals['roe']}%
-    - 추정 PER: {fundamentals['cns_per']}배 (후행 PER: {fundamentals['per']}배)
-    - PBR: {fundamentals['pbr']}배
 
-    [기술적 지표 및 트렌드]
+    {quarter_block}
+
+    [연간 실적]
+    {_annual_line_for_prompt(fundamentals)}
+
+    [밸류에이션 — 현재 주가 기준, 출처: 네이버 금융]
+    - 후행 PER(현재가 ÷ 최근 4분기 EPS): {rfin.format_multiple(fundamentals.get('per'), '산출 불가(적자이거나 데이터 없음)')}{_vs_sector(fundamentals.get('per'))}
+    - 추정 PER(증권사 컨센서스): {rfin.format_multiple(fundamentals.get('cns_per'), '컨센서스 없음')}{_vs_sector(fundamentals.get('cns_per'))}
+    - PBR: {rfin.format_multiple(fundamentals.get('pbr'), '산출 불가')}
+    - 동일업종 PER 중앙값: {rfin.format_multiple(fundamentals.get('sector_per'), '제공되지 않음')}
+
+    [기술적 지표 및 트렌드 — {price_date} 기준]
     - 현재가: {int(tech['price']):,}원
     - 최근 1개월 수익률: {tech['one_month_return']:.2f}%
     - RSI (14): {tech['rsi']:.2f} (30 이하는 과매도, 70 이상은 과열)
     - MACD 상태: {'매수 우위 (MACD > Signal)' if tech['macd'] > tech['signal'] else '매도 우위 (MACD <= Signal)'}
-    - 20일 이동평균선 위치: {'20일선 위 (상승추세)' if tech['price'] > tech['sma20'] else '20일선 아래 (조정/하락세)'}
-    - 볼린저밴드 %B: {f"{tech['bb_pct_b']:.2f} (0=하단밴드, 1=상단밴드)" if tech.get('bb_pct_b') is not None and pd.notna(tech['bb_pct_b']) else "데이터 없음"}
+    - 20일 이동평균선 위치: {'20일선 위 (상승추세)' if tech['price'] > tech['sma20'] else '20일선 아래 (조정/하락세)'} (20일선 가격 {int(tech['sma20']):,}원)
+    - 볼린저밴드 %B: {f"{tech['bb_pct_b']:.2f} (0=하단밴드, 1=상단밴드, 하단 {int(tech['bb_lower']):,}원 / 상단 {int(tech['bb_upper']):,}원)" if tech.get('bb_pct_b') is not None and pd.notna(tech['bb_pct_b']) else "데이터 없음"}
     - 스토캐스틱 %K/%D: {f"{tech['stoch_k']:.1f} / {tech['stoch_d']:.1f} (20 이하 과매도, 80 이상 과열)" if tech.get('stoch_k') is not None and pd.notna(tech['stoch_k']) else "데이터 없음"}
     - 주간 추세(주봉 5주/20주 이평): {tech.get('weekly_trend') or "데이터 없음"}
 
+    [참고 손절가·목표가 — 변동성(ATR14) 기반 코드 계산값, 화면에도 같은 값이 표시됨]
+    {risk_text}
+
     [관련 최신 뉴스 및 시장 평가]
     {news_text}
-
+    """
+    structure_text = """
     보고서는 가독성 있게 작성되어야 하며, 다음 내용을 포함해 주세요:
-    1. **재무 건전성 및 밸류에이션 평가**: 영업이익률/ROE를 통한 수익성 평가, PER/PBR 기준 고평가/저평가 여부 분석.
+    1. **재무 건전성 및 밸류에이션 평가**: 최근 분기 실적 추이(매출·영업이익 성장, 영업이익률·ROE, 부채비율·당좌비율)를 중심으로 수익성과 재무 안정성을 평가하고, PER/PBR 기준 고평가/저평가 여부 분석.
     2. **차트 및 기술적 흐름 해석**: 이동평균선 추세, RSI 과매도/과열 강도, MACD 신호를 조합한 매수 타점 분석.
     3. **시장 모멘텀 및 뉴스 분석**: 최근 뉴스들의 호재/악재 성격 및 수급 영향 평가.
     4. **최종 AI 투자 전략 & 가이드**: 추천 매매 전략(분할 매수, 관망, 매도 등)과 목표/손절 대응 팁.
     """
-    ok, content = call_groq_chat([{"role": "user", "content": prompt}])
+    prompt = rules_text + data_text + structure_text
+    # temperature를 낮춰 제공되지 않은 숫자를 지어내는 경향을 줄인다.
+    ok, content = call_groq_chat([{"role": "user", "content": prompt}], temperature=0.3)
     if not ok:
         # 예외는 st.cache_data에 캐시되지 않으므로, 실패한 리포트가 15분간 그대로 노출되는 것을 막는다.
         raise RuntimeError(content)
-    return content
+
+    # 숫자 검증: 제공한 데이터에 없는 숫자에 ⚠️를 붙인다. 자동 재생성은 하지 않는다 —
+    # gpt-oss-120b 무료 한도(분당 8,000토큰)에서 리포트 1회가 한도의 60~70%라 곧바로 다시 부르면 429가 나기 때문.
+    # 검증기 오류가 리포트 자체를 막지 않도록 실패하면 검증 없이 원문을 돌려준다(unverified=None).
+    try:
+        check = rnc.check_report(content, data_text)
+        return {"text": check["annotated"], "unverified": check["unverified"], "checked": check["checked"]}
+    except Exception:
+        return {"text": content, "unverified": None, "checked": 0}
+
+def render_report_number_check(result):
+    """AI 리포트 숫자 검증 결과 표시. result = get_individual_stock_ai_analysis의 반환 dict.
+    검증기는 '그 숫자가 제공 데이터에 있는지'만 본다 — 존재하는 숫자를 엉뚱한 항목·기간에 붙인 경우는 못 잡는다."""
+    unverified = result.get("unverified")
+    if unverified is None:
+        st.caption("숫자 검증을 수행하지 못했습니다. 리포트의 수치는 화면의 상세 지표와 대조해 확인하세요.")
+    elif unverified:
+        st.warning(
+            f"⚠️ 숫자 검증: 리포트의 수치 {result.get('checked', 0)}개 중 {len(unverified)}종이 제공된 데이터에서 확인되지 않았습니다. "
+            "본문에 ⚠️로 표시했습니다. AI가 직접 계산했거나 지어낸 값일 수 있으니 사실로 받아들이지 마세요."
+        )
+        with st.expander("확인되지 않은 숫자 목록"):
+            st.dataframe(
+                pd.DataFrame([{"숫자": u["token"], "문맥": u["context"]} for u in unverified]),
+                hide_index=True, use_container_width=True,
+            )
+    else:
+        st.caption(
+            f"✅ 숫자 검증: 리포트의 수치 {result.get('checked', 0)}개가 모두 제공된 데이터와 일치합니다. "
+            "(숫자가 존재하는지만 확인하며, 어느 항목·기간에 붙였는지는 검증하지 않습니다.)"
+        )
 
 def render_data_ts_caption(ts, cache_minutes=None):
     """캐시된 데이터의 실제 계산 시각 캡션. 캐시 히트 시에도 처음 계산된 시각이 그대로 표시되어,
@@ -2147,10 +2273,14 @@ elif menu == "퀀트 투자 리스트":
                 st.markdown("---")
                 render_portfolio_correlation(filtered, key_prefix="quant_list")
 
-def calculate_stock_score(fundamentals, tech, news_list):
+def calculate_stock_score(fundamentals, tech, news_list, recent=None):
     """개선된 점수 체계화 모델 (뉴스/수급 40 + 밸류에이션 10 + 트렌드 10 + 기술적지표 20 + 경영지표 20 = 100점)
     반환: (총점, 뉴스/수급 점수, 밸류에이션 점수, 트렌드 점수, 기술적지표 점수, 경영지표 점수)
-    — 화면에서 이 세부 점수를 다시 계산하지 않고 그대로 재사용할 것 (중복 계산 시 총점과 어긋날 위험)"""
+    — 화면에서 이 세부 점수를 다시 계산하지 않고 그대로 재사용할 것 (중복 계산 시 총점과 어긋날 위험)
+
+    recent: fetch_recent_financials 결과. 있으면 경영지표(영업이익률·ROE)를 최근 분기 기준으로 채점한다
+    (영업이익률=최근 4분기 합산, ROE=최근 분기 표의 값 — rfin.resolve_profitability). 없으면(조회 실패) 연간 수치.
+    밸류에이션의 PER·PBR은 원래부터 현재가 기준(네이버 실시간)이라 이 인자와 무관하게 최신이다."""
     
     # --------------------------------------------------
     # 1. 뉴스 및 수급 점수 체계화 (40점 만점)
@@ -2283,14 +2413,15 @@ def calculate_stock_score(fundamentals, tech, news_list):
         if stoch_k <= 20: tech_score += 2        # 스토캐스틱 과매도 구간
         elif stoch_k <= 80: tech_score += 1
 
-    # 경영지표 (20점)
+    # 경영지표 (20점) — 문턱값(10%/5%)은 그대로, 입력만 연간 → 최근 분기 기준으로
+    profit = rfin.resolve_profitability(fundamentals['op_margin'], fundamentals['roe'], recent)
     mgmt_score = 0
-    if fundamentals['op_margin'] >= 10: mgmt_score += 12
-    elif fundamentals['op_margin'] >= 5: mgmt_score += 8
+    if profit['op_margin'] >= 10: mgmt_score += 12
+    elif profit['op_margin'] >= 5: mgmt_score += 8
     else: mgmt_score += 4
 
-    if fundamentals['roe'] >= 10: mgmt_score += 8
-    elif fundamentals['roe'] >= 5: mgmt_score += 5
+    if profit['roe'] >= 10: mgmt_score += 8
+    elif profit['roe'] >= 5: mgmt_score += 5
     else: mgmt_score += 2
 
     total_score = news_suqub_total + val_score + trend_score + tech_score + mgmt_score
@@ -3576,7 +3707,9 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                             tech = analyze_stock_technical(code)
                             if tech:
                                 news = fetch_headlines_rss(fundamentals['name'])
-                                total_score, _, _, _, _, _ = calculate_stock_score(fundamentals, tech, news)
+                                recent_fin = fetch_recent_financials(code)   # 최근 분기 실적(실패 시 None → 연간 수치로 채점)
+                                total_score, _, _, _, _, _ = calculate_stock_score(fundamentals, tech, news, recent_fin)
+                                profit = rfin.resolve_profitability(fundamentals['op_margin'], fundamentals['roe'], recent_fin)
                                 macd_signal = '매수' if tech['macd'] > tech['signal'] else '매도'
                                 risk_levels = compute_risk_levels(tech['price'], tech.get('atr'))
                                 analysis_results.append({
@@ -3585,8 +3718,9 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                                     "현재주가": f"{int(tech['price']):,}원",
                                     "참고 손절가": f"{int(risk_levels['stop_loss']):,}원" if risk_levels else "-",
                                     "참고 목표가": f"{int(risk_levels['target_price']):,}원" if risk_levels else "-",
-                                    "영업이익률": f"{fundamentals['op_margin']}%",
-                                    "ROE": f"{fundamentals['roe']}%",
+                                    "영업이익률": f"{profit['op_margin']:.2f}%",
+                                    "ROE": f"{profit['roe']:.2f}%",
+                                    "재무 기준": f"{recent_fin['latest']['label']} 분기" if recent_fin else "연간(분기 조회 실패)",
                                     "PBR": f"{fundamentals['pbr']}배",
                                     "RSI": f"{tech['rsi']:.2f}",
                                     "MACD": macd_signal,
@@ -3603,6 +3737,7 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                     df_results = pd.DataFrame(analysis_results)
                     st.dataframe(df_results, use_container_width=True)
                     st.caption("※ 참고 손절가/목표가는 ATR(변동성) 기반 근사치입니다 (현재가 ± 2~3×ATR14). 실제 지지/저항선을 반영한 값이 아니므로 투자 판단의 참고 자료로만 활용하세요.")
+                    st.caption("※ 영업이익률은 최근 4분기 합산, ROE는 최근 분기 기준(네이버 금융 분기 재무)이며 '재무 기준' 열의 분기까지 반영됩니다. 분기 조회에 실패한 종목은 연간 수치로 채점합니다.")
 
     # ==========================================
     # Tab 2: ETF List
@@ -3705,11 +3840,13 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                         fundamentals['sector_per'] = fetch_sector_average_per(stock_code)
                         tech = analyze_stock_technical(stock_code)
                         news = fetch_headlines_rss(fundamentals['name'])
+                        recent_fin = fetch_recent_financials(stock_code)   # 최근 확정 분기 실적 (조회 실패 시 None)
 
                         if tech is None:
                             st.error("기술적 분석을 위한 충분한 차트 데이터가 없습니다.")
                         else:
-                            total_score, news_score, val_score, trend_score, tech_score, mgmt_score = calculate_stock_score(fundamentals, tech, news)
+                            total_score, news_score, val_score, trend_score, tech_score, mgmt_score = calculate_stock_score(fundamentals, tech, news, recent_fin)
+                            profit = rfin.resolve_profitability(fundamentals['op_margin'], fundamentals['roe'], recent_fin)
 
                             opinion = "매도"
                             color = "red"
@@ -3732,6 +3869,7 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                             col3.metric("경영/밸류 (30)", f"{mgmt_score + val_score}점")
                             col4.metric("기술/트렌드 (30)", f"{tech_score + trend_score}점")
                             st.caption("※ 뉴스/수급 점수는 AI가 각 뉴스 제목의 문맥을 읽고 판정한 감성(긍정/중립/부정)을 기반으로 계산됩니다. (AI 판정 실패 시 키워드 매칭 방식으로 자동 대체)")
+                            st.caption(f"※ 경영 점수 기준: 영업이익률 {profit['op_margin']:.2f}% ({profit['op_basis']}), ROE {profit['roe']:.2f}% ({profit['roe_basis']}). 밸류 점수의 PER·PBR은 현재 주가 기준입니다.")
 
                             risk_levels = compute_risk_levels(tech['price'], tech.get('atr'))
                             if risk_levels:
@@ -3742,20 +3880,44 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
 
                             if GENAI_AVAILABLE:
                                 st.markdown("#### 🤖 AI 심층 투자 분석 리포트")
+                                report_result = None
                                 with st.spinner("AI가 재무·기술·뉴스를 종합한 심층 리포트를 작성하고 있습니다..."):
                                     try:
-                                        ai_report = get_individual_stock_ai_analysis(fundamentals, tech, news)
+                                        report_result = get_individual_stock_ai_analysis(fundamentals, tech, news, recent_fin)
+                                        ai_report = report_result["text"]
                                     except RuntimeError as e:
                                         ai_report = f"⚠️ AI 분석 리포트 생성 중 오류가 발생했습니다: {e}"
                                 st.info(ai_report)
+                                if report_result:
+                                    render_report_number_check(report_result)
+                                # 리포트가 어느 시점 데이터로 쓰였는지 화면에서 바로 확인할 수 있게 기준을 밝힌다.
+                                if recent_fin:
+                                    basis = f"재무 {recent_fin['latest']['label']} 분기(네이버 금융)"
+                                    if recent_fin.get('stale_note'):
+                                        st.warning(f"⚠️ {recent_fin['stale_note']}")
+                                else:
+                                    basis = "재무 최근 분기 실적 조회 실패 — 연간 수치만 반영"
+                                    st.warning("⚠️ 최근 분기 실적을 불러오지 못해 연간 수치만으로 작성된 리포트입니다. 잠시 후 다시 분석해 주세요.")
+                                st.caption(f"📅 리포트 기준: {basis} · 주가·기술지표 {tech.get('price_date', '확인 불가')} · 작성 {now_kst().strftime('%Y-%m-%d %H:%M')}")
 
                             st.markdown("#### 🔍 상세 지표 분석")
                             t1, t2, t3 = st.tabs(["재무 및 밸류에이션", "기술적 지표 및 트렌드", "관련 최신 뉴스"])
                             with t1:
-                                st.write(f"- **영업이익률**: {fundamentals['op_margin']}%")
-                                st.write(f"- **ROE**: {fundamentals['roe']}%")
-                                st.write(f"- **추정 PER**: {fundamentals['cns_per']}배 (후행 PER: {fundamentals['per']}배)")
+                                if recent_fin:
+                                    latest_q = recent_fin['latest']
+                                    st.write(f"- **최근 분기({latest_q['label']}) 영업이익률**: {latest_q['op_margin']}%")
+                                    st.write(f"- **최근 분기({latest_q['label']}) ROE(최근 4분기 합산)**: {latest_q['roe']}%")
+                                    st.write(f"- **최근 분기({latest_q['label']}) 부채비율**: {latest_q['debt_ratio']}%")
+                                annual_period = fundamentals.get('annual_period')
+                                annual_tag = f"최근 결산연도({rfin.period_label(annual_period)})" if annual_period else "최근 결산연도"
+                                st.write(f"- **{annual_tag} 영업이익률**: {fundamentals['op_margin']}%")
+                                st.write(f"- **{annual_tag} ROE**: {fundamentals['roe']}%")
+                                st.write(f"- **추정 PER**: {rfin.format_multiple(fundamentals['cns_per'], '컨센서스 없음')} (후행 PER: {rfin.format_multiple(fundamentals['per'], '산출 불가')})")
                                 st.write(f"- **PBR**: {fundamentals['pbr']}배")
+                                if recent_fin:
+                                    st.caption("최근 5개 분기 실적 (출처: 네이버 금융 분기 재무, 억원 단위)")
+                                    st.dataframe(pd.DataFrame(rfin.quarter_table_rows(recent_fin)), hide_index=True, use_container_width=True)
+                                    st.caption(f"※ 종합 점수의 경영 항목은 영업이익률 {profit['op_margin']:.2f}%({profit['op_basis']}), ROE {profit['roe']:.2f}%({profit['roe_basis']}) 기준으로 채점됩니다. 위 '최근 분기 영업이익률'은 분기 한 개 값이라 점수 기준(4분기 합산)과 다를 수 있습니다.")
                             with t2:
                                 st.write(f"- **현재 주가**: {int(tech['price']):,}원")
                                 st.write(f"- **최근 1개월 수익률**: {tech['one_month_return']:.2f}%")
