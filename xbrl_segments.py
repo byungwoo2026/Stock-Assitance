@@ -28,6 +28,9 @@ REVENUE_TAGS = ("Revenue", "RevenueFromContractsWithCustomers")
 AXIS_REVENUE_TAGS = REVENUE_TAGS + ("RevenueFromSaleOfGoodsProduct", "RevenueFromSaleOfGoods", "RevenueFromRenderingOfServices")
 OP_TAGS = ("OperatingIncomeLoss", "ProfitLossFromOperatingActivities")
 OVERSHOOT = 1.01
+# 보고서 종류별로 '그 보고서의 누적 기간' 길이(일). 분기·반기 보고서에는 3개월짜리 기간도 함께 들어 있어 누적 길이만 골라야 한다.
+YEAR_SPAN = (330, 400)
+SPANS = {"11011": YEAR_SPAN, "11014": (255, 285), "11012": (170, 195), "11013": (80, 100)}
 SEGMENT_MIN_OF_REVENUE = 0.9       # 부문 합계가 연결 매출의 90%에도 못 미치면 주력 부문이 빠진 것 → 그 보기는 버린다
 
 NS_XBRLI = "{http://www.xbrl.org/2003/instance}"
@@ -100,11 +103,12 @@ def _days(a, b):
     return (date(y2, m2, d2) - date(y1, m1, d1)).days
 
 
-def year_periods(contexts):
-    """매출 같은 1년짜리 기간 중 가장 늦은 끝 날짜(당기)와 그 1년 전(전기). 못 찾으면 (None, None)."""
+def year_periods(contexts, span=YEAR_SPAN):
+    """매출 같은 누적 기간(span 일 길이) 중 가장 늦은 끝 날짜(당기)와 그 1년 전(전기). 못 찾으면 (None, None).
+    사업보고서는 1년, 분기·반기 보고서는 올해 누적(3분기면 9개월) — 전기는 항상 1년 전 같은 시점이다."""
     ends = collections.Counter()
     for start, end, _ in contexts.values():
-        if start and end and 330 <= _days(start, end) <= 400:
+        if start and end and span[0] <= _days(start, end) <= span[1]:
             ends[end] += 1
     if not ends:
         return None, None
@@ -129,9 +133,9 @@ def select_members(items, total):
     return picked, run
 
 
-def extract(contexts, facts, labels, fs="CFS"):
+def extract(contexts, facts, labels, fs="CFS", span=YEAR_SPAN):
     """파싱된 XBRL → {'period_end', 'prev_end', 'axes': {축: {...}}}. 못 찾은 축은 빠진다."""
-    cur_end, prev_end = year_periods(contexts)
+    cur_end, prev_end = year_periods(contexts, span)
     if not cur_end:
         return {"period_end": None, "prev_end": None, "axes": {}}
     want_fs = "ConsolidatedMember" if fs == "CFS" else "SeparateMember"
@@ -166,7 +170,7 @@ def extract(contexts, facts, labels, fs="CFS"):
             out = collections.defaultdict(dict)
             for cid, val, unit in by_tag.get(tag, []):
                 start, end, dims = contexts[cid]
-                if end not in (cur_end, prev_end) or not start or not (330 <= _days(start, end) <= 400):
+                if end not in (cur_end, prev_end) or not start or not (span[0] <= _days(start, end) <= span[1]):
                     continue
                 if axis is None:
                     if clean_dims(dims, None) is None:
@@ -198,7 +202,7 @@ def extract(contexts, facts, labels, fs="CFS"):
             for cid, val, unit in by_tag.get("Revenue", []):
                 start, end, dims = contexts[cid]
                 rest = {local(k): local(v) for k, v in dims.items()}
-                if end == cur_end and start and 330 <= _days(start, end) <= 400 and rest.get("SegmentConsolidationItemsAxis") == "OperatingSegmentsMember" \
+                if end == cur_end and start and span[0] <= _days(start, end) <= span[1] and rest.get("SegmentConsolidationItemsAxis") == "OperatingSegmentsMember" \
                         and "SegmentsAxis" not in rest and rest.get(fs_axis, want_fs) == want_fs:
                     seg_total = val
                     break
@@ -232,7 +236,7 @@ def extract(contexts, facts, labels, fs="CFS"):
     return result
 
 
-def parse_zip(zf, fs="CFS"):
+def parse_zip(zf, fs="CFS", span=YEAR_SPAN):
     names = zf.namelist()
     inst = next((n for n in names if n.endswith(".xbrl")), None)
     lab = next((n for n in names if n.endswith("lab-ko.xml")), None)
@@ -240,11 +244,11 @@ def parse_zip(zf, fs="CFS"):
         raise ValueError("XBRL 인스턴스 파일이 없습니다.")
     labels = parse_labels(zf.read(lab)) if lab else {}
     contexts, facts = parse_instance(zf.read(inst))
-    return extract(contexts, facts, labels, fs)
+    return extract(contexts, facts, labels, fs, span)
 
 
 def fetch_segments(rcept_no, fs="CFS", reprt_code="11011"):
-    """사업보고서 접수번호 → 부문 구성. 결과(작은 JSON)는 dart_cache에 영구 보관한다(정정 공시는 접수번호가 달라진다)."""
+    """보고서 접수번호 → 부문 구성(사업보고서는 연간, 분기·반기 보고서는 올해 누적). 결과(작은 JSON)는 dart_cache에 영구 보관한다(정정 공시는 접수번호가 달라진다)."""
     path = os.path.join(dart_core.CACHE_DIR, f"seg_{rcept_no}_{fs}.json")
     try:
         with open(path, encoding="utf-8") as f:
@@ -252,7 +256,7 @@ def fetch_segments(rcept_no, fs="CFS", reprt_code="11011"):
     except (OSError, ValueError):
         pass
     zf = dart_core.get_zip("fnlttXbrl.xml", rcept_no=rcept_no, reprt_code=reprt_code)
-    result = parse_zip(zf, fs)
+    result = parse_zip(zf, fs, SPANS.get(reprt_code, YEAR_SPAN))
     try:
         os.makedirs(dart_core.CACHE_DIR, exist_ok=True)
         tmp = f"{path}.{os.getpid()}.tmp"

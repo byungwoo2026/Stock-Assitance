@@ -385,6 +385,79 @@ class BuildReportTests(unittest.TestCase):
         self.assertEqual((rep["filings"][0]["tag"], rep["filings"][0]["risk"]), ("배당", "주의"))
 
 
+class RecentColumnsTests(unittest.TestCase):
+    """5개년 표 옆에 붙는 최근 분기 열(올해 누적 · 전년 동기 누적 · 후행 12개월)."""
+
+    def interim(self, rc="11012", label="반기"):
+        return {"year": 2026, "rc": rc, "label": label, "main": [
+            mrow("CFS", "IS", "매출액", 300, 200, add=600, prev_add=400), mrow("CFS", "IS", "영업이익", 30, 20, add=60, prev_add=40),
+            mrow("CFS", "IS", "당기순이익(손실)", 20, 10, add=40, prev_add=30),
+            mrow("CFS", "BS", "자산총계", 900, 800), mrow("CFS", "BS", "부채총계", 300, 250), mrow("CFS", "BS", "자본총계", 600, 550)]}
+
+    def all_interim(self):
+        return [arow("IS", cr.OWNER_NI_ID, "지배", 18, 9, add=36, prev_add=27), arow("BS", cr.OWNER_EQ_ID, "지배", 580, 480),
+                arow("CF", cr.OCF_ID, "영업활동현금흐름", 70, 50),                                   # 누적 70, 전년 동기 누적 50
+                arow("CF", "ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities", "유형자산의 취득", 25, 20),
+                arow("CF", "ifrs-full_PurchaseOfIntangibleAssetsClassifiedAsInvestingActivities", "무형자산의 취득", 5, 5)]
+
+    def test_three_columns_and_ttm_match_header(self):
+        rep = cr.build_report(make_raw(self.interim(), self.all_interim()), 100.0, TODAY)
+        r = rep["recent"]
+        self.assertEqual((r["cum"]["year"], r["prev"]["year"], r["ttm"]["year"]), ("2026 반기 누적", "2025 반기 누적", "후행 12개월"))
+        self.assertEqual((r["cum"]["revenue"], r["prev"]["revenue"]), (600, 400))
+        self.assertEqual((r["cum"]["ni"], r["prev"]["ni"]), (36, 27))                       # 지배주주끼리
+        self.assertAlmostEqual(r["cum"]["op_margin"], 10.0)
+        self.assertEqual((r["cum"]["ocf"], r["cum"]["capex"], r["cum"]["fcf"]), (70, 30, 40))
+        self.assertEqual((r["prev"]["ocf"], r["prev"]["capex"], r["prev"]["fcf"]), (50, 25, 25))
+        # 후행 = 2025 사업연도 + 올해 누적 − 전년 동기. 상단 헤더의 후행 12개월과 같은 값이어야 한다(한 곳에서 계산)
+        h = rep["header"]["ttm"]
+        self.assertEqual((r["ttm"]["revenue"], r["ttm"]["op"], r["ttm"]["ni"]), (h["revenue"], h["op"], h["ni"]))
+        self.assertEqual(r["ttm"]["revenue"], 1000 + 600 - 400)
+        self.assertEqual(r["ttm"]["ni"], 66 + 36 - 27)
+        last = rep["annual"]["rows"][-1]
+        self.assertEqual(r["ttm"]["ocf"], last["ocf"] + 70 - 50)
+        self.assertEqual(r["ttm"]["capex"], last["capex"] + 30 - 25)
+
+    def test_balance_sheet_only_for_current_quarter_and_roe_blank(self):
+        r = cr.build_report(make_raw(self.interim(), self.all_interim()), 100.0, TODAY)["recent"]
+        self.assertEqual((r["cum"]["assets"], r["cum"]["liab"], r["cum"]["equity"]), (900, 300, 600))
+        self.assertAlmostEqual(r["cum"]["debt_ratio"], 50.0)
+        self.assertEqual((r["ttm"]["assets"], r["ttm"]["debt_ratio"]), (900, r["cum"]["debt_ratio"]))
+        self.assertTrue(all(r["prev"][k] is None for k in ("assets", "liab", "equity", "debt_ratio")))      # 전년 동기 말 재무상태는 이 보고서에 없다
+        self.assertTrue(all(r[c]["roe"] is None for c in ("cum", "prev", "ttm")))                        # 연간 평균자본 기준이라 누적·후행에는 만들지 않는다
+
+    def test_missing_cashflow_stays_blank_and_is_noted(self):
+        rep = cr.build_report(make_raw(self.interim(), [arow("IS", cr.OWNER_NI_ID, "지배", 18, 9, add=36, prev_add=27)]), 100.0, TODAY)
+        r = rep["recent"]
+        self.assertEqual((r["cum"]["revenue"], r["ttm"]["revenue"]), (600, 1200))
+        self.assertTrue(all(r[c][k] is None for c in ("cum", "prev", "ttm") for k in ("ocf", "capex", "fcf")))     # 0으로 메우지 않는다
+        self.assertEqual(rep["header"]["ttm"]["ni"], 75)                                       # 현금흐름이 없어도 후행 순이익은 그대로
+        self.assertTrue(any("현금흐름" in n and "반기" in n and "FCF" in n for n in rep["notes"]))
+
+    def test_one_quarter_report_is_labelled_without_cumulative(self):
+        q1 = {"year": 2026, "rc": "11013", "label": "1분기", "main": [
+            mrow("CFS", "IS", "매출액", 300, 200), mrow("CFS", "IS", "영업이익", 30, 20), mrow("CFS", "IS", "당기순이익(손실)", 20, 10), mrow("CFS", "BS", "자본총계", 600, 500)]}
+        r = cr.build_report(make_raw(q1, [arow("IS", cr.OWNER_NI_ID, "지배", 18, 9)]), 100.0, TODAY)["recent"]
+        self.assertEqual((r["cum"]["year"], r["prev"]["year"]), ("2026 1분기", "2025 1분기"))
+        self.assertEqual((r["cum"]["revenue"], r["prev"]["revenue"]), (300, 200))
+
+    def test_no_interim_means_no_recent_columns(self):
+        self.assertIsNone(cr.build_report(make_raw(), 100.0, TODAY)["recent"])
+
+    def test_financial_company_has_no_fcf_in_recent_columns(self):
+        raw = make_raw(self.interim(), self.all_interim(),
+                       main_a=[row for row in fiscal_rows() if row["account_nm"] != "매출액"], old=None)
+        raw["interim"]["main"] = [row for row in raw["interim"]["main"] if row["account_nm"] != "매출액"]
+        rep = cr.build_report(raw, 100.0, TODAY)
+        self.assertTrue(rep["financial_like"])
+        self.assertTrue(all(rep["recent"][c]["fcf"] is None for c in ("cum", "prev", "ttm")))
+
+    def test_total_basis_uses_main_rows(self):
+        raw = make_raw(self.interim(), None, all_a=None, old={"year": 2022, "main": fiscal_rows(), "all": None})
+        r = cr.build_report(raw, 100.0, TODAY)["recent"]
+        self.assertEqual((r["cum"]["ni"], r["prev"]["ni"]), (40, 30))                          # 전체 기준(주요계정) — 지배주주와 섞지 않는다
+
+
 class FetchRawTests(unittest.TestCase):
     """dart_core를 모의해 어떤 보고서를 어떤 순서로 찾는지만 확인한다."""
 
@@ -420,6 +493,19 @@ class FetchRawTests(unittest.TestCase):
         self.assertEqual(raw["interim"]["rc"], "11012")                     # 3분기는 아직 없고 반기가 가장 최근
         self.assertEqual([c[2] for c in calls if c[1] == 2026], ["11014", "11012"])         # 반기를 찾으면 1분기는 묻지 않는다
         self.assertEqual(raw["shares"]["year"], 2026)
+
+    def test_interim_mix_is_fetched_with_cumulative_revenue(self):
+        interim_rows = [dict(r, rcept_no="20261112000741") for r in
+                        (mrow("CFS", "IS", "매출액", 300, 200, add=600, prev_add=400), mrow("CFS", "BS", "자산총계", 900, 800))]
+        self.patch({(2025, "11011"): fiscal_rows(), (2022, "11011"): fiscal_rows(), (2026, "11014"): interim_rows}, {(2026, "11014"): self.SH()})
+        with mock.patch.object(cr.segment_mix, "fetch_mix", return_value={"views": []}) as fm:
+            raw = cr.fetch_raw("000001", TODAY)
+        calls = {c.args[0]: c.args for c in fm.call_args_list}
+        self.assertEqual(calls["20261112000741"], ("20261112000741", "CFS", 600, "11014", "2026 3분기"))     # 그 보고서의 누적 매출로 본문 표를 검증한다
+        self.assertEqual(raw["mix_interim"], {"views": []})
+        with mock.patch.object(cr.segment_mix, "fetch_mix", return_value={"views": []}):
+            light = cr.fetch_raw("000001", TODAY, light=True)                                                # 피어 비교용은 매출 구성을 받지 않는다
+        self.assertIsNone(light["mix_interim"])
 
     def test_shares_fall_back_to_annual_when_interim_has_none(self):
         self.patch({(2025, "11011"): fiscal_rows(), (2022, "11011"): fiscal_rows(), (2026, "11013"): fiscal_rows()},

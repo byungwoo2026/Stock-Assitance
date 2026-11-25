@@ -79,6 +79,32 @@ class XbrlParseTests(unittest.TestCase):
         self.assertEqual(xs.year_periods(b.contexts), ("2025-12-31", "2024-12-31"))
         self.assertEqual(xs.year_periods({}), (None, None))
 
+    def test_year_periods_for_interim_reports_use_cumulative_span(self):
+        # 3분기 보고서: 올해 1~9월(누적)·7~9월(3개월)·전년 같은 기간이 함께 들어 있다. 누적 길이만 골라야 한다.
+        ctx = {"a": ("2026-01-01", "2026-09-30", {}), "b": ("2026-07-01", "2026-09-30", {}),
+               "c": ("2025-01-01", "2025-09-30", {}), "d": ("2025-07-01", "2025-09-30", {}), "e": ("2025-01-01", "2025-12-31", {})}
+        self.assertEqual(xs.year_periods(ctx, xs.SPANS["11014"]), ("2026-09-30", "2025-09-30"))
+        self.assertEqual(xs.year_periods(ctx, xs.SPANS["11011"]), ("2025-12-31", None))     # 같은 자료를 연간 기준으로 보면 전혀 다른 답 → 보고서 종류를 꼭 넘겨야 한다
+        half = {"a": ("2026-01-01", "2026-06-30", {}), "b": ("2026-04-01", "2026-06-30", {}), "c": ("2025-01-01", "2025-06-30", {})}
+        self.assertEqual(xs.year_periods(half, xs.SPANS["11012"]), ("2026-06-30", "2025-06-30"))
+
+    def test_extract_interim_uses_cumulative_values_not_three_months(self):
+        b = XbrlBuilder()
+        for start, end, val_total, val_a in (("2026-01-01", "2026-09-30", 900, 600), ("2026-07-01", "2026-09-30", 300, 200), ("2025-01-01", "2025-09-30", 800, 500)):
+            for dims, val in (({}, val_total), ({PROD_AXIS: "e:Mem"}, val_a), ({PROD_AXIS: "e:Etc"}, val_total - val_a)):
+                d = dict(dims)
+                d[FS_AXIS] = CONSOL
+                b._n += 1
+                cid = f"x{b._n}"
+                b.contexts[cid] = (start, end, d)
+                b.facts.append(("Revenue", cid, float(val), "KRW"))
+        out = xs.extract(b.contexts, b.facts, {"e_Mem": "메모리", "e_Etc": "기타"}, "CFS", xs.SPANS["11014"])
+        self.assertEqual(out["period_end"], "2026-09-30")
+        prod = out["axes"]["product"]
+        self.assertEqual(prod["total"], 900)                                         # 3개월 300이 아니라 9개월 누적
+        self.assertEqual({m["label"]: (m["cur"], m["prev"]) for m in prod["members"]}, {"메모리": (600, 500), "기타": (300, 300)})
+        self.assertEqual(xs.extract(b.contexts, b.facts, {}, "CFS")["axes"], {})     # 연간 기준으로 읽으면 1년짜리 기간이 없어 비어야 한다(조용히 틀린 값을 내지 않음)
+
     def test_select_members_avoids_double_counting(self):
         # 상위(해외 100)와 그 하위(유럽 60·아시아 40)가 함께 공시 → 합계 100을 넘지 않게 큰 것부터
         picked, covered = xs.select_members([("국내", 100), ("해외", 100), ("유럽", 60), ("아시아", 40)], 200)
@@ -312,6 +338,26 @@ class SegmentMixTests(unittest.TestCase):
                 none = sm.fetch_mix("20260101000003", "CFS", 1000.0)
                 self.assertEqual((none["errors"], none["views"]), ([], []))                              # XBRL이 아예 없는 회사는 정상 상태
                 self.assertTrue(os.path.exists(os.path.join(tmp, "mix_20260101000003_CFS.json")))
+
+    def test_interim_mix_uses_table_without_prev_and_labels_the_source(self):
+        # 분기보고서: XBRL에 주석이 없으면 본문 표를 쓰되, 표의 비교 열(전년 연간)로 증감률을 만들지 않는다
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(dart_core, "CACHE_DIR", tmp), \
+             mock.patch.object(sm.xbrl_segments, "fetch_segments", return_value={"axes": {}, "period_end": "2026-09-30"}) as fx, \
+             mock.patch.object(dart_core, "download_document", return_value=table_doc(YC_STYLE)):
+            mix = sm.fetch_mix("20261112000741", "CFS", 600e6, "11014", "2026 3분기")
+            fx.assert_called_once_with("20261112000741", "CFS", "11014")
+            v = mix["views"][0]
+            self.assertEqual(v["source"], "2026 3분기보고서 본문 '매출실적' 표(자동 해석)")
+            self.assertFalse(v["has_prev"])
+            self.assertTrue(all(m["prev"] is None for m in v["members"]))
+            self.assertIn("전년 연간", v["note"])
+            self.assertEqual((mix["reprt_code"], mix["period_end"]), ("11014", "2026-09-30"))
+
+    def test_interim_xbrl_view_keeps_like_for_like_prev(self):
+        mix = sm.build_mix(self.xb(0.95), None, "2026 반기보고서 XBRL 주석", "표", with_prev=False)
+        prod = next(v for v in mix["views"] if v["key"] == "product")
+        self.assertEqual(prod["source"], "2026 반기보고서 XBRL 주석")
+        self.assertTrue(prod["has_prev"])                                            # XBRL의 전기는 전년 동기 누적이라 그대로 쓴다
 
     def test_table_fallback_used_when_xbrl_has_no_product(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.object(dart_core, "CACHE_DIR", tmp), \
