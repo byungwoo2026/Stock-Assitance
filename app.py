@@ -1729,7 +1729,10 @@ def render_index_metric(label, data):
         st.metric(label=label, value=data['index'], delta=None)
         return
 
-    change_str = data['change']  # 예: "+4.46%" 또는 "-5.33%"
+    render_kr_metric(label, data['index'], data['change'])
+
+def render_kr_metric(label, value, change_str):
+    """한국 증시 관례(상승=빨강 ▲, 하락=파랑 ▼)로 값과 등락률을 표시. change_str 예: "+4.46%" 또는 "-5.33%" """
     is_down = change_str.startswith('-')
     color = "#1857e0" if is_down else "#d60000"  # 파랑(하락) / 빨강(상승)
     arrow = "▼" if is_down else "▲"
@@ -1737,7 +1740,7 @@ def render_index_metric(label, data):
     st.markdown(f"""
         <div style="padding: 4px 0;">
             <div style="font-size: 0.875rem; color: rgba(49,51,63,0.6);">{label}</div>
-            <div style="font-size: 2.25rem; font-weight: 600; line-height: 1.2;">{data['index']}</div>
+            <div style="font-size: 2.25rem; font-weight: 600; line-height: 1.2;">{value}</div>
             <div style="font-size: 0.875rem; color: {color}; font-weight: 600;">{arrow} {change_str}</div>
         </div>
     """, unsafe_allow_html=True)
@@ -1774,7 +1777,7 @@ if menu == "종합 대시보드":
         semi_cols = st.columns(len(semi_data))
         for s_col, (name, d) in zip(semi_cols, semi_data.items()):
             with s_col:
-                st.metric(label=name, value=f"{d['price']:,.0f}원", delta=f"{d['change']:+.2f}%")
+                render_kr_metric(name, f"{d['price']:,.0f}원", f"{d['change']:+.2f}%")
         render_data_ts_caption(semi_ts, cache_minutes=10)
     else:
         st.warning("반도체 데이터를 불러오지 못했습니다.")
