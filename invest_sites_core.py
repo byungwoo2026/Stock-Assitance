@@ -41,7 +41,7 @@ SOURCES = {
 ROBOTS_DISALLOW = {"buffettlab.co.kr": ("/adm/", "/cheditor5/", "/Daumeditor/"), "finance.eduinfom.com": ("/wp-json/", "/api/"),
                    "snusmic.com": ("/wp-admin/",)}
 BUFFETT_TAGS = ("[버핏 리포트]", "[이슈 체크]")        # 종목 분석 글. 장마감·시황·원자재 등은 제외
-GROQ_MODEL_CANDIDATES = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]   # app.py와 같은 후보(가끔 갱신 필요)
+GROQ_MODEL_CANDIDATES = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]   # app.py와 같은 후보(가끔 갱신 필요)
 LLM_MAX_CHARS = 6000
 
 

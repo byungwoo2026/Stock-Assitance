@@ -46,9 +46,9 @@ import dart_core
 import plotly.graph_objects as go
 from streamlit.errors import StreamlitAPIException
 
-# Groq가 특정 모델을 예고 없이 단종시킨 전례가 있어(예: llama-3.3-70b-versatile),
-# 최우선 모델이 실패하면 다음 모델로 자동 전환. 가끔 갱신이 필요할 수 있음(2026-09-16 기준 확인).
-GROQ_MODEL_CANDIDATES = ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+# Groq가 특정 모델을 예고 없이 단종시킨 전례가 있어(llama-3.3-70b-versatile·llama-3.1-8b-instant는 2026-11 현재 404),
+# 최우선 모델이 실패하면 다음 모델로 자동 전환. 분당 한도가 모델별이라 120b가 막혀도 20b는 통할 수 있다(2026-11-07 실측).
+GROQ_MODEL_CANDIDATES = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"]
 
 # 재시도/모델 전환으로 해결되지 않는 오류(인증·접근 차단)는 즉시 중단하고 원인을 알기 쉬운 문구로 안내
 GROQ_FATAL_STATUS_MESSAGES = {
@@ -61,9 +61,10 @@ def call_groq_chat(messages, temperature=None, max_retries=2):
     """Groq 채팅 완성 호출 공통 헬퍼.
     모델별로 최대 max_retries회 짧게 재시도하고, 그래도 실패하면 다음 후보 모델로 넘어간다.
     단, 401/403처럼 재시도해도 소용없는 오류는 즉시 중단하고 안내 문구를 반환한다.
-    반환: (성공 여부, 성공 시 응답 텍스트 / 실패 시 마지막 에러 메시지)
+    404(모델 없음)·429(한도 초과)는 같은 모델을 다시 불러도 소용없어 바로 다음 모델로 넘어간다.
+    반환: (성공 여부, 성공 시 응답 텍스트 / 실패 시 모델별 첫 에러 메시지 — 마지막 후보의 404가 진짜 원인을 가리지 않도록)
     """
-    last_err = None
+    errors = {}                                  # 모델 → 그 모델의 첫 에러(재시도 중 바뀌는 것보다 처음 원인이 중요)
     for model in GROQ_MODEL_CANDIDATES:
         for attempt in range(max_retries):
             try:
@@ -77,10 +78,12 @@ def call_groq_chat(messages, temperature=None, max_retries=2):
                 fatal_msg = GROQ_FATAL_STATUS_MESSAGES.get(getattr(e, "status_code", None))
                 if fatal_msg:
                     return False, fatal_msg
-                last_err = e
+                errors.setdefault(model, str(e))
+                if getattr(e, "status_code", None) in (404, 429):
+                    break
                 if attempt < max_retries - 1:
                     time.sleep(0.5 * (attempt + 1))
-    return False, str(last_err)
+    return False, " / ".join(f"[{m}] {msg}" for m, msg in errors.items())
 
 st.set_page_config(page_title="나만의 투자 조수", layout="wide")
 
