@@ -7,6 +7,7 @@ import re
 from datetime import datetime, timedelta, timezone
 import time
 import xml.etree.ElementTree as ET
+from email.utils import parsedate_to_datetime
 import json
 import threading
 # pyrefly: ignore [missing-import]
@@ -39,6 +40,8 @@ import segment_mix as smix            # 보고서의 매출 구성(사업부문�
 import peer_compare as pcmp           # 보고서의 피어 비교(같은 업종 시총 비슷한 종목을 같은 방식으로 계산)
 import filing_text as ftext           # 보고서의 AI 서술 재료: 사업보고서 본문 섹션(사업의 개요·경영진단·제재·소송·핵심감사사항)
 import report_narrative as rnar       # 보고서의 AI 서술(사업 요약·변화·비판적 리스크). LLM은 서술만, 숫자·인용은 코드가 검증
+import recent_financials as rfin      # '개별종목분석'의 AI 심층 리포트·종합점수용 최근 분기 실적(네이버 분기 재무) — 연간 수치만 쓰던 문제 보완
+import report_number_check as rnc     # AI 심층 리포트 숫자 검증: 제공 데이터에 없는 숫자(직접 계산·지어낸 값)에 ⚠️ 표시
 import dart_core
 import plotly.graph_objects as go
 from streamlit.errors import StreamlitAPIException
@@ -157,7 +160,16 @@ def fetch_headlines_rss(keyword, max_n=5, period="7d"):
             
             title = title_elem.text if title_elem is not None else ""
             link = link_elem.text if link_elem is not None else "#"
-            
+
+            # 발행일(KST, YYYY-MM-DD) — AI 리포트가 '최근 뉴스'와 오래된 뉴스를 구분하도록 프롬프트에 넣는다.
+            pub_date = None
+            date_elem = item.find('pubDate')
+            if date_elem is not None and date_elem.text:
+                try:
+                    pub_date = parsedate_to_datetime(date_elem.text).astimezone(KST).strftime('%Y-%m-%d')
+                except Exception:
+                    pub_date = None
+
             # 구글 RSS 타이틀 특성상 뒤에 붙는 ' - 언론사' 분리 처리
             press = "주요 언론"
             if " - " in title:
@@ -166,7 +178,7 @@ def fetch_headlines_rss(keyword, max_n=5, period="7d"):
                 press = parts[1]
                 
             if title:
-                headlines.append({"title": title, "press": press, "link": link})
+                headlines.append({"title": title, "press": press, "link": link, "date": pub_date})
     except Exception:
         # 상태코드는 200인데 XML 파싱 자체가 실패하는 등 예외 상황도
         # 화면을 빨간 에러박스로 깨뜨리지 않고 조용히 넘어가도록 처리
@@ -645,6 +657,7 @@ def fetch_stock_name_and_fundamentals(code):
         sector_per = 0.0
 
         op_margin, roe = "0", "0"
+        annual_period = None   # op_margin·roe가 어느 결산연도 값인지(예: '202512') — 리포트에 기간을 밝히기 위해
         op_margin_series, revenue_series = [], []
         try:
             fin_res = session.get(f"https://m.stock.naver.com/api/stock/{code}/finance/annual", timeout=5)
@@ -674,6 +687,7 @@ def fetch_stock_name_and_fundamentals(code):
                 return values
 
             if latest_actual_key:
+                annual_period = latest_actual_key
                 op_margin_row = row_by_title('영업이익률')
                 if op_margin_row:
                     op_margin = (op_margin_row.get('columns') or {}).get(latest_actual_key, {}).get('value') or "0"
@@ -705,7 +719,8 @@ def fetch_stock_name_and_fundamentals(code):
             "sector_per": sector_per,
             "op_margin": clean_num(op_margin),
             "roe": clean_num(roe),
-            "op_margin_avg": op_margin_avg,          # 확인 가능한 연도 전체 평균 영업이익률 (없으면 None)
+            "annual_period": annual_period,           # 위 op_margin·roe(연간)의 결산연도 키 (없으면 None)
+            "op_margin_avg": op_margin_avg,        # 확인 가능한 연도 전체 평균 영업이익률 (없으면 None)
             "op_margin_years": len(op_margin_series),
             "revenue_growth": revenue_growth_avg,     # 확인 가능한 연도들의 평균 매출성장률(%) (없으면 None)
             "revenue_growth_years": len(revenue_growth_points),
@@ -734,6 +749,7 @@ def analyze_stock_technical(code):
 
         return {
             "price": last['close'],
+            "price_date": df.index[-1].strftime('%Y-%m-%d'),  # 이 지표들의 기준 거래일 (리포트에 명시)
             "sma20": last['SMA20'],
             "sma60": last['SMA60'],
             "macd": last['MACD'],
@@ -1124,44 +1140,159 @@ def get_ai_summary(news_list):
         return content
     return f"⚠️ AI 분석 중 오류가 발생했습니다. (Secrets 설정이나 키 값을 확인해 주세요): {content}"
 
+@st.cache_data(ttl=300)  # 5분 캐싱 (버튼 재클릭 시 재호출 방지. 실패는 예외로 알려 '실패'가 캐시되지 않게 함)
+def _fetch_recent_financials_cached(code):
+    parsed = rfin.fetch_quarterly(get_naver_session(), code, now_kst().date())
+    if parsed is None:
+        raise RuntimeError("최근 분기 실적을 불러오지 못했습니다.")
+    return parsed
+
+def fetch_recent_financials(code):
+    """최근 확정 분기 실적(네이버 분기 재무). 조회 실패 시 None — 호출한 쪽이 '분기 실적 미반영'으로 처리한다."""
+    try:
+        return _fetch_recent_financials_cached(code)
+    except Exception:
+        return None
+
+def _annual_line_for_prompt(fundamentals):
+    """연간(최근 결산연도) 영업이익률·ROE 한 줄. 어느 연도 값인지 반드시 밝힌다(기간 없는 숫자가 '최신'으로 오해되는 것을 막음)."""
+    period = fundamentals.get('annual_period')
+    if not period:
+        return "- 최근 결산연도(연간) 영업이익률·ROE: 제공되지 않음"
+    return (f"- 최근 결산연도({rfin.period_label(period)}) 연간: "
+            f"영업이익률 {fundamentals['op_margin']}%, ROE {fundamentals['roe']}%")
+
 @st.cache_data(ttl=900)  # 15분 캐싱 (버튼 재클릭마다 불필요한 API 재호출 방지)
-def get_individual_stock_ai_analysis(fundamentals, tech, news_list):
-    news_text = "\n".join([f"- [{n['press']}] {n['title']}" for n in news_list]) if news_list else "최근 관련 뉴스 없음"
-    prompt = f"""
+def get_individual_stock_ai_analysis(fundamentals, tech, news_list, recent=None):
+    """recent: fetch_recent_financials 결과(최근 분기 실적). 없으면 연간 수치만으로 쓰되 그 사실을 리포트에 밝히게 한다."""
+    today = now_kst().strftime('%Y-%m-%d')
+    price_date = tech.get('price_date') or "확인 불가"
+    news_text = "\n".join(
+        [f"- [{n.get('date') or '날짜 미상'}] [{n['press']}] {n['title']}" for n in news_list]
+    ) if news_list else "최근 관련 뉴스 없음"
+
+    # 화면의 '참고 손절가·목표가'와 같은 함수·같은 값을 넘겨, AI가 임의의 목표가를 만들어 화면과 어긋나지 않게 한다.
+    # '현재가 대비 %'도 코드가 계산해 준다 — AI가 직접 계산하게 두면 제공 데이터에 없는 숫자가 되어 검증기에 걸린다.
+    risk_levels = compute_risk_levels(tech['price'], tech.get('atr'))
+    risk_text = (f"- 참고 손절가: {int(risk_levels['stop_loss']):,}원 "
+                 f"(현재가 대비 {(risk_levels['stop_loss'] / tech['price'] - 1) * 100:+.1f}%, 현재가 − 2×ATR14)\n"
+                 f"    - 참고 목표가: {int(risk_levels['target_price']):,}원 "
+                 f"(현재가 대비 {(risk_levels['target_price'] / tech['price'] - 1) * 100:+.1f}%, 현재가 + 3×ATR14)"
+                 if risk_levels else "- 제공되지 않음")
+
+    sector_per = fundamentals.get('sector_per') or 0
+    def _vs_sector(per_value):
+        if per_value and per_value > 0 and sector_per > 0:
+            return f" (동일업종 PER 중앙값 대비 {(per_value / sector_per - 1) * 100:+.1f}%)"
+        return ""
+
+    if recent:
+        quarter_block = rfin.format_prompt_block(recent)
+        financial_basis = f"{recent['latest']['label']} 분기"
+    else:
+        quarter_block = ("[최근 분기 실적]\n- 조회 실패: 분기 실적 수치는 제공되지 않았습니다. "
+                         "아래 연간 수치만으로 판단하되, 최신 분기 실적이 반영되지 않았다는 점을 보고서 첫머리에 밝히세요.")
+        financial_basis = "최근 분기 실적 없음(연간 수치만 사용)"
+
+    # 프롬프트 = 규칙 + 데이터 + 구성. 숫자 검증기의 허용 목록은 '데이터' 부분에서만 뽑는다(규칙 문구의 예시 숫자가 섞이지 않게).
+    rules_text = f"""
     당신은 전문 주식 투자 분석가(리서치 센터장)입니다.
     다음 개별 종목 정보를 바탕으로 투자자에게 깊이 있고 전문적인 'AI 심층 투자 분석 보고서'를 작성해주세요.
 
+    [작성 규칙 — 반드시 지킬 것]
+    1. 보고서 맨 위에 '대상 종목: {fundamentals['name']}', '작성일: {today}', '재무 기준: {financial_basis}', '주가·기술지표 기준일: {price_date}' 네 줄을 그대로 적으세요.
+    2. 재무 평가는 아래 [최근 분기 실적]의 '가장 최근 확정 분기'를 중심으로 하세요. 영업이익률·ROE·부채비율 등을 말할 때는 반드시 기간(예: 2026.09 분기)을 함께 적고, 연간 수치는 보조로만 쓰세요.
+       최근 분기와 최근 결산연도 수치가 크게 다르면(개선/악화) 그 차이를 가장 먼저 짚으세요.
+       [최근 분기 실적]에 ⚠ 경고(최신 분기 미반영 등)가 있으면 재무 평가 첫머리에서 그 내용을 그대로 밝히세요.
+    3. 숫자는 이 요청에 적힌 값과 '코드가 계산한 값'만 쓰세요. 새로 계산한 수치를 만들지 말고 제공된 변화율(%, %p)을 인용하세요. 'N배 상승·개선' 같은 배수 표현도 직접 계산해 쓰지 마세요.
+       현금성 자산·총부채 금액, 업종 평균 영업이익률, 컨센서스처럼 제공되지 않은 수치를 만들거나 기억으로 채우지 마세요. 정말 필요한 경우에만 '제공된 데이터에 없음'이라고 한 번 쓰고, 표 칸을 채우려고 반복하지 말고 그 행·열은 생략하세요.
+    4. 비교 기준으로 쓸 수 있는 업종 수치는 제공된 '동일업종 PER 중앙값'뿐입니다. '산업 평균'·'시장 평균' 숫자를 임의로 만들지 마세요.
+    5. 금융업(은행·증권·보험)은 부채비율이 구조적으로 높으므로 일반 기업 기준으로 위험하다고 판단하지 마세요.
+    6. 뉴스는 날짜를 확인해 최근 것을 중심으로 평가하고 오래된 뉴스는 비중을 낮추세요. 뉴스 제목에 없는 사실을 덧붙이지 마세요.
+       제목에 이 종목({fundamentals['name']})이 나오지 않거나 다른 회사 이야기로 보이는 기사는 평가에서 제외하세요.
+    7. 매매 전략의 목표가·손절가는 아래 [참고 손절가·목표가]에 제공된 값만 쓰세요(제공되지 않았다면 가격을 제시하지 말고 기준만 서술). 비율(%)로 가격을 새로 만들지 마세요.
+    8. 리포트의 숫자는 자동 검증됩니다. 제공된 데이터에 없는 숫자(직접 계산한 비율·배수, 어림한 가격 구간 포함)는 ⚠️ 표시로 독자에게 경고됩니다.
+    """
+    data_text = f"""
     [종목 기본 정보]
     - 종목명: {fundamentals['name']}
-    - 영업이익률: {fundamentals['op_margin']}%
-    - ROE: {fundamentals['roe']}%
-    - 추정 PER: {fundamentals['cns_per']}배 (후행 PER: {fundamentals['per']}배)
-    - PBR: {fundamentals['pbr']}배
 
-    [기술적 지표 및 트렌드]
+    {quarter_block}
+
+    [연간 실적]
+    {_annual_line_for_prompt(fundamentals)}
+
+    [밸류에이션 — 현재 주가 기준, 출처: 네이버 금융]
+    - 후행 PER(현재가 ÷ 최근 4분기 EPS): {rfin.format_multiple(fundamentals.get('per'), '산출 불가(적자이거나 데이터 없음)')}{_vs_sector(fundamentals.get('per'))}
+    - 추정 PER(증권사 컨센서스): {rfin.format_multiple(fundamentals.get('cns_per'), '컨센서스 없음')}{_vs_sector(fundamentals.get('cns_per'))}
+    - PBR: {rfin.format_multiple(fundamentals.get('pbr'), '산출 불가')}
+    - 동일업종 PER 중앙값: {rfin.format_multiple(fundamentals.get('sector_per'), '제공되지 않음')}
+
+    [기술적 지표 및 트렌드 — {price_date} 기준]
     - 현재가: {int(tech['price']):,}원
     - 최근 1개월 수익률: {tech['one_month_return']:.2f}%
     - RSI (14): {tech['rsi']:.2f} (30 이하는 과매도, 70 이상은 과열)
     - MACD 상태: {'매수 우위 (MACD > Signal)' if tech['macd'] > tech['signal'] else '매도 우위 (MACD <= Signal)'}
-    - 20일 이동평균선 위치: {'20일선 위 (상승추세)' if tech['price'] > tech['sma20'] else '20일선 아래 (조정/하락세)'}
-    - 볼린저밴드 %B: {f"{tech['bb_pct_b']:.2f} (0=하단밴드, 1=상단밴드)" if tech.get('bb_pct_b') is not None and pd.notna(tech['bb_pct_b']) else "데이터 없음"}
+    - 20일 이동평균선 위치: {'20일선 위 (상승추세)' if tech['price'] > tech['sma20'] else '20일선 아래 (조정/하락세)'} (20일선 가격 {int(tech['sma20']):,}원)
+    - 볼린저밴드 %B: {f"{tech['bb_pct_b']:.2f} (0=하단밴드, 1=상단밴드, 하단 {int(tech['bb_lower']):,}원 / 상단 {int(tech['bb_upper']):,}원)" if tech.get('bb_pct_b') is not None and pd.notna(tech['bb_pct_b']) else "데이터 없음"}
     - 스토캐스틱 %K/%D: {f"{tech['stoch_k']:.1f} / {tech['stoch_d']:.1f} (20 이하 과매도, 80 이상 과열)" if tech.get('stoch_k') is not None and pd.notna(tech['stoch_k']) else "데이터 없음"}
     - 주간 추세(주봉 5주/20주 이평): {tech.get('weekly_trend') or "데이터 없음"}
 
+    [참고 손절가·목표가 — 변동성(ATR14) 기반 코드 계산값, 화면에도 같은 값이 표시됨]
+    {risk_text}
+
     [관련 최신 뉴스 및 시장 평가]
     {news_text}
-
+    """
+    structure_text = """
     보고서는 가독성 있게 작성되어야 하며, 다음 내용을 포함해 주세요:
-    1. **재무 건전성 및 밸류에이션 평가**: 영업이익률/ROE를 통한 수익성 평가, PER/PBR 기준 고평가/저평가 여부 분석.
+    1. **재무 건전성 및 밸류에이션 평가**: 최근 분기 실적 추이(매출·영업이익 성장, 영업이익률·ROE, 부채비율·당좌비율)를 중심으로 수익성과 재무 안정성을 평가하고, PER/PBR 기준 고평가/저평가 여부 분석.
     2. **차트 및 기술적 흐름 해석**: 이동평균선 추세, RSI 과매도/과열 강도, MACD 신호를 조합한 매수 타점 분석.
     3. **시장 모멘텀 및 뉴스 분석**: 최근 뉴스들의 호재/악재 성격 및 수급 영향 평가.
     4. **최종 AI 투자 전략 & 가이드**: 추천 매매 전략(분할 매수, 관망, 매도 등)과 목표/손절 대응 팁.
     """
-    ok, content = call_groq_chat([{"role": "user", "content": prompt}])
+    prompt = rules_text + data_text + structure_text
+    # temperature를 낮춰 제공되지 않은 숫자를 지어내는 경향을 줄인다.
+    ok, content = call_groq_chat([{"role": "user", "content": prompt}], temperature=0.3)
     if not ok:
         # 예외는 st.cache_data에 캐시되지 않으므로, 실패한 리포트가 15분간 그대로 노출되는 것을 막는다.
         raise RuntimeError(content)
-    return content
+
+    # 숫자 검증: 제공한 데이터에 없는 숫자에 ⚠️를 붙인다. 자동 재생성은 하지 않는다 —
+    # gpt-oss-120b 무료 한도(분당 8,000토큰)에서 리포트 1회가 한도의 60~70%라 곧바로 다시 부르면 429가 나기 때문.
+    # 검증기 오류가 리포트 자체를 막지 않도록 실패하면 검증 없이 원문을 돌려준다(unverified=None).
+    try:
+        check = rnc.check_report(content, data_text)
+        return {"text": check["annotated"], "unverified": check["unverified"], "checked": check["checked"]}
+    except Exception:
+        return {"text": content, "unverified": None, "checked": 0}
+
+def _escape_tilde(text):
+    """마크다운은 '~'가 두 번 나오면 그 사이를 취소선으로 그린다('2006~2014년 … 2015~2019년', AI가 쓴 '~50,000원 … ~81,000원').
+    화면에 마크다운으로 그릴 때만 '~'를 '\\~'로 바꾼다(원문·검증기 입력은 그대로 둔다)."""
+    return str(text).replace("~", "\\~")
+
+def render_report_number_check(result):
+    """AI 리포트 숫자 검증 결과 표시. result = get_individual_stock_ai_analysis의 반환 dict.
+    검증기는 '그 숫자가 제공 데이터에 있는지'만 본다 — 존재하는 숫자를 엉뚱한 항목·기간에 붙인 경우는 못 잡는다."""
+    unverified = result.get("unverified")
+    if unverified is None:
+        st.caption("숫자 검증을 수행하지 못했습니다. 리포트의 수치는 화면의 상세 지표와 대조해 확인하세요.")
+    elif unverified:
+        st.warning(
+            f"⚠️ 숫자 검증: 리포트의 수치 {result.get('checked', 0)}개 중 {len(unverified)}종이 제공된 데이터에서 확인되지 않았습니다. "
+            "본문에 ⚠️로 표시했습니다. AI가 직접 계산했거나 지어낸 값일 수 있으니 사실로 받아들이지 마세요."
+        )
+        with st.expander("확인되지 않은 숫자 목록"):
+            st.dataframe(
+                pd.DataFrame([{"숫자": u["token"], "문맥": u["context"]} for u in unverified]),
+                hide_index=True, use_container_width=True,
+            )
+    else:
+        st.caption(
+            f"✅ 숫자 검증: 리포트의 수치 {result.get('checked', 0)}개가 모두 제공된 데이터와 일치합니다. "
+            "(숫자가 존재하는지만 확인하며, 어느 항목·기간에 붙였는지는 검증하지 않습니다.)"
+        )
 
 def render_data_ts_caption(ts, cache_minutes=None):
     """캐시된 데이터의 실제 계산 시각 캡션. 캐시 히트 시에도 처음 계산된 시각이 그대로 표시되어,
@@ -1799,7 +1930,7 @@ elif menu == "주요 기업 헤드라인 뉴스":
                        st.markdown("### 🤖 AI 투자 비서의 3줄 시장 분석")
                        with st.spinner("AI가 실시간 호재/악재 감성 분석을 진행하고 있습니다..."):
                            ai_briefing = get_ai_summary(news_list)
-                           st.info(ai_briefing)
+                           st.info(_escape_tilde(ai_briefing))
                        st.markdown("---")
 
                 # 2. 그 아래에 기존 뉴스 리스트가 차례대로 출력됩니다.
@@ -2147,10 +2278,14 @@ elif menu == "퀀트 투자 리스트":
                 st.markdown("---")
                 render_portfolio_correlation(filtered, key_prefix="quant_list")
 
-def calculate_stock_score(fundamentals, tech, news_list):
+def calculate_stock_score(fundamentals, tech, news_list, recent=None):
     """개선된 점수 체계화 모델 (뉴스/수급 40 + 밸류에이션 10 + 트렌드 10 + 기술적지표 20 + 경영지표 20 = 100점)
     반환: (총점, 뉴스/수급 점수, 밸류에이션 점수, 트렌드 점수, 기술적지표 점수, 경영지표 점수)
-    — 화면에서 이 세부 점수를 다시 계산하지 않고 그대로 재사용할 것 (중복 계산 시 총점과 어긋날 위험)"""
+    — 화면에서 이 세부 점수를 다시 계산하지 않고 그대로 재사용할 것 (중복 계산 시 총점과 어긋날 위험)
+
+    recent: fetch_recent_financials 결과. 있으면 경영지표(영업이익률·ROE)를 최근 분기 기준으로 채점한다
+    (영업이익률=최근 4분기 합산, ROE=최근 분기 표의 값 — rfin.resolve_profitability). 없으면(조회 실패) 연간 수치.
+    밸류에이션의 PER·PBR은 원래부터 현재가 기준(네이버 실시간)이라 이 인자와 무관하게 최신이다."""
     
     # --------------------------------------------------
     # 1. 뉴스 및 수급 점수 체계화 (40점 만점)
@@ -2283,14 +2418,15 @@ def calculate_stock_score(fundamentals, tech, news_list):
         if stoch_k <= 20: tech_score += 2        # 스토캐스틱 과매도 구간
         elif stoch_k <= 80: tech_score += 1
 
-    # 경영지표 (20점)
+    # 경영지표 (20점) — 문턱값(10%/5%)은 그대로, 입력만 연간 → 최근 분기 기준으로
+    profit = rfin.resolve_profitability(fundamentals['op_margin'], fundamentals['roe'], recent)
     mgmt_score = 0
-    if fundamentals['op_margin'] >= 10: mgmt_score += 12
-    elif fundamentals['op_margin'] >= 5: mgmt_score += 8
+    if profit['op_margin'] >= 10: mgmt_score += 12
+    elif profit['op_margin'] >= 5: mgmt_score += 8
     else: mgmt_score += 4
 
-    if fundamentals['roe'] >= 10: mgmt_score += 8
-    elif fundamentals['roe'] >= 5: mgmt_score += 5
+    if profit['roe'] >= 10: mgmt_score += 8
+    elif profit['roe'] >= 5: mgmt_score += 5
     else: mgmt_score += 2
 
     total_score = news_suqub_total + val_score + trend_score + tech_score + mgmt_score
@@ -2450,8 +2586,9 @@ def render_risk_flags(code, risk_asof=None):
         with st.expander("위험 공시 경고의 근거와 한계"):
             for f in recent:
                 st.markdown(f"- **{f['label']}** — {f['caveat']}")
+            evidence_note = _escape_tilde(rdisc.EVIDENCE_NOTE)      # '2019-01~2026-09'의 ~가 아래 ~와 짝지어 취소선이 되지 않게
             st.markdown(
-                f"- 근거: {rdisc.EVIDENCE_NOTE}. 같은 날·같은 시장 다른 종목과 견주고, 두 기간(2019~2022 / 2023~2026)에서 방향이 같은지 확인한 유형만 담았습니다.\n"
+                f"- 근거: {evidence_note}. 같은 날·같은 시장 다른 종목과 견주고, 두 기간(2019\\~2022 / 2023\\~2026)에서 방향이 같은지 확인한 유형만 담았습니다.\n"
                 "- 효과 크기는 평균 −5% 안팎으로 작고, 공시 당일에 이미 평균 −1% 안팎이 반영돼 있습니다. 개별 종목의 하락을 예측하는 것이 아니라 '이 공시 뒤 평균적으로 시장보다 약했다'는 과거 통계입니다.\n"
                 "- 거래정지·상장폐지 종목은 가격이 멈춰 수익률 0으로 잡혀 하락이 과소평가됩니다. 등급과 신호에는 반영하지 않았습니다.")
     if older:
@@ -2509,8 +2646,9 @@ def _rep_cash_figure(rows, currency):
     fig.add_bar(x=years, y=scaled("ocf"), name="영업활동현금흐름", marker_color="#9ca3af")
     fig.add_bar(x=years, y=scaled("capex"), name="CAPEX(유형+무형 취득)", marker_color="#64748b")
     fig.add_scatter(x=years, y=scaled("fcf"), name="FCF", mode="lines+markers", line=dict(color="#d60000"))
-    fig.update_layout(barmode="group", height=300, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.15), yaxis=dict(title=unit), hovermode="x unified")
+    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.15), yaxis=dict(title=unit), hovermode="x unified")
     return fig
+
 
 def _rep_annual_dataframe(rep):
     cur, rows = rep["currency"], rep["annual"]["rows"]
@@ -2522,52 +2660,51 @@ def _rep_annual_dataframe(rep):
     data = {str(r["year"]): [fmt[kind](r[key]) for _, key, kind in spec] for r in rows}
     return pd.DataFrame(data, index=[label for label, _, _ in spec])
 
-def render_report_header(rep):
+def render_report_header(rep, key_prefix="diag"):
     h, cur = rep["header"], rep["currency"]
     ttm = h["ttm"]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("종가", f"{h['price']:,.0f}원" if h["price"] else "—", help=f"{h['price_date']:%Y-%m-%d} 종가(진단 화면과 같은 시세)" if h["price_date"] else None)
-    c2.metric("시가총액", crep.fmt_won(h["market_cap"]),
-              help=(f"종가 × 보통주 발행주식수 {h['shares_common']:,.0f}주({h['shares_date']} 기준, 자기주식 포함)" if h["shares_common"] else "주식수를 읽지 못했습니다."))
-    per_txt = "적자" if h["per_status"] == "loss" else crep.fmt_mult(h["per"])
-    c3.metric("PER (후행)", per_txt, help=f"시가총액 ÷ 후행 순이익. 이익 기준: {ttm['label']}. 최근 사업연도 기준 PER은 {crep.fmt_mult(h['per_fy'])}")
-    c4, c5, c6 = st.columns(3)
-    pbr_txt = "자본잠식" if h["pbr_status"] == "neg" else crep.fmt_mult(h["pbr"], 2)
-    c4.metric("PBR", pbr_txt, help=f"시가총액 ÷ 자본({h['equity_label']}, {crep.fmt_amount(h['equity'], cur)})")
-    c5.metric("PSR (후행)", crep.fmt_mult(h["psr"], 2), help="시가총액 ÷ 후행 매출")
-    c6.metric("영업이익률 (후행)", crep.fmt_pct(h["op_margin_ttm"]), help="후행 영업이익 ÷ 후행 매출")
+    # 지표 6개를 한 줄에 놓으면 칸이 좁아 큰 시가총액 값이 잘리므로, 이 영역의 지표 글자만 줄인다(컨테이너 key가 CSS 클래스로 붙는다).
+    st.markdown("<style>[class*='rep_header'] [data-testid='stMetricValue'] { font-size: 1.55rem; }</style>", unsafe_allow_html=True)
+    with st.container(key=f"{key_prefix}_rep_header"):
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("종가", f"{h['price']:,.0f}원" if h["price"] else "—", help=f"{h['price_date']:%Y-%m-%d} 종가(진단 화면과 같은 시세)" if h["price_date"] else None)
+        c2.metric("시가총액", crep.fmt_won(h["market_cap"]),
+                  help=(f"종가 × 보통주 발행주식수 {h['shares_common']:,.0f}주({h['shares_date']} 기준, 자기주식 포함)" if h["shares_common"] else "주식수를 읽지 못했습니다."))
+        per_txt = "적자" if h["per_status"] == "loss" else crep.fmt_mult(h["per"])
+        c3.metric("PER (후행)", per_txt, help=f"시가총액 ÷ 후행 순이익. 이익 기준: {ttm['label']}. 최근 사업연도 기준 PER은 {crep.fmt_mult(h['per_fy'])}")
+        pbr_txt = "자본잠식" if h["pbr_status"] == "neg" else crep.fmt_mult(h["pbr"], 2)
+        c4.metric("PBR", pbr_txt, help=f"시가총액 ÷ 자본({h['equity_label']}, {crep.fmt_amount(h['equity'], cur)})")
+        c5.metric("PSR (후행)", crep.fmt_mult(h["psr"], 2), help="시가총액 ÷ 후행 매출")
+        c6.metric("영업이익률 (후행)", crep.fmt_pct(h["op_margin_ttm"]), help="후행 영업이익 ÷ 후행 매출")
     st.caption(f"후행 지표 기준: {ttm['label']} · 후행 매출 {crep.fmt_amount(ttm['revenue'], cur)} · 영업이익 {crep.fmt_amount(ttm['op'], cur)} · 순이익 {crep.fmt_amount(ttm['ni'], cur)}")
     if h.get("pref_note"):
         st.caption("※ " + h["pref_note"])
 
 def render_report_holders(rep):
     ho, tr = rep["holders"], rep["treasury"]
-    left, right = st.columns(2)
-    with left:
-        st.markdown("##### 최대주주·특수관계인")
-        if not ho or not ho["major"]:
-            st.caption("DART에서 최대주주 현황을 받지 못했습니다.")
+    st.markdown("##### 최대주주·특수관계인")
+    if not ho or not ho["major"]:
+        st.caption("DART에서 최대주주 현황을 받지 못했습니다.")
+    else:
+        m = ho["major"]
+        st.markdown(f"**{m['name']}** {crep.fmt_pct(m['ratio'], 2)} · 특수관계인 합계 **{crep.fmt_pct(ho['group_ratio'], 2)}**")
+        st.caption(f"{ho['period']}(결산일 {ho['date']}) 기준 보통주")
+        df = pd.DataFrame([{"이름": p["name"], "관계": p["relate"], "지분율(%)": p["ratio"],
+                            "기초 대비(%p)": None if p["ratio"] is None or p["prev_ratio"] is None else round(p["ratio"] - p["prev_ratio"], 2)}
+                           for p in ho["people"][:10]])
+        st.dataframe(df, hide_index=True, width="stretch", height="content",
+                     column_config={"지분율(%)": st.column_config.NumberColumn(format="%.2f"), "기초 대비(%p)": st.column_config.NumberColumn(format="%+.2f")})
+    st.markdown("##### 자기주식")
+    if not tr or tr["end"] is None:
+        st.caption("DART에서 자기주식 현황을 받지 못했습니다.")
+    else:
+        a, b = st.columns(2)
+        a.metric("보유 자기주식", f"{tr['end']:,.0f}주", help="자기주식은 의결권이 없고 시가총액 계산에는 포함돼 있습니다.")
+        b.metric("발행주식 대비", crep.fmt_pct(tr["ratio"], 2))
+        if tr["acquired"] is not None:
+            st.caption(f"{tr['period']} 기준 기간 중 취득 {tr['acquired']:,.0f}주 · 처분 {tr['disposed']:,.0f}주 · 소각 {tr['cancelled']:,.0f}주 (기초 {tr['begin']:,.0f}주)")
         else:
-            m = ho["major"]
-            st.markdown(f"**{m['name']}** {crep.fmt_pct(m['ratio'], 2)} · 특수관계인 합계 **{crep.fmt_pct(ho['group_ratio'], 2)}**")
-            st.caption(f"{ho['period']}(결산일 {ho['date']}) 기준 보통주")
-            df = pd.DataFrame([{"이름": p["name"], "관계": p["relate"], "지분율(%)": p["ratio"],
-                                "기초 대비(%p)": None if p["ratio"] is None or p["prev_ratio"] is None else round(p["ratio"] - p["prev_ratio"], 2)}
-                               for p in ho["people"][:10]])
-            st.dataframe(df, hide_index=True, width="stretch",
-                         column_config={"지분율(%)": st.column_config.NumberColumn(format="%.2f"), "기초 대비(%p)": st.column_config.NumberColumn(format="%+.2f")})
-    with right:
-        st.markdown("##### 자기주식")
-        if not tr or tr["end"] is None:
-            st.caption("DART에서 자기주식 현황을 받지 못했습니다.")
-        else:
-            a, b = st.columns(2)
-            a.metric("보유 자기주식", f"{tr['end']:,.0f}주", help="자기주식은 의결권이 없고 시가총액 계산에는 포함돼 있습니다.")
-            b.metric("발행주식 대비", crep.fmt_pct(tr["ratio"], 2))
-            if tr["acquired"] is not None:
-                st.caption(f"{tr['period']} 기준 기간 중 취득 {tr['acquired']:,.0f}주 · 처분 {tr['disposed']:,.0f}주 · 소각 {tr['cancelled']:,.0f}주 (기초 {tr['begin']:,.0f}주)")
-            else:
-                st.caption(f"{tr.get('period') or '최신 보고서'} 기준 보유 수량만 확인했습니다(기간 중 취득·처분·소각 내역은 받지 못함).")
+            st.caption(f"{tr.get('period') or '최신 보고서'} 기준 보유 수량만 확인했습니다(기간 중 취득·처분·소각 내역은 받지 못함).")
 
 def render_report_filings(rep, code, key_prefix):
     st.markdown("##### 최근 공시 (90일)")
@@ -2665,8 +2802,9 @@ def render_report_peers(rep, code, name, key_prefix):
     from concurrent.futures import ThreadPoolExecutor
     st.markdown("##### 피어 비교 (같은 업종·비슷한 시가총액)")
     industry = fetch_industry_info(code)
-    override = st.text_input("비교 종목 직접 지정(쉼표로 구분, 최대 8개)", key=f"{key_prefix}_peer_override_{code}", placeholder="예: 한미반도체, 000660 — 비우면 자동 선정",
-                             help="자동 선정은 네이버 업종 분류라 사업 구조가 다른 종목이 섞일 수 있습니다. 직접 정하면 그 종목들과 비교합니다.")
+    input_col, _ = st.columns(2, gap="large")       # 입력칸이 전체 폭으로 늘어나지 않게 절반만 쓴다
+    override = input_col.text_input("비교 종목 직접 지정(쉼표로 구분, 최대 8개)", key=f"{key_prefix}_peer_override_{code}", placeholder="예: 한미반도체, 000660 — 비우면 자동 선정",
+                                    help="자동 선정은 네이버 업종 분류라 사업 구조가 다른 종목이 섞일 수 있습니다. 직접 정하면 그 종목들과 비교합니다.")
     codes, failed_names = [], []
     if override.strip():
         for token in [t.strip() for t in override.split(",") if t.strip()][:pcmp.MAX_PEERS]:
@@ -2735,47 +2873,48 @@ def render_report_simulator(rep, code, key_prefix, peer_summary=None):
         options[f"{rep['annual_year']} 사업연도 순이익 ({crep.fmt_won(last_ni)})"] = last_ni
     if not options:
         options[f"순이익 ({crep.fmt_won(v['ni_base'])})"] = v["ni_base"]
-    c1, c2 = st.columns(2)
-    base_label = c1.radio("이익 기준", list(options), key=f"{key_prefix}_rep_base_{code}") if len(options) > 1 else next(iter(options))
-    if len(options) == 1:
-        c1.markdown(f"**이익 기준** · {base_label}")
-    growth = c2.slider("순이익 증감 가정(%)", -50, 100, 0, 5, key=f"{key_prefix}_rep_growth_{code}",
-                       help="기준 순이익을 얼마나 늘리거나 줄여 볼지. 전망이 아니라 '이만큼 달라지면 주가가 어떻게 되나'를 보는 가정값입니다.")
-    ni = options[base_label] * (1 + growth / 100)
-
     rng = v["range"]
     per_now = v["per_now"]
     anchor = per_now or (rng["mid"] if rng else 10.0)
     per_cap = float(max(40, int(max(anchor, rng["high"] if rng else 0) * 1.5 // 5 + 1) * 5))
-    per = st.slider("적용 PER(배)", 1.0, per_cap, float(min(max(round(anchor * 2) / 2, 1.0), per_cap)), 0.5, key=f"{key_prefix}_rep_per_{code}")
-    sim = crep.scenario(ni, cap, price, per)
-    m1, m2, m3 = st.columns(3)
-    m1.metric("목표 시가총액", crep.fmt_won(sim["cap"]), help="이익 × PER")
-    m2.metric("목표 주가", f"{sim['price']:,.0f}원", f"{sim['upside'] * 100:+.1f}%", delta_color="inverse",
-              help="현재가 × (목표 시총 ÷ 현재 시총). 우선주가 있어도 현재가 대비 비율이 같게 나옵니다.")
-    m3.metric("가정 순이익", crep.fmt_won(ni), help=f"{base_label} × (1 {growth:+d}%)")
+    controls, reference = st.columns(2, gap="large")        # 왼쪽: 가정 조절과 결과 / 오른쪽: PER 기준점 표
+    with controls:
+        base_label = st.radio("이익 기준", list(options), key=f"{key_prefix}_rep_base_{code}") if len(options) > 1 else next(iter(options))
+        if len(options) == 1:
+            st.markdown(f"**이익 기준** · {base_label}")
+        growth = st.slider("순이익 증감 가정(%)", -50, 100, 0, 5, key=f"{key_prefix}_rep_growth_{code}",
+                           help="기준 순이익을 얼마나 늘리거나 줄여 볼지. 전망이 아니라 '이만큼 달라지면 주가가 어떻게 되나'를 보는 가정값입니다.")
+        ni = options[base_label] * (1 + growth / 100)
+        per = st.slider("적용 PER(배)", 1.0, per_cap, float(min(max(round(anchor * 2) / 2, 1.0), per_cap)), 0.5, key=f"{key_prefix}_rep_per_{code}")
+        sim = crep.scenario(ni, cap, price, per)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("목표 시가총액", crep.fmt_won(sim["cap"]), help="이익 × PER")
+        m2.metric("목표 주가", f"{sim['price']:,.0f}원", f"{sim['upside'] * 100:+.1f}%", delta_color="inverse",
+                  help="현재가 × (목표 시총 ÷ 현재 시총). 우선주가 있어도 현재가 대비 비율이 같게 나옵니다.")
+        m3.metric("가정 순이익", crep.fmt_won(ni), help=f"{base_label} × (1 {growth:+d}%)")
 
-    st.markdown("**PER 기준점** (같은 이익 가정으로 계산)")
-    rows = []
-    if per_now:
-        s = crep.scenario(ni, cap, price, per_now)
-        rows.append({"기준": "현재 후행 PER", "PER(배)": per_now, "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100, "근거": f"종가 ÷ 후행 순이익({h['ttm']['label']})"})
-    if rng:
-        yrs = f"{rng['years'][0]}~{rng['years'][-1]}"
-        for lab, key in (("Bear · 과거 최저", "low"), ("Base · 과거 중앙", "mid"), ("Bull · 과거 최고", "high")):
-            s = crep.scenario(ni, cap, price, rng[key])
-            rows.append({"기준": lab, "PER(배)": rng[key], "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100,
-                         "근거": f"이 종목의 {yrs} 사업연도 말 PER {rng['n']}개 중 {'최저' if key == 'low' else '중앙' if key == 'mid' else '최고'}(네이버)"})
-    if peer_summary and peer_summary.get("per_median"):         # 위 '피어 비교' 표의 중앙값과 같은 숫자(출처·계산이 같다)
-        s = crep.scenario(ni, cap, price, peer_summary["per_median"])
-        rows.append({"기준": "피어 PER 중앙값", "PER(배)": peer_summary["per_median"], "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100,
-                     "근거": f"위 '피어 비교' 표 {peer_summary['n']}개 종목의 후행 PER 중앙값(적자 제외)"})
-    if rows:
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
-                     column_config={"PER(배)": st.column_config.NumberColumn(format="%.1f"), "목표 주가": st.column_config.NumberColumn(format="%d"),
-                                    "현재가 대비(%)": st.column_config.NumberColumn(format="%+.1f")})
-    else:
-        st.caption("이 종목의 과거 PER(최소 2개 사업연도)과 피어 PER 중앙값을 모두 얻지 못해 기준점을 만들지 못했습니다. 위 슬라이더로 직접 가정해 보세요.")
+    with reference:
+        st.markdown("**PER 기준점** (같은 이익 가정으로 계산)")
+        rows = []
+        if per_now:
+            s = crep.scenario(ni, cap, price, per_now)
+            rows.append({"기준": "현재 후행 PER", "PER(배)": per_now, "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100, "근거": f"종가 ÷ 후행 순이익({h['ttm']['label']})"})
+        if rng:
+            yrs = f"{rng['years'][0]}~{rng['years'][-1]}"
+            for lab, key in (("Bear · 과거 최저", "low"), ("Base · 과거 중앙", "mid"), ("Bull · 과거 최고", "high")):
+                s = crep.scenario(ni, cap, price, rng[key])
+                rows.append({"기준": lab, "PER(배)": rng[key], "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100,
+                             "근거": f"이 종목의 {yrs} 사업연도 말 PER {rng['n']}개 중 {'최저' if key == 'low' else '중앙' if key == 'mid' else '최고'}(네이버)"})
+        if peer_summary and peer_summary.get("per_median"):         # 위 '피어 비교' 표의 중앙값과 같은 숫자(출처·계산이 같다)
+            s = crep.scenario(ni, cap, price, peer_summary["per_median"])
+            rows.append({"기준": "피어 PER 중앙값", "PER(배)": peer_summary["per_median"], "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100,
+                         "근거": f"위 '피어 비교' 표 {peer_summary['n']}개 종목의 후행 PER 중앙값(적자 제외)"})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height="content",
+                         column_config={"PER(배)": st.column_config.NumberColumn(format="%.1f"), "목표 주가": st.column_config.NumberColumn(format="%d"),
+                                        "현재가 대비(%)": st.column_config.NumberColumn(format="%+.1f"), "근거": st.column_config.TextColumn(width="large")})
+        else:
+            st.caption("이 종목의 과거 PER(최소 2개 사업연도)과 피어 PER 중앙값을 모두 얻지 못해 기준점을 만들지 못했습니다. 왼쪽 슬라이더로 직접 가정해 보세요.")
     st.caption("※ Bear·Base·Bull은 '낮은·중간·높은 배수'라는 뜻이지 주가 하락·상승 예측이 아닙니다. 후행 이익이 과거보다 크게 늘었다면 Bear 배수로도 현재가보다 높게 나옵니다. "
                "순이익 × PER을 곱한 단순 산식이라 예측도 기업가치 평가도 아닙니다. 과거 PER은 사업연도 말 주가 기준 3개 연도뿐이고, 이익이 급변한 종목(후행 이익이 사업연도의 2배 이상 등)은 "
                "배수 기준점이 현재 이익과 맞지 않을 수 있습니다. PER 기준점에 쓴 네이버 값은 DART 순이익과 출처가 달라 소수점 단위로 어긋날 수 있습니다.")
@@ -2792,10 +2931,10 @@ def render_narrative_result(res):
     """검증을 통과한 AI 서술 + 근거(F·Q) + 탈락 문장. 인용은 코드가 원문 발췌와 대조한 것만 나온다."""
     label = {q["id"]: q["label"] for q in res.get("excerpts", [])}
     url = crep.DART_VIEW + (res.get("rcept_no") or "")
-    for key in ("business", "changes", "risks", "questions"):
+    def draw(key):
         items = res.get(key) or []
         if not items and key != "risks":
-            continue
+            return
         st.markdown(f"**{rnar.SECTION_NAMES[key]}**")
         if not items:
             st.caption("검증을 통과한 리스크 문장이 없습니다(근거가 약하거나 숫자·인용 검증에서 모두 탈락). 아래 '검증에서 탈락한 문장'과 공시 원문을 직접 확인해 주세요.")
@@ -2807,6 +2946,14 @@ def render_narrative_result(res):
             else:
                 st.markdown(f"- {_md_safe(it['text'])}")
             st.caption("근거 " + " · ".join(it["refs"]))
+    # 왼쪽: 무슨 회사이고 무엇이 달라졌나 / 오른쪽: 무엇이 위험하고 무엇을 확인할까(인용문이 길어 폭이 넓은 쪽에 둔다)
+    facts_col, risk_col = st.columns(2, gap="large")
+    with facts_col:
+        draw("business")
+        draw("changes")
+    with risk_col:
+        draw("risks")
+        draw("questions")
     st.caption(f"생성 {res['generated_at']} · {res['model']} · 검증 통과 {res['kept']}/{res['asked']}문장"
                + (f" · 앞선 시도 실패: {', '.join(res['llm_errors'])}" if res.get("llm_errors") else ""))
     if res.get("dropped"):
@@ -2902,20 +3049,45 @@ def render_company_report(code, name, price, price_date, key_prefix):
     st.caption(f"{rep['name']} · {rep['fs']}재무제표 · {rep['annual_year']} 사업보고서{interim}까지 반영 · 모든 숫자는 DART 공시와 종가로 코드가 계산합니다(AI 추정·전망 없음).")
     if rep["currency"] != "KRW":
         st.warning(f"이 회사는 재무제표가 {rep['currency']} 단위입니다. 아래 금액은 원화가 아닙니다.")
-    render_report_header(rep)
+    render_report_header(rep, key_prefix)
 
-    st.markdown("##### 5개년 실적")
-    st.plotly_chart(_rep_annual_figure(rep["annual"]["rows"], rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_annual_{code}")
-    st.dataframe(_rep_annual_dataframe(rep), width="stretch")
-    if not rep["financial_like"] and any(r["fcf"] is not None for r in rep["annual"]["rows"]):
+    rows = rep["annual"]["rows"]
+    has_cash = not rep["financial_like"] and any(r["fcf"] is not None for r in rows)
+    peer = {}                                   # 피어 비교가 계산한 중앙값을 시뮬레이터가 이어받는 통로(위에서 아래로 차례로 그려진다)
+
+    def annual_chart():
+        st.markdown("##### 5개년 실적")
+        st.plotly_chart(_rep_annual_figure(rows, rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_annual_{code}")
+
+    def cash_chart():
         st.markdown("##### 현금흐름")
-        st.plotly_chart(_rep_cash_figure(rep["annual"]["rows"], rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_cash_{code}")
+        st.plotly_chart(_rep_cash_figure(rows, rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_cash_{code}")
         st.caption("FCF = 영업활동현금흐름 − (유형자산 취득 + 무형자산 취득). 리스·임대 자산 투자와 사업 인수는 반영하지 않습니다.")
-    render_report_mix(rep, code, key_prefix)
-    render_report_holders(rep)
-    render_report_filings(rep, code, key_prefix)
-    peer_summary = render_report_peers(rep, code, name, key_prefix)
-    render_report_simulator(rep, code, key_prefix, peer_summary)
+
+    def annual_table():
+        st.markdown("##### 5개년 재무표")
+        st.dataframe(_rep_annual_dataframe(rep), width="stretch", height="content")
+
+    def peers():
+        peer["summary"] = render_report_peers(rep, code, name, key_prefix)
+
+    # 위쪽은 왼쪽 묶음(실적·재무표·주주)과 오른쪽 묶음(현금흐름·매출 구성·공시)을 각각 위아래로 쌓는다 — 행을 맞추면 높이가 다른 블록 아래에 빈 칸이 생긴다.
+    # 표 열이 많거나 가로로 넓게 읽어야 하는 피어 비교·시뮬레이터·AI 서술은 아래에서 전체 폭을 쓴다. 현금흐름이 없는 금융업은 오른쪽이 매출 구성부터 시작한다.
+    left, right = st.columns(2, gap="large")
+    with left:
+        annual_chart()
+        annual_table()
+        if has_cash:
+            render_report_holders(rep)
+    with right:
+        if has_cash:
+            cash_chart()
+        render_report_mix(rep, code, key_prefix)
+        render_report_filings(rep, code, key_prefix)
+        if not has_cash:                    # 금융업: 오른쪽이 짧아지므로 주주 영역을 이쪽으로 옮겨 균형을 맞춘다
+            render_report_holders(rep)
+    peers()
+    render_report_simulator(rep, code, key_prefix, peer.get("summary"))
     render_report_narrative(rep, code, key_prefix)
 
     with st.expander("계산 기준과 데이터 한계"):
@@ -2978,7 +3150,7 @@ def render_diagnosis_signals(diag, name, mode, key_prefix):
 
     st.markdown("##### 참고 신호 (점수 미반영)")
     st.caption("10일선·20일선·정배열·패턴은 과거 검증에서 시장·기간마다 부호가 바뀌거나 오히려 음(-)이어서 점수에 넣지 않고 참고로만 보여줍니다."
-               + (" 6~2개월 모멘텀(지수 대비)은 2020년 이후에는 뚜렷했지만 2006~2019년 독립 구간에서는 방향만 같고 통계적으로 유의하지 않아 역시 참고로만 둡니다."
+               + (" 6\\~2개월 모멘텀(지수 대비)은 2020년 이후에는 뚜렷했지만 2006\\~2019년 독립 구간에서는 방향만 같고 통계적으로 유의하지 않아 역시 참고로만 둡니다."
                   if mode == "매수" else ""))
     for c in (c for c in res.checks if not c.scored):
         render_check_line(c)
@@ -3292,8 +3464,8 @@ if menu == "AI 종목 진단":
     st.subheader("🩺 AI 종목 진단")
     st.markdown("240일선·수급·거래량 3개 핵심 항목으로 등급을 매기고, 10일선·20일선·정배열·패턴·6~2개월 모멘텀은 참고 신호로 보여줍니다. 판정은 모두 규칙 기반이라 같은 데이터면 항상 같은 결과가 나옵니다.")
     st.caption("※ 투자 참고용 점검표입니다. 과거 검증(코스피 상위 300·코스닥 상위 100, 20일·60일 보유, 수급은 과거 데이터가 없어 제외)에서 "
-               "'사지 않기'(종가가 240일선 아래)는 2020년 이후 세 시장 모두 시장 대비 열위였고 2006~2014년에도 같은 방향이었지만, "
-               "2015~2019년에는 효과가 없었습니다(장세 의존). '매수 고려'가 '지켜보기'보다 낫다는 근거는 확인되지 않았습니다. "
+               "'사지 않기'(종가가 240일선 아래)는 2020년 이후 세 시장 모두 시장 대비 열위였고 2006\\~2014년에도 같은 방향이었지만, "
+               "2015\\~2019년에는 효과가 없었습니다(장세 의존). '매수 고려'가 '지켜보기'보다 낫다는 근거는 확인되지 않았습니다. "
                "매수 신호보다는 피해야 할 종목을 거르는 용도에 가깝습니다. 투자 판단과 책임은 본인에게 있습니다.")
     tab_single, tab_watch = st.tabs(["🔎 종목 진단", "⭐ 관심종목 일괄 진단"])
     with tab_single:
@@ -3576,7 +3748,9 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                             tech = analyze_stock_technical(code)
                             if tech:
                                 news = fetch_headlines_rss(fundamentals['name'])
-                                total_score, _, _, _, _, _ = calculate_stock_score(fundamentals, tech, news)
+                                recent_fin = fetch_recent_financials(code)   # 최근 분기 실적(실패 시 None → 연간 수치로 채점)
+                                total_score, _, _, _, _, _ = calculate_stock_score(fundamentals, tech, news, recent_fin)
+                                profit = rfin.resolve_profitability(fundamentals['op_margin'], fundamentals['roe'], recent_fin)
                                 macd_signal = '매수' if tech['macd'] > tech['signal'] else '매도'
                                 risk_levels = compute_risk_levels(tech['price'], tech.get('atr'))
                                 analysis_results.append({
@@ -3585,8 +3759,9 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                                     "현재주가": f"{int(tech['price']):,}원",
                                     "참고 손절가": f"{int(risk_levels['stop_loss']):,}원" if risk_levels else "-",
                                     "참고 목표가": f"{int(risk_levels['target_price']):,}원" if risk_levels else "-",
-                                    "영업이익률": f"{fundamentals['op_margin']}%",
-                                    "ROE": f"{fundamentals['roe']}%",
+                                    "영업이익률": f"{profit['op_margin']:.2f}%",
+                                    "ROE": f"{profit['roe']:.2f}%",
+                                    "재무 기준": f"{recent_fin['latest']['label']} 분기" if recent_fin else "연간(분기 조회 실패)",
                                     "PBR": f"{fundamentals['pbr']}배",
                                     "RSI": f"{tech['rsi']:.2f}",
                                     "MACD": macd_signal,
@@ -3603,6 +3778,7 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                     df_results = pd.DataFrame(analysis_results)
                     st.dataframe(df_results, use_container_width=True)
                     st.caption("※ 참고 손절가/목표가는 ATR(변동성) 기반 근사치입니다 (현재가 ± 2~3×ATR14). 실제 지지/저항선을 반영한 값이 아니므로 투자 판단의 참고 자료로만 활용하세요.")
+                    st.caption("※ 영업이익률은 최근 4분기 합산, ROE는 최근 분기 기준(네이버 금융 분기 재무)이며 '재무 기준' 열의 분기까지 반영됩니다. 분기 조회에 실패한 종목은 연간 수치로 채점합니다.")
 
     # ==========================================
     # Tab 2: ETF List
@@ -3705,11 +3881,13 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                         fundamentals['sector_per'] = fetch_sector_average_per(stock_code)
                         tech = analyze_stock_technical(stock_code)
                         news = fetch_headlines_rss(fundamentals['name'])
+                        recent_fin = fetch_recent_financials(stock_code)   # 최근 확정 분기 실적 (조회 실패 시 None)
 
                         if tech is None:
                             st.error("기술적 분석을 위한 충분한 차트 데이터가 없습니다.")
                         else:
-                            total_score, news_score, val_score, trend_score, tech_score, mgmt_score = calculate_stock_score(fundamentals, tech, news)
+                            total_score, news_score, val_score, trend_score, tech_score, mgmt_score = calculate_stock_score(fundamentals, tech, news, recent_fin)
+                            profit = rfin.resolve_profitability(fundamentals['op_margin'], fundamentals['roe'], recent_fin)
 
                             opinion = "매도"
                             color = "red"
@@ -3732,6 +3910,7 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                             col3.metric("경영/밸류 (30)", f"{mgmt_score + val_score}점")
                             col4.metric("기술/트렌드 (30)", f"{tech_score + trend_score}점")
                             st.caption("※ 뉴스/수급 점수는 AI가 각 뉴스 제목의 문맥을 읽고 판정한 감성(긍정/중립/부정)을 기반으로 계산됩니다. (AI 판정 실패 시 키워드 매칭 방식으로 자동 대체)")
+                            st.caption(f"※ 경영 점수 기준: 영업이익률 {profit['op_margin']:.2f}% ({profit['op_basis']}), ROE {profit['roe']:.2f}% ({profit['roe_basis']}). 밸류 점수의 PER·PBR은 현재 주가 기준입니다.")
 
                             risk_levels = compute_risk_levels(tech['price'], tech.get('atr'))
                             if risk_levels:
@@ -3742,20 +3921,44 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
 
                             if GENAI_AVAILABLE:
                                 st.markdown("#### 🤖 AI 심층 투자 분석 리포트")
+                                report_result = None
                                 with st.spinner("AI가 재무·기술·뉴스를 종합한 심층 리포트를 작성하고 있습니다..."):
                                     try:
-                                        ai_report = get_individual_stock_ai_analysis(fundamentals, tech, news)
+                                        report_result = get_individual_stock_ai_analysis(fundamentals, tech, news, recent_fin)
+                                        ai_report = report_result["text"]
                                     except RuntimeError as e:
                                         ai_report = f"⚠️ AI 분석 리포트 생성 중 오류가 발생했습니다: {e}"
-                                st.info(ai_report)
+                                st.info(_escape_tilde(ai_report))
+                                if report_result:
+                                    render_report_number_check(report_result)
+                                # 리포트가 어느 시점 데이터로 쓰였는지 화면에서 바로 확인할 수 있게 기준을 밝힌다.
+                                if recent_fin:
+                                    basis = f"재무 {recent_fin['latest']['label']} 분기(네이버 금융)"
+                                    if recent_fin.get('stale_note'):
+                                        st.warning(f"⚠️ {recent_fin['stale_note']}")
+                                else:
+                                    basis = "재무 최근 분기 실적 조회 실패 — 연간 수치만 반영"
+                                    st.warning("⚠️ 최근 분기 실적을 불러오지 못해 연간 수치만으로 작성된 리포트입니다. 잠시 후 다시 분석해 주세요.")
+                                st.caption(f"📅 리포트 기준: {basis} · 주가·기술지표 {tech.get('price_date', '확인 불가')} · 작성 {now_kst().strftime('%Y-%m-%d %H:%M')}")
 
                             st.markdown("#### 🔍 상세 지표 분석")
                             t1, t2, t3 = st.tabs(["재무 및 밸류에이션", "기술적 지표 및 트렌드", "관련 최신 뉴스"])
                             with t1:
-                                st.write(f"- **영업이익률**: {fundamentals['op_margin']}%")
-                                st.write(f"- **ROE**: {fundamentals['roe']}%")
-                                st.write(f"- **추정 PER**: {fundamentals['cns_per']}배 (후행 PER: {fundamentals['per']}배)")
+                                if recent_fin:
+                                    latest_q = recent_fin['latest']
+                                    st.write(f"- **최근 분기({latest_q['label']}) 영업이익률**: {latest_q['op_margin']}%")
+                                    st.write(f"- **최근 분기({latest_q['label']}) ROE(최근 4분기 합산)**: {latest_q['roe']}%")
+                                    st.write(f"- **최근 분기({latest_q['label']}) 부채비율**: {latest_q['debt_ratio']}%")
+                                annual_period = fundamentals.get('annual_period')
+                                annual_tag = f"최근 결산연도({rfin.period_label(annual_period)})" if annual_period else "최근 결산연도"
+                                st.write(f"- **{annual_tag} 영업이익률**: {fundamentals['op_margin']}%")
+                                st.write(f"- **{annual_tag} ROE**: {fundamentals['roe']}%")
+                                st.write(f"- **추정 PER**: {rfin.format_multiple(fundamentals['cns_per'], '컨센서스 없음')} (후행 PER: {rfin.format_multiple(fundamentals['per'], '산출 불가')})")
                                 st.write(f"- **PBR**: {fundamentals['pbr']}배")
+                                if recent_fin:
+                                    st.caption("최근 5개 분기 실적 (출처: 네이버 금융 분기 재무, 억원 단위)")
+                                    st.dataframe(pd.DataFrame(rfin.quarter_table_rows(recent_fin)), hide_index=True, use_container_width=True)
+                                    st.caption(f"※ 종합 점수의 경영 항목은 영업이익률 {profit['op_margin']:.2f}%({profit['op_basis']}), ROE {profit['roe']:.2f}%({profit['roe_basis']}) 기준으로 채점됩니다. 위 '최근 분기 영업이익률'은 분기 한 개 값이라 점수 기준(4분기 합산)과 다를 수 있습니다.")
                             with t2:
                                 st.write(f"- **현재 주가**: {int(tech['price']):,}원")
                                 st.write(f"- **최근 1개월 수익률**: {tech['one_month_return']:.2f}%")
