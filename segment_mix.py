@@ -39,7 +39,7 @@ def _informative(view):
     return sum(1 for m in view["members"] if not m.get("derived")) >= MIN_MEMBERS
 
 
-def views_from_xbrl(xb):
+def views_from_xbrl(xb, source=XBRL_SOURCE):
     out = {}
     for key, ax in (xb.get("axes") or {}).items():
         note = None
@@ -47,7 +47,7 @@ def views_from_xbrl(xb):
             note = "사업부문 매출은 부문 간 내부거래를 제거하기 전 금액이라 합계가 연결 매출과 다릅니다. 비중은 부문 합계 기준입니다."
         elif ax.get("coverage") is not None and ax["coverage"] < FULL_COVERAGE:
             note = f"회사가 이 구분으로 공시한 매출은 연결 매출의 {ax['coverage'] * 100:.0f}%입니다. 나머지는 '그 외'로 묶었습니다."
-        view = _view(key, ax["title"], XBRL_SOURCE, ax["members"], ax["total"], ax["covered"], note)
+        view = _view(key, ax["title"], source, ax["members"], ax["total"], ax["covered"], note)
         if _informative(view):
             out[key] = view
     return out
@@ -66,18 +66,22 @@ def compact_members(members, top=10):
     return head + [rest] + derived
 
 
-def view_from_table(res):
-    members = [{"label": i["label"], "cur": i["cur"], "prev": i["prev"], "share": i["share"]} for i in res["items"]]
-    note = None if res.get("prev_ok") else "전기 금액이 일부 비어 있어 증감률은 표시하지 않습니다."
-    return _view("product", "제품·서비스", TABLE_SOURCE, members, res["sum_won"], res["sum_won"], note)
+def view_from_table(res, source=TABLE_SOURCE, with_prev=True):
+    """with_prev=False(분기·반기 보고서): 표의 비교 열이 전년 동기가 아니라 전년 연간 값이라 전기 금액·증감률을 쓰지 않는다."""
+    members = [{"label": i["label"], "cur": i["cur"], "prev": i["prev"] if with_prev else None, "share": i["share"]} for i in res["items"]]
+    if not with_prev:
+        note = "올해 누적 기준입니다. 분기보고서 표의 비교 열은 전년 동기가 아닌 전년 연간 값이라 증감률은 표시하지 않습니다."
+    else:
+        note = None if res.get("prev_ok") else "전기 금액이 일부 비어 있어 증감률은 표시하지 않습니다."
+    return _view("product", "제품·서비스", source, members, res["sum_won"], res["sum_won"], note)
 
 
-def build_mix(xb, table_res=None):
+def build_mix(xb, table_res=None, source=XBRL_SOURCE, table_source=TABLE_SOURCE, with_prev=True):
     """XBRL 결과(+선택적 본문 표 결과) → {'views': [화면 순서대로], 'period_end', 'prev_end'}."""
-    views = views_from_xbrl(xb or {})
+    views = views_from_xbrl(xb or {}, source)
     prod = views.get("product")
     if table_res and (not prod or (prod["coverage"] or 0) < USABLE_COVERAGE):
-        table_view = view_from_table(table_res)
+        table_view = view_from_table(table_res, table_source, with_prev)
         if _informative(table_view):
             views["product"] = table_view
         elif not prod:
@@ -86,8 +90,11 @@ def build_mix(xb, table_res=None):
     return {"views": [views[k] for k in order], "period_end": (xb or {}).get("period_end"), "prev_end": (xb or {}).get("prev_end")}
 
 
-def fetch_mix(rcept_no, fs, revenue_won=None):
-    """접수번호 → 매출 구성. 계산 결과(작은 JSON)를 dart_cache에 보관한다. 본문 표는 XBRL로 제품 보기를 못 채운 경우에만 받는다."""
+def fetch_mix(rcept_no, fs, revenue_won=None, reprt_code="11011", report_label=None):
+    """접수번호 → 매출 구성. 계산 결과(작은 JSON)를 dart_cache에 보관한다. 본문 표는 XBRL로 제품 보기를 못 채운 경우에만 받는다.
+    reprt_code가 분기·반기(11013·11012·11014)면 올해 누적 구성이다. 분기보고서 XBRL에는 주석이 없는 회사가 많아(주요 재무제표만 태그) 본문 표가 사실상 주 경로다.
+    본문 표는 같은 합계 검증(±3%, revenue_won = 그 보고서의 누적 매출)을 통과해야 쓰고, 표의 비교 열이 전년 연간 값이라 전기·증감률은 버린다.
+    report_label은 출처 문구('2026 3분기')."""
     path = os.path.join(dart_core.CACHE_DIR, f"mix_{rcept_no}_{fs}.json")
     try:
         with open(path, encoding="utf-8") as f:
@@ -96,11 +103,14 @@ def fetch_mix(rcept_no, fs, revenue_won=None):
         pass
     xb, errors = {}, []
     try:
-        xb = xbrl_segments.fetch_segments(rcept_no, fs)
+        xb = xbrl_segments.fetch_segments(rcept_no, fs, reprt_code) if reprt_code != "11011" else xbrl_segments.fetch_segments(rcept_no, fs)
     except Exception as e:                                     # XBRL이 없거나 형식이 달라도 본문 표로 이어간다
         if "zip이 아닌" not in str(e):                         # XBRL 원본이 아예 없는 회사는 정상 상태 → 오류로 치지 않고 결과를 캐시한다
             errors.append(f"XBRL {type(e).__name__}: {str(e)[:80]}")
-    prod = views_from_xbrl(xb).get("product")
+    annual = reprt_code == "11011"
+    source = XBRL_SOURCE if annual else f"{report_label or '분기'}보고서 XBRL 주석"
+    table_source = TABLE_SOURCE if annual else f"{report_label or '분기'}보고서 본문 '매출실적' 표(자동 해석)"
+    prod = views_from_xbrl(xb, source).get("product")
     table_res = None
     if revenue_won and (not prod or (prod["coverage"] or 0) < USABLE_COVERAGE):
         try:
@@ -109,8 +119,9 @@ def fetch_mix(rcept_no, fs, revenue_won=None):
             table_res = res if res and res.get("items") else None
         except Exception as e:
             errors.append(f"본문 {type(e).__name__}: {str(e)[:80]}")
-    mix = build_mix(xb, table_res)
+    mix = build_mix(xb, table_res, source, table_source, with_prev=annual)
     mix["rcept_no"], mix["errors"] = rcept_no, errors
+    mix["reprt_code"] = reprt_code
     if not errors:                                             # 일시 오류는 캐시에 굳히지 않는다
         try:
             os.makedirs(dart_core.CACHE_DIR, exist_ok=True)

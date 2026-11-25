@@ -14,6 +14,8 @@ company_report.py — 종목 분석 보고서 1단계(사실만). DART 숫자로
 - PER = 시가총액 ÷ TTM 순이익, PBR = 시가총액 ÷ 최신 자본, PSR = 시가총액 ÷ TTM 매출.
 - ROE = 지배주주 순이익 ÷ 평균 지배주주 자본(전년 값이 없으면 기말), 부채비율 = 부채총계 ÷ 자본총계.
 - FCF = 영업활동현금흐름 − (유형자산 취득 + 무형자산 취득).
+- 최근 분기 열 = 가장 최근 분기·반기 보고서의 올해 누적 · 전년 동기 누적 · 후행 12개월(TTM). 5개년 표·차트 옆에 붙여 사업연도 이후 흐름을 보인다.
+  분기 보고서의 재무상태(자산·부채·자본)는 그 분기 말 값이고, 전년 동기 말 값은 같은 보고서에 없어 비운다. ROE는 연간 평균자본 기준이라 분기 누적·TTM 열은 비운다.
 """
 import datetime as dt
 import re
@@ -31,7 +33,7 @@ FILING_LIMIT = 60
 NOISE_TAG = "임원·주요주주 소유보고"
 
 
-ERROR_LABELS = {"mix": "매출 구성", "old": "과거 연도 재무", "all_a": "전체 재무제표", "all_interim": "분기 전체 재무제표",
+ERROR_LABELS = {"mix": "매출 구성", "mix_interim": "분기 매출 구성", "old": "과거 연도 재무", "all_a": "전체 재무제표", "all_interim": "분기 전체 재무제표",
                 "shares": "주식수", "holders": "최대주주", "treasury": "자기주식", "filings": "공시 목록"}
 
 
@@ -295,6 +297,49 @@ def ttm_value(annual, cur, prev):
     return None if None in (annual, cur, prev) else annual + cur - prev
 
 
+def interim_cumulatives(raw, fs, ni_basis):
+    """가장 최근 분기·반기 보고서의 올해 누적과 전년 동기 누적 (현재, 전년동기) 쌍. 후행 12개월과 '최근 분기' 열이 같은 값을 쓰도록 한 곳에서 읽는다.
+    순이익은 사업연도 표와 같은 기준(지배주주면 전체 재무제표의 지배주주 몫, 아니면 주요계정의 당기순이익)만 쓰고 섞지 않는다.
+    현금흐름 계정은 누적 금액이 thstrm_amount, 전년 동기 누적이 frmtrm_amount에 있다. 분기 말 재무상태는 값 하나(전년 동기 말은 이 보고서에 없다)."""
+    interim, all_i = raw["interim"], raw.get("all_interim")
+    main = interim["main"]
+    out = {"revenue": main_cum(main, fs, "revenue"), "op": main_cum(main, fs, "op")}
+    if ni_basis == "지배주주":
+        out["ni"] = owner_ni_cum(all_i) if all_i else (None, None)
+    else:
+        out["ni"] = main_cum(main, fs, "ni")
+    out["ocf"] = (cf_ocf(all_i), cf_ocf(all_i, "frmtrm_amount")) if all_i else (None, None)
+    out["capex"] = (cf_capex(all_i), cf_capex(all_i, "frmtrm_amount")) if all_i else (None, None)
+    out["bs"] = {k: main_get(main, fs, k) for k in ("assets", "liab", "equity")}
+    return out
+
+
+def recent_columns(interim, cum, last_annual, financial_like=False):
+    """5개년 표 옆에 붙일 최근 분기 3열: 올해 누적 · 전년 동기 누적 · 후행 12개월. 행 모양은 annual_table의 행과 같다.
+    last_annual = 가장 최근 사업연도 행(후행 = 그 해 + 올해 누적 − 전년 동기 누적). 값이 하나라도 없으면 그 칸만 None."""
+    y, lab = interim["year"], interim["label"]
+    q1 = interim["rc"] == "11013"                       # 1분기는 누적 = 그 분기
+    bs = cum["bs"]
+
+    def row(name, idx, with_bs):
+        g = lambda k: cum[k][idx]
+        rev, op, ni, ocf, capex = g("revenue"), g("op"), g("ni"), g("ocf"), g("capex")
+        assets, liab, eq = (bs["assets"], bs["liab"], bs["equity"]) if with_bs else (None, None, None)
+        return {"year": name, "revenue": rev, "op": op, "op_margin": _pct(op, rev), "ni": ni, "assets": assets, "liab": liab, "equity": eq,
+                "debt_ratio": _pct(liab, eq), "roe": None, "ocf": ocf, "capex": capex,
+                "fcf": None if financial_like or ocf is None or capex is None else ocf - capex}
+
+    cur = row(f"{y} {lab}" if q1 else f"{y} {lab} 누적", 0, True)
+    prev = row(f"{y - 1} {lab}" if q1 else f"{y - 1} {lab} 누적", 1, False)
+    t = lambda k: ttm_value(last_annual[k], cur[k], prev[k])
+    ocf, capex = t("ocf"), t("capex")
+    ttm = {"year": "후행 12개월", "revenue": t("revenue"), "op": t("op"), "ni": t("ni"), "assets": cur["assets"], "liab": cur["liab"], "equity": cur["equity"],
+           "ocf": ocf, "capex": capex, "fcf": None if financial_like or ocf is None or capex is None else ocf - capex, "roe": None}
+    ttm["op_margin"] = _pct(ttm["op"], ttm["revenue"])
+    ttm["debt_ratio"] = cur["debt_ratio"]
+    return {"cum": cur, "prev": prev, "ttm": ttm, "label": f"{y} {lab}"}
+
+
 def _div(a, b):
     return a / b if a is not None and b not in (None, 0) else None
 
@@ -498,8 +543,13 @@ def fetch_raw(code, today=None, light=False):
         })
     if interim:
         tasks["all_interim"] = lambda: dart_core.all_statements(cc, A + 1, interim["rc"], fs)
+        i_rcept = next((r.get("rcept_no") for r in interim["main"] if r.get("rcept_no")), None)
+        if not light and i_rcept:
+            # 분기 매출 구성: 그 보고서의 누적 매출로 본문 표 합계를 검증한다(분기 XBRL에는 주석이 없는 회사가 많다)
+            i_rev = main_cum(interim["main"], fs, "revenue")[0] if krw else None
+            tasks["mix_interim"] = lambda: segment_mix.fetch_mix(i_rcept, fs, i_rev, interim["rc"], f"{interim['year']} {interim['label']}")
     raw = {"code": code, "name": corp["corp_name"], "corp_code": cc, "today": today, "annual_year": A, "fs": fs,
-           "main_a": main_a, "interim": interim, "errors": {}, "old": None, "holders": None, "treasury": None, "filings": None, "mix": None, "all_interim": None}
+           "main_a": main_a, "interim": interim, "errors": {}, "old": None, "holders": None, "treasury": None, "filings": None, "mix": None, "mix_interim": None, "all_interim": None}
     with ThreadPoolExecutor(max_workers=6) as ex:
         futures = {k: ex.submit(f) for k, f in tasks.items()}
         for k, fut in futures.items():
@@ -550,25 +600,25 @@ def build_report(raw, price, price_date=None, naver_annual=None, risk_levels=Non
     ttm = {"revenue": last["revenue"], "op": last["op"], "ni": last["ni"], "label": f"{A} 사업연도", "is_ttm": False}
     equity_latest, equity_label = (
         (owner_equity(raw["all_a"]) if raw.get("all_a") and annual["ni_basis"] == "지배주주" else last["equity"]), f"{A} 사업연도 말")
+    cum, recent = None, None
     if interim:
         y, rc, lab = interim["year"], interim["rc"], interim["label"]
-        cur_rev, prev_rev = main_cum(interim["main"], fs, "revenue")
-        cur_op, prev_op = main_cum(interim["main"], fs, "op")
-        if annual["ni_basis"] == "지배주주":              # 사업연도 값이 지배주주 몫이면 누적도 같은 기준만 쓴다(전체 기준과 섞지 않음)
-            cur_ni, prev_ni = owner_ni_cum(raw["all_interim"]) if raw.get("all_interim") else (None, None)
-        else:
-            cur_ni, prev_ni = main_cum(interim["main"], fs, "ni")
-        ni_ttm = ttm_value(last["ni"], cur_ni, prev_ni)
+        cum = interim_cumulatives(raw, fs, annual["ni_basis"])        # 사업연도 값이 지배주주 몫이면 누적도 같은 기준만 쓴다(전체 기준과 섞지 않음)
+        ni_ttm = ttm_value(last["ni"], *cum["ni"])
         if ni_ttm is not None:
-            ttm = {"revenue": ttm_value(last["revenue"], cur_rev, prev_rev), "op": ttm_value(last["op"], cur_op, prev_op), "ni": ni_ttm,
+            ttm = {"revenue": ttm_value(last["revenue"], *cum["revenue"]), "op": ttm_value(last["op"], *cum["op"]), "ni": ni_ttm,
                    "label": f"{A} 사업연도 + {y} {lab} 누적 − {y - 1} 동기 누적", "is_ttm": True}
             eq_now = (owner_equity(raw["all_interim"]) if annual["ni_basis"] == "지배주주" and raw.get("all_interim") else None)
             if eq_now is None:
-                eq_now = main_get(interim["main"], fs, "equity")
+                eq_now = cum["bs"]["equity"]
             if eq_now is not None:
                 equity_latest, equity_label = eq_now, f"{y} {lab} 말"
         else:
             notes.append(f"{y} {lab} 보고서는 있으나 누적 순이익을 읽지 못해 후행 12개월 대신 {A} 사업연도 값을 씁니다.")
+        recent = recent_columns(interim, cum, last, financial_like)
+        if not financial_like and (cum["ocf"][0] is None or cum["capex"][0] is None):
+            notes.append(f"{y} {lab} 현금흐름(영업활동현금흐름·유형/무형자산 취득)을 읽지 못해 최근 분기 열의 FCF가 비어 있습니다"
+                         + ("(전체 재무제표를 받지 못함)." if not raw.get("all_interim") else "."))
     if equity_latest is None:
         equity_latest = last["equity"]
 
@@ -608,7 +658,7 @@ def build_report(raw, price, price_date=None, naver_annual=None, risk_levels=Non
     return {"code": raw["code"], "name": raw["name"], "fs": "연결" if fs == "CFS" else "별도", "annual_year": A, "financial_like": financial_like, "currency": currency,
             "rcept_no": next((r.get("rcept_no") for r in raw["main_a"] if r.get("rcept_no")), None),      # 사업보고서 접수번호(3단계 서술의 원문·캐시 키)
             "interim": {k: interim[k] for k in ("year", "rc", "label")} if interim else None,
-            "header": head, "annual": annual, "holders": holders, "treasury": treasury, "valuation": valuation, "mix": raw.get("mix"),
+            "header": head, "annual": annual, "recent": recent, "holders": holders, "treasury": treasury, "valuation": valuation, "mix": raw.get("mix"), "mix_interim": raw.get("mix_interim"),
             "filings": filings, "notes": notes}
 
 

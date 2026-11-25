@@ -2637,8 +2637,20 @@ def _rep_annual_figure(rows, currency):
     fig.add_bar(x=years, y=scaled("revenue"), name="매출액", marker_color="#9ca3af")
     fig.add_bar(x=years, y=scaled("op"), name="영업이익", marker_color="#d60000")
     fig.add_scatter(x=years, y=[r["op_margin"] for r in rows], name="영업이익률(%)", yaxis="y2", mode="lines+markers", line=dict(color="#1857e0"))
-    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.15),
+    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.15), xaxis=dict(type="category"),
                       yaxis=dict(title=unit), yaxis2=dict(title="%", overlaying="y", side="right", showgrid=False), hovermode="x unified")
+    return fig
+
+def _rep_quarter_figure(parsed):
+    """최근 분기 실적(네이버, 억원). 분기 라벨 '2026.09'가 숫자로 읽히지 않게 범주축으로 둔다."""
+    qs = parsed["quarters"]
+    x = [q["label"] for q in qs]
+    fig = go.Figure()
+    fig.add_bar(x=x, y=[q["revenue"] for q in qs], name="매출액", marker_color="#9ca3af")
+    fig.add_bar(x=x, y=[q["op_income"] for q in qs], name="영업이익", marker_color="#d60000")
+    fig.add_scatter(x=x, y=[q["op_margin"] for q in qs], name="영업이익률(%)", yaxis="y2", mode="lines+markers", line=dict(color="#1857e0"))
+    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.15), xaxis=dict(type="category"),
+                      yaxis=dict(title="억원"), yaxis2=dict(title="%", overlaying="y", side="right", showgrid=False), hovermode="x unified")
     return fig
 
 def _rep_cash_figure(rows, currency):
@@ -2649,7 +2661,8 @@ def _rep_cash_figure(rows, currency):
     fig.add_bar(x=years, y=scaled("ocf"), name="영업활동현금흐름", marker_color="#9ca3af")
     fig.add_bar(x=years, y=scaled("capex"), name="CAPEX(유형+무형 취득)", marker_color="#64748b")
     fig.add_scatter(x=years, y=scaled("fcf"), name="FCF", mode="lines+markers", line=dict(color="#d60000"))
-    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.15), yaxis=dict(title=unit), hovermode="x unified")
+    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.15), xaxis=dict(type="category"),
+                      yaxis=dict(title=unit), hovermode="x unified")
     return fig
 
 
@@ -2660,6 +2673,9 @@ def _rep_annual_dataframe(rep):
             ("자산총계", "assets", "amt"), ("부채총계", "liab", "amt"), ("자본총계", "equity", "amt"), ("부채비율", "debt_ratio", "pct0"), ("ROE", "roe", "pct"),
             ("영업활동현금흐름", "ocf", "amt"), ("CAPEX", "capex", "amt"), ("FCF", "fcf", "amt")]
     fmt = {"amt": lambda v: crep.fmt_amount(v, cur), "pct": crep.fmt_pct, "pct0": lambda v: crep.fmt_pct(v, 0)}
+    recent = rep.get("recent")
+    if recent:                                  # 사업연도 뒤에 전년 동기 누적 · 올해 누적 · 후행 12개월을 붙인다(최근 흐름이 5개년 표에서 끊기지 않게)
+        rows = rows + [recent["prev"], recent["cum"], recent["ttm"]]
     data = {str(r["year"]): [fmt[kind](r[key]) for _, key, kind in spec] for r in rows}
     return pd.DataFrame(data, index=[label for label, _, _ in spec])
 
@@ -2682,6 +2698,27 @@ def render_report_header(rep, key_prefix="diag"):
     st.caption(f"후행 지표 기준: {ttm['label']} · 후행 매출 {crep.fmt_amount(ttm['revenue'], cur)} · 영업이익 {crep.fmt_amount(ttm['op'], cur)} · 순이익 {crep.fmt_amount(ttm['ni'], cur)}")
     if h.get("pref_note"):
         st.caption("※ " + h["pref_note"])
+
+def render_report_quarters(rep, code, key_prefix):
+    """최근 5개 분기 실적(네이버 분기 재무) — DART 5개년 표는 사업연도 단위라 최근 몇 분기의 추세(예: 영업이익률이 분기마다 어떻게 변했는지)가 안 보인다.
+    네이버가 막히거나 외화 보고 회사면 이 영역만 비운다(보고서의 나머지는 그대로)."""
+    st.markdown("##### 최근 분기 실적")
+    if rep["currency"] != "KRW":
+        st.caption("원화가 아닌 단위로 보고하는 회사라 네이버 분기 재무(원화)와 맞지 않아 생략합니다.")
+        return
+    try:
+        parsed = _fetch_recent_financials_cached(code)
+    except Exception:
+        st.caption("최근 분기 실적(네이버 금융)을 불러오지 못했습니다. 아래 5개년 표의 '누적·후행 12개월' 열이 DART 기준 최근 흐름입니다.")
+        return
+    st.plotly_chart(_rep_quarter_figure(parsed), theme=None, key=f"{key_prefix}_rep_chart_quarter_{code}")
+    table = pd.DataFrame(rfin.quarter_table_rows(parsed)).set_index("분기").T
+    st.dataframe(table, width="stretch", height="content")
+    if parsed.get("stale_note"):
+        st.caption("⚠️ " + parsed["stale_note"])
+    for line in rfin.change_lines(parsed):
+        st.caption(line.lstrip("- "))
+    st.caption("출처: 네이버 금융 분기 재무(한 분기만의 값, 억원). ROE는 최근 4분기 순이익 합산 기준이며, DART 공시와 반올림·집계 기준이 조금 다를 수 있습니다.")
 
 def render_report_holders(rep):
     ho, tr = rep["holders"], rep["treasury"]
@@ -2733,26 +2770,37 @@ def _mix_figure(members):
 
 def render_report_mix(rep, code, key_prefix):
     st.markdown("##### 매출 구성")
-    mix = rep.get("mix")
-    if not mix or not mix.get("views"):
+    # 가장 최근 분기(누적)를 먼저 보여주고, 사업연도 구성으로 바꿔 볼 수 있다. 분기보고서는 주석이 없는 회사가 많아 못 읽으면 사업연도만 나온다.
+    options = []
+    mi, ma = rep.get("mix_interim"), rep.get("mix")
+    if rep.get("recent") and mi and mi.get("views"):
+        options.append((f"{rep['recent']['label']} 누적", mi, True))
+    if ma and ma.get("views"):
+        options.append((f"{rep['annual_year']} 사업연도", ma, False))
+    if not options:
         st.caption("사업보고서에서 사업부문·제품·지역별 매출 구성을 읽지 못했습니다(주석을 태그하지 않았거나 표 서식을 해석하지 못한 경우). 금융업처럼 매출 구분이 없는 업종도 해당합니다.")
         return
+    labels = [o[0] for o in options]
+    period = st.radio("기준", labels, horizontal=True, key=f"{key_prefix}_mix_period_{code}") if len(labels) > 1 else labels[0]
+    pidx = labels.index(period)
+    _, mix, is_interim = options[pidx]
     link = crep.DART_VIEW + mix.get("rcept_no", "")
     views, cur = mix["views"], rep["currency"]
     titles = [v["title"] for v in views]
-    pick = st.radio("보기", titles, horizontal=True, key=f"{key_prefix}_mix_view_{code}") if len(titles) > 1 else titles[0]
+    pick = st.radio("보기", titles, horizontal=True, key=f"{key_prefix}_mix_view_{code}_{pidx}") if len(titles) > 1 else titles[0]
     v = next(x for x in views if x["title"] == pick)
     end = mix.get("period_end")
-    st.caption(f"{pick} · {end[:4] + '년' if end else '최근 사업연도'} · 출처: {v['source']} · [DART 원문]({link})")
+    when = period if is_interim else (end[:4] + "년" if end else "최근 사업연도")
+    st.caption(f"{pick} · {when} · 출처: {v['source']} · [DART 원문]({link})")
     if v["note"]:
         st.caption("※ " + v["note"])
     members = smix.compact_members(v["members"])
-    st.plotly_chart(_mix_figure(members), theme=None, key=f"{key_prefix}_mix_chart_{code}")
+    st.plotly_chart(_mix_figure(members), theme=None, key=f"{key_prefix}_mix_chart_{code}_{pidx}")
     rows = []
     for m in members:
         row = {"구성": m["label"], "매출": crep.fmt_amount(m["cur"], cur), "비중(%)": m["share"]}
         if v["has_prev"]:
-            row["전기 매출"] = crep.fmt_amount(m.get("prev"), cur)
+            row["전년 동기 매출" if is_interim else "전기 매출"] = crep.fmt_amount(m.get("prev"), cur)
             row["증감률(%)"] = (m["cur"] / m["prev"] - 1) * 100 if m.get("prev") else None
         if v["has_op"]:
             row["영업이익"] = crep.fmt_amount(m.get("op_cur"), cur) if m.get("op_cur") is not None else "—"
@@ -3058,37 +3106,50 @@ def render_company_report(code, name, price, price_date, key_prefix):
     has_cash = not rep["financial_like"] and any(r["fcf"] is not None for r in rows)
     peer = {}                                   # 피어 비교가 계산한 중앙값을 시뮬레이터가 이어받는 통로(위에서 아래로 차례로 그려진다)
 
+    recent = rep.get("recent")
+    chart_rows = rows + ([recent["ttm"]] if recent else [])      # 마지막 막대 = 후행 12개월(사업연도 이후 분기까지 반영)
+
     def annual_chart():
-        st.markdown("##### 5개년 실적")
-        st.plotly_chart(_rep_annual_figure(rows, rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_annual_{code}")
+        st.markdown("##### 5개년 실적" + (" + 후행 12개월" if recent else ""))
+        st.plotly_chart(_rep_annual_figure(chart_rows, rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_annual_{code}")
 
     def cash_chart():
-        st.markdown("##### 현금흐름")
-        st.plotly_chart(_rep_cash_figure(rows, rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_cash_{code}")
+        st.markdown("##### 현금흐름" + (" (후행 12개월 포함)" if recent else ""))
+        st.plotly_chart(_rep_cash_figure(chart_rows, rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_cash_{code}")
         st.caption("FCF = 영업활동현금흐름 − (유형자산 취득 + 무형자산 취득). 리스·임대 자산 투자와 사업 인수는 반영하지 않습니다.")
 
     def annual_table():
-        st.markdown("##### 5개년 재무표")
+        st.markdown("##### 5개년 재무표" + (f" + {recent['label']} 누적·후행 12개월" if recent else ""))
         st.dataframe(_rep_annual_dataframe(rep), width="stretch", height="content")
+        if recent:
+            st.caption(f"※ '{recent['cum']['year']}'은 올해 1월부터 분기 말까지의 합계(분기보고서·감사 전 숫자), '후행 12개월' = {rep['header']['ttm']['label']}. "
+                       "자산·부채·자본은 분기 말 값이고 전년 동기 말 값은 보고서에 없어 비웠습니다. ROE는 연간 평균자본 기준이라 누적·후행 열은 비웠습니다(분기 ROE는 위 '최근 분기 실적' 표).")
 
     def peers():
         peer["summary"] = render_report_peers(rep, code, name, key_prefix)
 
-    # 위쪽은 왼쪽 묶음(실적·재무표·주주)과 오른쪽 묶음(현금흐름·매출 구성·공시)을 각각 위아래로 쌓는다 — 행을 맞추면 높이가 다른 블록 아래에 빈 칸이 생긴다.
-    # 표 열이 많거나 가로로 넓게 읽어야 하는 피어 비교·시뮬레이터·AI 서술은 아래에서 전체 폭을 쓴다. 현금흐름이 없는 금융업은 오른쪽이 매출 구성부터 시작한다.
+    # 배치(위→아래): ① 왼쪽 '최근 분기 실적' + 오른쪽 차트들 ② 5개년 재무표(전체 폭 — 사업연도 5열 + 최근 분기 3열이라 반폭에는 안 들어간다)
+    # ③ 주주 | 매출 구성 ④ 공시(열이 많아 전체 폭) ⑤ 피어 비교·시뮬레이터·AI 서술(전체 폭). 각 행 안에서는 높이가 비슷한 블록끼리 짝지어 빈 칸을 줄였다.
+    # 현금흐름이 없는 금융업은 오른쪽 차트가 하나뿐이라 주주 영역을 그 아래로 옮겨 균형을 맞춘다.
     left, right = st.columns(2, gap="large")
     with left:
-        annual_chart()
-        annual_table()
-        if has_cash:
-            render_report_holders(rep)
+        render_report_quarters(rep, code, key_prefix)
     with right:
+        annual_chart()
         if has_cash:
             cash_chart()
-        render_report_mix(rep, code, key_prefix)
-        render_report_filings(rep, code, key_prefix)
-        if not has_cash:                    # 금융업: 오른쪽이 짧아지므로 주주 영역을 이쪽으로 옮겨 균형을 맞춘다
+        else:
             render_report_holders(rep)
+    annual_table()
+    if has_cash:
+        left, right = st.columns(2, gap="large")
+        with left:
+            render_report_holders(rep)
+        with right:
+            render_report_mix(rep, code, key_prefix)
+    else:
+        render_report_mix(rep, code, key_prefix)
+    render_report_filings(rep, code, key_prefix)
     peers()
     render_report_simulator(rep, code, key_prefix, peer.get("summary"))
     render_report_narrative(rep, code, key_prefix)

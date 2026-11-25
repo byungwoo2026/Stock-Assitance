@@ -97,6 +97,31 @@ def report_facts(rep):
         parts = [f"{n} {amt(ttm[k])}" for n, k in (("매출", "revenue"), ("영업이익", "op"), ("순이익", "ni")) if ttm.get(k) is not None]
         if parts:
             lines.append(f"후행 12개월({ttm['label']}): " + " · ".join(parts))
+    rc = rep.get("recent")
+    if rc:     # 사업연도 이후 최근 분기: 올해 누적과 전년 동기 대비 한 줄(두 해 비교를 여러 줄 주면 모델이 증가율을 섞는다 — 위 전년 대비와 같은 이유)
+        c, pv = rc["cum"], rc["prev"]
+        parts = []
+        if c["revenue"] is not None:
+            parts.append(f"매출 {amt(c['revenue'])}")
+        if c["op"] is not None:
+            parts.append(f"영업이익 {amt(c['op'])}" + (f"(영업이익률 {crep.fmt_pct(c['op_margin'])})" if c["op_margin"] is not None else ""))
+        if c["ni"] is not None:
+            parts.append(f"순이익 {amt(c['ni'])}")
+        if c["ocf"] is not None:
+            parts.append(f"영업현금흐름 {amt(c['ocf'])}")
+        if c["fcf"] is not None:
+            parts.append(f"FCF {amt(c['fcf'])}")
+        if c["debt_ratio"] is not None:
+            parts.append(f"분기 말 부채비율 {crep.fmt_pct(c['debt_ratio'])}")
+        if parts:
+            lines.append(f"{c['year']}(올해 1월부터 분기 말까지 누적): " + " · ".join(parts))
+        ch = [f"{name} {x}" for name, k in (("매출", "revenue"), ("영업이익", "op"), ("순이익", "ni"), ("영업현금흐름", "ocf"), ("FCF", "fcf")) if (x := _chg(c[k], pv[k]))]
+        if ch:
+            lines.append(f"{c['year']} 전년 동기({pv['year']}) 대비: " + " · ".join(ch))
+    for view in (rep.get("mix_interim") or {}).get("views", []) if rc else []:
+        mem = sorted((m for m in view["members"] if not m.get("derived") and m.get("share") is not None), key=lambda m: -m["share"])[:5]
+        if len(mem) >= 2:
+            lines.append(f"{rc['label']} 누적 매출 구성({view['title']}, {view['source']}): " + ", ".join(f"{m['label']} {m['share']:.1f}%" for m in mem))
     for view in (rep.get("mix") or {}).get("views", []):
         mem = sorted((m for m in view["members"] if not m.get("derived") and m.get("share") is not None), key=lambda m: -m["share"])[:5]
         if len(mem) >= 2:       # 연도를 붙인다 — 안 붙이면 모델이 연도를 지어낸다(실측: 2025 보고서의 구성을 '2023년'으로 씀)

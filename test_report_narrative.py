@@ -158,6 +158,23 @@ class FactsTest(unittest.TestCase):
         self.assertIn("2025 사업연도 전년(2024) 대비: 매출 +12.0% · 영업이익 +24.3% · 순이익 +3.8%", text)
         self.assertNotIn("전년(2023)", text)                  # 지난해 증가율까지 주면 모델이 올해 것처럼 쓴다(실측) → 최근 해 하나만
 
+    def test_recent_quarter_facts_one_comparison_line(self):
+        cum = {"year": "2026 3분기 누적", "revenue": 9.0e12, "op": 9.0e11, "op_margin": 10.0, "ni": 7.0e11, "ocf": 1.0e12, "fcf": 2.0e11, "debt_ratio": 45.0}
+        prev = {"year": "2025 3분기 누적", "revenue": 8.0e12, "op": 6.0e11, "op_margin": 7.5, "ni": 5.0e11, "ocf": 8.0e11, "fcf": -1.0e11, "debt_ratio": None}
+        mix = {"views": [{"title": "제품·서비스", "source": "2026 3분기보고서 본문 '매출실적' 표(자동 해석)", "members": [
+            {"label": "메모리", "share": 70.0}, {"label": "기타", "share": 30.0}]}]}
+        text = "\n".join(f["text"] for f in rn.report_facts(make_rep(recent={"cum": cum, "prev": prev, "ttm": {}, "label": "2026 3분기"}, mix_interim=mix)))
+        self.assertIn("2026 3분기 누적(올해 1월부터 분기 말까지 누적): 매출 9.00조", text)
+        self.assertIn("영업이익 9,000억(영업이익률 10.0%)", text)
+        self.assertIn("2026 3분기 누적 전년 동기(2025 3분기 누적) 대비: 매출 +12.5% · 영업이익 +50.0% · 순이익 +40.0% · 영업현금흐름 +25.0% · FCF 흑자 전환", text)
+        self.assertIn("2026 3분기 누적 매출 구성(제품·서비스, 2026 3분기보고서 본문 '매출실적' 표(자동 해석)): 메모리 70.0%, 기타 30.0%", text)
+        self.assertEqual(text.count("전년 동기("), 1)                                      # 비교는 한 줄만(두 해를 주면 증감률을 섞어 쓴다)
+
+    def test_no_recent_quarter_facts_without_interim(self):
+        text = "\n".join(f["text"] for f in rn.report_facts(make_rep(recent=None, mix_interim={"views": [{"title": "x", "source": "s", "members": []}]})))
+        self.assertNotIn("전년 동기", text)
+        self.assertNotIn("누적 매출 구성", text)
+
     def test_yoy_words_when_base_not_positive(self):
         self.assertEqual(rn._chg(5, -3), "흑자 전환")
         self.assertEqual(rn._chg(-5, 3), "적자 전환")
