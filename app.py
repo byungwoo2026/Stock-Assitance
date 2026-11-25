@@ -1267,6 +1267,11 @@ def get_individual_stock_ai_analysis(fundamentals, tech, news_list, recent=None)
     except Exception:
         return {"text": content, "unverified": None, "checked": 0}
 
+def _escape_tilde(text):
+    """마크다운은 '~'가 두 번 나오면 그 사이를 취소선으로 그린다('2006~2014년 … 2015~2019년', AI가 쓴 '~50,000원 … ~81,000원').
+    화면에 마크다운으로 그릴 때만 '~'를 '\\~'로 바꾼다(원문·검증기 입력은 그대로 둔다)."""
+    return str(text).replace("~", "\\~")
+
 def render_report_number_check(result):
     """AI 리포트 숫자 검증 결과 표시. result = get_individual_stock_ai_analysis의 반환 dict.
     검증기는 '그 숫자가 제공 데이터에 있는지'만 본다 — 존재하는 숫자를 엉뚱한 항목·기간에 붙인 경우는 못 잡는다."""
@@ -1925,7 +1930,7 @@ elif menu == "주요 기업 헤드라인 뉴스":
                        st.markdown("### 🤖 AI 투자 비서의 3줄 시장 분석")
                        with st.spinner("AI가 실시간 호재/악재 감성 분석을 진행하고 있습니다..."):
                            ai_briefing = get_ai_summary(news_list)
-                           st.info(ai_briefing)
+                           st.info(_escape_tilde(ai_briefing))
                        st.markdown("---")
 
                 # 2. 그 아래에 기존 뉴스 리스트가 차례대로 출력됩니다.
@@ -2581,8 +2586,9 @@ def render_risk_flags(code, risk_asof=None):
         with st.expander("위험 공시 경고의 근거와 한계"):
             for f in recent:
                 st.markdown(f"- **{f['label']}** — {f['caveat']}")
+            evidence_note = _escape_tilde(rdisc.EVIDENCE_NOTE)      # '2019-01~2026-09'의 ~가 아래 ~와 짝지어 취소선이 되지 않게
             st.markdown(
-                f"- 근거: {rdisc.EVIDENCE_NOTE}. 같은 날·같은 시장 다른 종목과 견주고, 두 기간(2019~2022 / 2023~2026)에서 방향이 같은지 확인한 유형만 담았습니다.\n"
+                f"- 근거: {evidence_note}. 같은 날·같은 시장 다른 종목과 견주고, 두 기간(2019\\~2022 / 2023\\~2026)에서 방향이 같은지 확인한 유형만 담았습니다.\n"
                 "- 효과 크기는 평균 −5% 안팎으로 작고, 공시 당일에 이미 평균 −1% 안팎이 반영돼 있습니다. 개별 종목의 하락을 예측하는 것이 아니라 '이 공시 뒤 평균적으로 시장보다 약했다'는 과거 통계입니다.\n"
                 "- 거래정지·상장폐지 종목은 가격이 멈춰 수익률 0으로 잡혀 하락이 과소평가됩니다. 등급과 신호에는 반영하지 않았습니다.")
     if older:
@@ -3144,7 +3150,7 @@ def render_diagnosis_signals(diag, name, mode, key_prefix):
 
     st.markdown("##### 참고 신호 (점수 미반영)")
     st.caption("10일선·20일선·정배열·패턴은 과거 검증에서 시장·기간마다 부호가 바뀌거나 오히려 음(-)이어서 점수에 넣지 않고 참고로만 보여줍니다."
-               + (" 6~2개월 모멘텀(지수 대비)은 2020년 이후에는 뚜렷했지만 2006~2019년 독립 구간에서는 방향만 같고 통계적으로 유의하지 않아 역시 참고로만 둡니다."
+               + (" 6\\~2개월 모멘텀(지수 대비)은 2020년 이후에는 뚜렷했지만 2006\\~2019년 독립 구간에서는 방향만 같고 통계적으로 유의하지 않아 역시 참고로만 둡니다."
                   if mode == "매수" else ""))
     for c in (c for c in res.checks if not c.scored):
         render_check_line(c)
@@ -3458,8 +3464,8 @@ if menu == "AI 종목 진단":
     st.subheader("🩺 AI 종목 진단")
     st.markdown("240일선·수급·거래량 3개 핵심 항목으로 등급을 매기고, 10일선·20일선·정배열·패턴·6~2개월 모멘텀은 참고 신호로 보여줍니다. 판정은 모두 규칙 기반이라 같은 데이터면 항상 같은 결과가 나옵니다.")
     st.caption("※ 투자 참고용 점검표입니다. 과거 검증(코스피 상위 300·코스닥 상위 100, 20일·60일 보유, 수급은 과거 데이터가 없어 제외)에서 "
-               "'사지 않기'(종가가 240일선 아래)는 2020년 이후 세 시장 모두 시장 대비 열위였고 2006~2014년에도 같은 방향이었지만, "
-               "2015~2019년에는 효과가 없었습니다(장세 의존). '매수 고려'가 '지켜보기'보다 낫다는 근거는 확인되지 않았습니다. "
+               "'사지 않기'(종가가 240일선 아래)는 2020년 이후 세 시장 모두 시장 대비 열위였고 2006\\~2014년에도 같은 방향이었지만, "
+               "2015\\~2019년에는 효과가 없었습니다(장세 의존). '매수 고려'가 '지켜보기'보다 낫다는 근거는 확인되지 않았습니다. "
                "매수 신호보다는 피해야 할 종목을 거르는 용도에 가깝습니다. 투자 판단과 책임은 본인에게 있습니다.")
     tab_single, tab_watch = st.tabs(["🔎 종목 진단", "⭐ 관심종목 일괄 진단"])
     with tab_single:
@@ -3922,7 +3928,7 @@ if menu == "개별종목분석":  # 💡 화면의 사이드바 메뉴명과 완
                                         ai_report = report_result["text"]
                                     except RuntimeError as e:
                                         ai_report = f"⚠️ AI 분석 리포트 생성 중 오류가 발생했습니다: {e}"
-                                st.info(ai_report)
+                                st.info(_escape_tilde(ai_report))
                                 if report_result:
                                     render_report_number_check(report_result)
                                 # 리포트가 어느 시점 데이터로 쓰였는지 화면에서 바로 확인할 수 있게 기준을 밝힌다.
