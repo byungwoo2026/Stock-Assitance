@@ -2640,8 +2640,9 @@ def _rep_cash_figure(rows, currency):
     fig.add_bar(x=years, y=scaled("ocf"), name="영업활동현금흐름", marker_color="#9ca3af")
     fig.add_bar(x=years, y=scaled("capex"), name="CAPEX(유형+무형 취득)", marker_color="#64748b")
     fig.add_scatter(x=years, y=scaled("fcf"), name="FCF", mode="lines+markers", line=dict(color="#d60000"))
-    fig.update_layout(barmode="group", height=300, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.15), yaxis=dict(title=unit), hovermode="x unified")
+    fig.update_layout(barmode="group", height=320, margin=dict(l=10, r=10, t=30, b=10), legend=dict(orientation="h", y=1.15), yaxis=dict(title=unit), hovermode="x unified")
     return fig
+
 
 def _rep_annual_dataframe(rep):
     cur, rows = rep["currency"], rep["annual"]["rows"]
@@ -2653,52 +2654,51 @@ def _rep_annual_dataframe(rep):
     data = {str(r["year"]): [fmt[kind](r[key]) for _, key, kind in spec] for r in rows}
     return pd.DataFrame(data, index=[label for label, _, _ in spec])
 
-def render_report_header(rep):
+def render_report_header(rep, key_prefix="diag"):
     h, cur = rep["header"], rep["currency"]
     ttm = h["ttm"]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("종가", f"{h['price']:,.0f}원" if h["price"] else "—", help=f"{h['price_date']:%Y-%m-%d} 종가(진단 화면과 같은 시세)" if h["price_date"] else None)
-    c2.metric("시가총액", crep.fmt_won(h["market_cap"]),
-              help=(f"종가 × 보통주 발행주식수 {h['shares_common']:,.0f}주({h['shares_date']} 기준, 자기주식 포함)" if h["shares_common"] else "주식수를 읽지 못했습니다."))
-    per_txt = "적자" if h["per_status"] == "loss" else crep.fmt_mult(h["per"])
-    c3.metric("PER (후행)", per_txt, help=f"시가총액 ÷ 후행 순이익. 이익 기준: {ttm['label']}. 최근 사업연도 기준 PER은 {crep.fmt_mult(h['per_fy'])}")
-    c4, c5, c6 = st.columns(3)
-    pbr_txt = "자본잠식" if h["pbr_status"] == "neg" else crep.fmt_mult(h["pbr"], 2)
-    c4.metric("PBR", pbr_txt, help=f"시가총액 ÷ 자본({h['equity_label']}, {crep.fmt_amount(h['equity'], cur)})")
-    c5.metric("PSR (후행)", crep.fmt_mult(h["psr"], 2), help="시가총액 ÷ 후행 매출")
-    c6.metric("영업이익률 (후행)", crep.fmt_pct(h["op_margin_ttm"]), help="후행 영업이익 ÷ 후행 매출")
+    # 지표 6개를 한 줄에 놓으면 칸이 좁아 큰 시가총액 값이 잘리므로, 이 영역의 지표 글자만 줄인다(컨테이너 key가 CSS 클래스로 붙는다).
+    st.markdown("<style>[class*='rep_header'] [data-testid='stMetricValue'] { font-size: 1.55rem; }</style>", unsafe_allow_html=True)
+    with st.container(key=f"{key_prefix}_rep_header"):
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
+        c1.metric("종가", f"{h['price']:,.0f}원" if h["price"] else "—", help=f"{h['price_date']:%Y-%m-%d} 종가(진단 화면과 같은 시세)" if h["price_date"] else None)
+        c2.metric("시가총액", crep.fmt_won(h["market_cap"]),
+                  help=(f"종가 × 보통주 발행주식수 {h['shares_common']:,.0f}주({h['shares_date']} 기준, 자기주식 포함)" if h["shares_common"] else "주식수를 읽지 못했습니다."))
+        per_txt = "적자" if h["per_status"] == "loss" else crep.fmt_mult(h["per"])
+        c3.metric("PER (후행)", per_txt, help=f"시가총액 ÷ 후행 순이익. 이익 기준: {ttm['label']}. 최근 사업연도 기준 PER은 {crep.fmt_mult(h['per_fy'])}")
+        pbr_txt = "자본잠식" if h["pbr_status"] == "neg" else crep.fmt_mult(h["pbr"], 2)
+        c4.metric("PBR", pbr_txt, help=f"시가총액 ÷ 자본({h['equity_label']}, {crep.fmt_amount(h['equity'], cur)})")
+        c5.metric("PSR (후행)", crep.fmt_mult(h["psr"], 2), help="시가총액 ÷ 후행 매출")
+        c6.metric("영업이익률 (후행)", crep.fmt_pct(h["op_margin_ttm"]), help="후행 영업이익 ÷ 후행 매출")
     st.caption(f"후행 지표 기준: {ttm['label']} · 후행 매출 {crep.fmt_amount(ttm['revenue'], cur)} · 영업이익 {crep.fmt_amount(ttm['op'], cur)} · 순이익 {crep.fmt_amount(ttm['ni'], cur)}")
     if h.get("pref_note"):
         st.caption("※ " + h["pref_note"])
 
 def render_report_holders(rep):
     ho, tr = rep["holders"], rep["treasury"]
-    left, right = st.columns(2)
-    with left:
-        st.markdown("##### 최대주주·특수관계인")
-        if not ho or not ho["major"]:
-            st.caption("DART에서 최대주주 현황을 받지 못했습니다.")
+    st.markdown("##### 최대주주·특수관계인")
+    if not ho or not ho["major"]:
+        st.caption("DART에서 최대주주 현황을 받지 못했습니다.")
+    else:
+        m = ho["major"]
+        st.markdown(f"**{m['name']}** {crep.fmt_pct(m['ratio'], 2)} · 특수관계인 합계 **{crep.fmt_pct(ho['group_ratio'], 2)}**")
+        st.caption(f"{ho['period']}(결산일 {ho['date']}) 기준 보통주")
+        df = pd.DataFrame([{"이름": p["name"], "관계": p["relate"], "지분율(%)": p["ratio"],
+                            "기초 대비(%p)": None if p["ratio"] is None or p["prev_ratio"] is None else round(p["ratio"] - p["prev_ratio"], 2)}
+                           for p in ho["people"][:10]])
+        st.dataframe(df, hide_index=True, width="stretch", height="content",
+                     column_config={"지분율(%)": st.column_config.NumberColumn(format="%.2f"), "기초 대비(%p)": st.column_config.NumberColumn(format="%+.2f")})
+    st.markdown("##### 자기주식")
+    if not tr or tr["end"] is None:
+        st.caption("DART에서 자기주식 현황을 받지 못했습니다.")
+    else:
+        a, b = st.columns(2)
+        a.metric("보유 자기주식", f"{tr['end']:,.0f}주", help="자기주식은 의결권이 없고 시가총액 계산에는 포함돼 있습니다.")
+        b.metric("발행주식 대비", crep.fmt_pct(tr["ratio"], 2))
+        if tr["acquired"] is not None:
+            st.caption(f"{tr['period']} 기준 기간 중 취득 {tr['acquired']:,.0f}주 · 처분 {tr['disposed']:,.0f}주 · 소각 {tr['cancelled']:,.0f}주 (기초 {tr['begin']:,.0f}주)")
         else:
-            m = ho["major"]
-            st.markdown(f"**{m['name']}** {crep.fmt_pct(m['ratio'], 2)} · 특수관계인 합계 **{crep.fmt_pct(ho['group_ratio'], 2)}**")
-            st.caption(f"{ho['period']}(결산일 {ho['date']}) 기준 보통주")
-            df = pd.DataFrame([{"이름": p["name"], "관계": p["relate"], "지분율(%)": p["ratio"],
-                                "기초 대비(%p)": None if p["ratio"] is None or p["prev_ratio"] is None else round(p["ratio"] - p["prev_ratio"], 2)}
-                               for p in ho["people"][:10]])
-            st.dataframe(df, hide_index=True, width="stretch",
-                         column_config={"지분율(%)": st.column_config.NumberColumn(format="%.2f"), "기초 대비(%p)": st.column_config.NumberColumn(format="%+.2f")})
-    with right:
-        st.markdown("##### 자기주식")
-        if not tr or tr["end"] is None:
-            st.caption("DART에서 자기주식 현황을 받지 못했습니다.")
-        else:
-            a, b = st.columns(2)
-            a.metric("보유 자기주식", f"{tr['end']:,.0f}주", help="자기주식은 의결권이 없고 시가총액 계산에는 포함돼 있습니다.")
-            b.metric("발행주식 대비", crep.fmt_pct(tr["ratio"], 2))
-            if tr["acquired"] is not None:
-                st.caption(f"{tr['period']} 기준 기간 중 취득 {tr['acquired']:,.0f}주 · 처분 {tr['disposed']:,.0f}주 · 소각 {tr['cancelled']:,.0f}주 (기초 {tr['begin']:,.0f}주)")
-            else:
-                st.caption(f"{tr.get('period') or '최신 보고서'} 기준 보유 수량만 확인했습니다(기간 중 취득·처분·소각 내역은 받지 못함).")
+            st.caption(f"{tr.get('period') or '최신 보고서'} 기준 보유 수량만 확인했습니다(기간 중 취득·처분·소각 내역은 받지 못함).")
 
 def render_report_filings(rep, code, key_prefix):
     st.markdown("##### 최근 공시 (90일)")
@@ -2796,8 +2796,9 @@ def render_report_peers(rep, code, name, key_prefix):
     from concurrent.futures import ThreadPoolExecutor
     st.markdown("##### 피어 비교 (같은 업종·비슷한 시가총액)")
     industry = fetch_industry_info(code)
-    override = st.text_input("비교 종목 직접 지정(쉼표로 구분, 최대 8개)", key=f"{key_prefix}_peer_override_{code}", placeholder="예: 한미반도체, 000660 — 비우면 자동 선정",
-                             help="자동 선정은 네이버 업종 분류라 사업 구조가 다른 종목이 섞일 수 있습니다. 직접 정하면 그 종목들과 비교합니다.")
+    input_col, _ = st.columns(2, gap="large")       # 입력칸이 전체 폭으로 늘어나지 않게 절반만 쓴다
+    override = input_col.text_input("비교 종목 직접 지정(쉼표로 구분, 최대 8개)", key=f"{key_prefix}_peer_override_{code}", placeholder="예: 한미반도체, 000660 — 비우면 자동 선정",
+                                    help="자동 선정은 네이버 업종 분류라 사업 구조가 다른 종목이 섞일 수 있습니다. 직접 정하면 그 종목들과 비교합니다.")
     codes, failed_names = [], []
     if override.strip():
         for token in [t.strip() for t in override.split(",") if t.strip()][:pcmp.MAX_PEERS]:
@@ -2866,47 +2867,48 @@ def render_report_simulator(rep, code, key_prefix, peer_summary=None):
         options[f"{rep['annual_year']} 사업연도 순이익 ({crep.fmt_won(last_ni)})"] = last_ni
     if not options:
         options[f"순이익 ({crep.fmt_won(v['ni_base'])})"] = v["ni_base"]
-    c1, c2 = st.columns(2)
-    base_label = c1.radio("이익 기준", list(options), key=f"{key_prefix}_rep_base_{code}") if len(options) > 1 else next(iter(options))
-    if len(options) == 1:
-        c1.markdown(f"**이익 기준** · {base_label}")
-    growth = c2.slider("순이익 증감 가정(%)", -50, 100, 0, 5, key=f"{key_prefix}_rep_growth_{code}",
-                       help="기준 순이익을 얼마나 늘리거나 줄여 볼지. 전망이 아니라 '이만큼 달라지면 주가가 어떻게 되나'를 보는 가정값입니다.")
-    ni = options[base_label] * (1 + growth / 100)
-
     rng = v["range"]
     per_now = v["per_now"]
     anchor = per_now or (rng["mid"] if rng else 10.0)
     per_cap = float(max(40, int(max(anchor, rng["high"] if rng else 0) * 1.5 // 5 + 1) * 5))
-    per = st.slider("적용 PER(배)", 1.0, per_cap, float(min(max(round(anchor * 2) / 2, 1.0), per_cap)), 0.5, key=f"{key_prefix}_rep_per_{code}")
-    sim = crep.scenario(ni, cap, price, per)
-    m1, m2, m3 = st.columns(3)
-    m1.metric("목표 시가총액", crep.fmt_won(sim["cap"]), help="이익 × PER")
-    m2.metric("목표 주가", f"{sim['price']:,.0f}원", f"{sim['upside'] * 100:+.1f}%", delta_color="inverse",
-              help="현재가 × (목표 시총 ÷ 현재 시총). 우선주가 있어도 현재가 대비 비율이 같게 나옵니다.")
-    m3.metric("가정 순이익", crep.fmt_won(ni), help=f"{base_label} × (1 {growth:+d}%)")
+    controls, reference = st.columns(2, gap="large")        # 왼쪽: 가정 조절과 결과 / 오른쪽: PER 기준점 표
+    with controls:
+        base_label = st.radio("이익 기준", list(options), key=f"{key_prefix}_rep_base_{code}") if len(options) > 1 else next(iter(options))
+        if len(options) == 1:
+            st.markdown(f"**이익 기준** · {base_label}")
+        growth = st.slider("순이익 증감 가정(%)", -50, 100, 0, 5, key=f"{key_prefix}_rep_growth_{code}",
+                           help="기준 순이익을 얼마나 늘리거나 줄여 볼지. 전망이 아니라 '이만큼 달라지면 주가가 어떻게 되나'를 보는 가정값입니다.")
+        ni = options[base_label] * (1 + growth / 100)
+        per = st.slider("적용 PER(배)", 1.0, per_cap, float(min(max(round(anchor * 2) / 2, 1.0), per_cap)), 0.5, key=f"{key_prefix}_rep_per_{code}")
+        sim = crep.scenario(ni, cap, price, per)
+        m1, m2, m3 = st.columns(3)
+        m1.metric("목표 시가총액", crep.fmt_won(sim["cap"]), help="이익 × PER")
+        m2.metric("목표 주가", f"{sim['price']:,.0f}원", f"{sim['upside'] * 100:+.1f}%", delta_color="inverse",
+                  help="현재가 × (목표 시총 ÷ 현재 시총). 우선주가 있어도 현재가 대비 비율이 같게 나옵니다.")
+        m3.metric("가정 순이익", crep.fmt_won(ni), help=f"{base_label} × (1 {growth:+d}%)")
 
-    st.markdown("**PER 기준점** (같은 이익 가정으로 계산)")
-    rows = []
-    if per_now:
-        s = crep.scenario(ni, cap, price, per_now)
-        rows.append({"기준": "현재 후행 PER", "PER(배)": per_now, "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100, "근거": f"종가 ÷ 후행 순이익({h['ttm']['label']})"})
-    if rng:
-        yrs = f"{rng['years'][0]}~{rng['years'][-1]}"
-        for lab, key in (("Bear · 과거 최저", "low"), ("Base · 과거 중앙", "mid"), ("Bull · 과거 최고", "high")):
-            s = crep.scenario(ni, cap, price, rng[key])
-            rows.append({"기준": lab, "PER(배)": rng[key], "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100,
-                         "근거": f"이 종목의 {yrs} 사업연도 말 PER {rng['n']}개 중 {'최저' if key == 'low' else '중앙' if key == 'mid' else '최고'}(네이버)"})
-    if peer_summary and peer_summary.get("per_median"):         # 위 '피어 비교' 표의 중앙값과 같은 숫자(출처·계산이 같다)
-        s = crep.scenario(ni, cap, price, peer_summary["per_median"])
-        rows.append({"기준": "피어 PER 중앙값", "PER(배)": peer_summary["per_median"], "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100,
-                     "근거": f"위 '피어 비교' 표 {peer_summary['n']}개 종목의 후행 PER 중앙값(적자 제외)"})
-    if rows:
-        st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch",
-                     column_config={"PER(배)": st.column_config.NumberColumn(format="%.1f"), "목표 주가": st.column_config.NumberColumn(format="%d"),
-                                    "현재가 대비(%)": st.column_config.NumberColumn(format="%+.1f")})
-    else:
-        st.caption("이 종목의 과거 PER(최소 2개 사업연도)과 피어 PER 중앙값을 모두 얻지 못해 기준점을 만들지 못했습니다. 위 슬라이더로 직접 가정해 보세요.")
+    with reference:
+        st.markdown("**PER 기준점** (같은 이익 가정으로 계산)")
+        rows = []
+        if per_now:
+            s = crep.scenario(ni, cap, price, per_now)
+            rows.append({"기준": "현재 후행 PER", "PER(배)": per_now, "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100, "근거": f"종가 ÷ 후행 순이익({h['ttm']['label']})"})
+        if rng:
+            yrs = f"{rng['years'][0]}~{rng['years'][-1]}"
+            for lab, key in (("Bear · 과거 최저", "low"), ("Base · 과거 중앙", "mid"), ("Bull · 과거 최고", "high")):
+                s = crep.scenario(ni, cap, price, rng[key])
+                rows.append({"기준": lab, "PER(배)": rng[key], "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100,
+                             "근거": f"이 종목의 {yrs} 사업연도 말 PER {rng['n']}개 중 {'최저' if key == 'low' else '중앙' if key == 'mid' else '최고'}(네이버)"})
+        if peer_summary and peer_summary.get("per_median"):         # 위 '피어 비교' 표의 중앙값과 같은 숫자(출처·계산이 같다)
+            s = crep.scenario(ni, cap, price, peer_summary["per_median"])
+            rows.append({"기준": "피어 PER 중앙값", "PER(배)": peer_summary["per_median"], "목표 주가": s["price"], "현재가 대비(%)": s["upside"] * 100,
+                         "근거": f"위 '피어 비교' 표 {peer_summary['n']}개 종목의 후행 PER 중앙값(적자 제외)"})
+        if rows:
+            st.dataframe(pd.DataFrame(rows), hide_index=True, width="stretch", height="content",
+                         column_config={"PER(배)": st.column_config.NumberColumn(format="%.1f"), "목표 주가": st.column_config.NumberColumn(format="%d"),
+                                        "현재가 대비(%)": st.column_config.NumberColumn(format="%+.1f"), "근거": st.column_config.TextColumn(width="large")})
+        else:
+            st.caption("이 종목의 과거 PER(최소 2개 사업연도)과 피어 PER 중앙값을 모두 얻지 못해 기준점을 만들지 못했습니다. 왼쪽 슬라이더로 직접 가정해 보세요.")
     st.caption("※ Bear·Base·Bull은 '낮은·중간·높은 배수'라는 뜻이지 주가 하락·상승 예측이 아닙니다. 후행 이익이 과거보다 크게 늘었다면 Bear 배수로도 현재가보다 높게 나옵니다. "
                "순이익 × PER을 곱한 단순 산식이라 예측도 기업가치 평가도 아닙니다. 과거 PER은 사업연도 말 주가 기준 3개 연도뿐이고, 이익이 급변한 종목(후행 이익이 사업연도의 2배 이상 등)은 "
                "배수 기준점이 현재 이익과 맞지 않을 수 있습니다. PER 기준점에 쓴 네이버 값은 DART 순이익과 출처가 달라 소수점 단위로 어긋날 수 있습니다.")
@@ -2923,10 +2925,10 @@ def render_narrative_result(res):
     """검증을 통과한 AI 서술 + 근거(F·Q) + 탈락 문장. 인용은 코드가 원문 발췌와 대조한 것만 나온다."""
     label = {q["id"]: q["label"] for q in res.get("excerpts", [])}
     url = crep.DART_VIEW + (res.get("rcept_no") or "")
-    for key in ("business", "changes", "risks", "questions"):
+    def draw(key):
         items = res.get(key) or []
         if not items and key != "risks":
-            continue
+            return
         st.markdown(f"**{rnar.SECTION_NAMES[key]}**")
         if not items:
             st.caption("검증을 통과한 리스크 문장이 없습니다(근거가 약하거나 숫자·인용 검증에서 모두 탈락). 아래 '검증에서 탈락한 문장'과 공시 원문을 직접 확인해 주세요.")
@@ -2938,6 +2940,14 @@ def render_narrative_result(res):
             else:
                 st.markdown(f"- {_md_safe(it['text'])}")
             st.caption("근거 " + " · ".join(it["refs"]))
+    # 왼쪽: 무슨 회사이고 무엇이 달라졌나 / 오른쪽: 무엇이 위험하고 무엇을 확인할까(인용문이 길어 폭이 넓은 쪽에 둔다)
+    facts_col, risk_col = st.columns(2, gap="large")
+    with facts_col:
+        draw("business")
+        draw("changes")
+    with risk_col:
+        draw("risks")
+        draw("questions")
     st.caption(f"생성 {res['generated_at']} · {res['model']} · 검증 통과 {res['kept']}/{res['asked']}문장"
                + (f" · 앞선 시도 실패: {', '.join(res['llm_errors'])}" if res.get("llm_errors") else ""))
     if res.get("dropped"):
@@ -3033,20 +3043,45 @@ def render_company_report(code, name, price, price_date, key_prefix):
     st.caption(f"{rep['name']} · {rep['fs']}재무제표 · {rep['annual_year']} 사업보고서{interim}까지 반영 · 모든 숫자는 DART 공시와 종가로 코드가 계산합니다(AI 추정·전망 없음).")
     if rep["currency"] != "KRW":
         st.warning(f"이 회사는 재무제표가 {rep['currency']} 단위입니다. 아래 금액은 원화가 아닙니다.")
-    render_report_header(rep)
+    render_report_header(rep, key_prefix)
 
-    st.markdown("##### 5개년 실적")
-    st.plotly_chart(_rep_annual_figure(rep["annual"]["rows"], rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_annual_{code}")
-    st.dataframe(_rep_annual_dataframe(rep), width="stretch")
-    if not rep["financial_like"] and any(r["fcf"] is not None for r in rep["annual"]["rows"]):
+    rows = rep["annual"]["rows"]
+    has_cash = not rep["financial_like"] and any(r["fcf"] is not None for r in rows)
+    peer = {}                                   # 피어 비교가 계산한 중앙값을 시뮬레이터가 이어받는 통로(위에서 아래로 차례로 그려진다)
+
+    def annual_chart():
+        st.markdown("##### 5개년 실적")
+        st.plotly_chart(_rep_annual_figure(rows, rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_annual_{code}")
+
+    def cash_chart():
         st.markdown("##### 현금흐름")
-        st.plotly_chart(_rep_cash_figure(rep["annual"]["rows"], rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_cash_{code}")
+        st.plotly_chart(_rep_cash_figure(rows, rep["currency"]), theme=None, key=f"{key_prefix}_rep_chart_cash_{code}")
         st.caption("FCF = 영업활동현금흐름 − (유형자산 취득 + 무형자산 취득). 리스·임대 자산 투자와 사업 인수는 반영하지 않습니다.")
-    render_report_mix(rep, code, key_prefix)
-    render_report_holders(rep)
-    render_report_filings(rep, code, key_prefix)
-    peer_summary = render_report_peers(rep, code, name, key_prefix)
-    render_report_simulator(rep, code, key_prefix, peer_summary)
+
+    def annual_table():
+        st.markdown("##### 5개년 재무표")
+        st.dataframe(_rep_annual_dataframe(rep), width="stretch", height="content")
+
+    def peers():
+        peer["summary"] = render_report_peers(rep, code, name, key_prefix)
+
+    # 위쪽은 왼쪽 묶음(실적·재무표·주주)과 오른쪽 묶음(현금흐름·매출 구성·공시)을 각각 위아래로 쌓는다 — 행을 맞추면 높이가 다른 블록 아래에 빈 칸이 생긴다.
+    # 표 열이 많거나 가로로 넓게 읽어야 하는 피어 비교·시뮬레이터·AI 서술은 아래에서 전체 폭을 쓴다. 현금흐름이 없는 금융업은 오른쪽이 매출 구성부터 시작한다.
+    left, right = st.columns(2, gap="large")
+    with left:
+        annual_chart()
+        annual_table()
+        if has_cash:
+            render_report_holders(rep)
+    with right:
+        if has_cash:
+            cash_chart()
+        render_report_mix(rep, code, key_prefix)
+        render_report_filings(rep, code, key_prefix)
+        if not has_cash:                    # 금융업: 오른쪽이 짧아지므로 주주 영역을 이쪽으로 옮겨 균형을 맞춘다
+            render_report_holders(rep)
+    peers()
+    render_report_simulator(rep, code, key_prefix, peer.get("summary"))
     render_report_narrative(rep, code, key_prefix)
 
     with st.expander("계산 기준과 데이터 한계"):
